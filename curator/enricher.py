@@ -1,16 +1,16 @@
 """curator/enricher.py — fetch HF modelcard + ask heyi_engine for structured metadata.
 
-v10 change: the LLM call goes through ``heyi_engine.HeyiEngineClient`` instead
-of CCR. The client auto-discovers what's currently loaded on :10814 so the
-curator no longer hardcodes a model name (one of the v9 root causes — user
-swaps Kimi for M2.7 and CCR keeps requesting MiniMax-M2.7 → 404).
+The LLM call goes through ``heyi_engine.HeyiEngineClient``. The client
+auto-discovers what's currently loaded on :10814 so the curator never
+hardcodes a model name (one of the v9 root causes — user swaps Kimi for
+M2.7 and the upstream proxy keeps requesting MiniMax-M2.7 → 404).
 
-The legacy ``call_ccr_messages`` is preserved as a deprecated path so old
-tests / scripts keep importing; new code should pass an ``engine_client`` in
-``CuratorConfig`` or rely on ``CuratorConfig.from_env()`` which builds one.
+PR#7a removed the legacy proxy-call helper and the back-compat shim
+fields on ``CuratorConfig``. New callers pass ``engine_client`` directly
+or rely on ``CuratorConfig.from_env()`` which builds one.
 
-Pure-ish: HF fetch and the LLM call are isolated into small functions that can
-be mocked in tests.
+Pure-ish: HF fetch and the LLM call are isolated into small functions
+that can be mocked in tests.
 
 Output schema is documented in `CURATED_SCHEMA` below and validated.
 """
@@ -161,51 +161,8 @@ class LlmResponse:
     raw: dict[str, Any] | None = None
 
 
-def call_ccr_messages(ccr_url: str, *, api_key: str, model: str,
-                      messages: list[dict[str, str]],
-                      max_tokens: int = 4096,
-                      timeout_s: float = 120.0) -> LlmResponse:
-    """POST /v1/messages to CCR (Anthropic-shape).
-
-    CCR will translate to OpenAI shape upstream, run our strip-think
-    transformer on the response stream, and hand us back clean text.
-    """
-    body = json.dumps({
-        "model": model,
-        "max_tokens": max_tokens,
-        "messages": messages,
-    }).encode("utf-8")
-
-    req = urllib.request.Request(
-        ccr_url.rstrip("/") + "/v1/messages",
-        data=body,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-            "User-Agent": "heyi-eval/v9 curator",
-        },
-        method="POST",
-    )
-    started = datetime.now(tz=UTC)
-    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-        raw = resp.read()
-    elapsed = (datetime.now(tz=UTC) - started).total_seconds()
-    data = json.loads(raw.decode("utf-8", errors="replace"))
-
-    text = ""
-    for c in data.get("content", []):
-        if c.get("type") == "text":
-            text += c.get("text", "")
-
-    usage = data.get("usage", {})
-    return LlmResponse(
-        text=text,
-        model=data.get("model", model),
-        input_tokens=int(usage.get("input_tokens", 0) or 0),
-        output_tokens=int(usage.get("output_tokens", 0) or 0),
-        elapsed_s=elapsed,
-        raw=data,
-    )
+# PR#7a: removed the legacy proxy-call helper — every curator LLM call goes
+# through HeyiEngineClient now. See heyi_engine/client.py and enrich_one().
 
 
 # ── parse + validate LLM output ────────────────────────────────────────────
@@ -282,9 +239,8 @@ def normalize_curated(parsed: dict[str, Any] | None) -> dict[str, Any]:
 
 @dataclass
 class CuratorConfig:
-    # heyi_engine endpoint (v10 default; replaces v9's CCR :3457). The
-    # client auto-discovers the model name from /v1/models — we no longer
-    # hardcode "MiniMax-M2.7" anywhere here.
+    # heyi_engine endpoint. The client auto-discovers the model name from
+    # /v1/models so we never hardcode it here.
     engine_url: str = "http://127.0.0.1:10814"
     engine_api_key: str | None = None
     engine_client: HeyiEngineClient | None = field(default=None, repr=False)
@@ -294,31 +250,10 @@ class CuratorConfig:
     engine_timeout_s: float = 120.0
     hf_timeout_s: float = 15.0
 
-    # ── back-compat shims (deprecated) ───────────────────────────────────
-    # v9 callers still passing ccr_url / ccr_api_key / ccr_model work, but
-    # those fields no longer drive behavior. ccr_model in particular is
-    # ignored because v10 auto-discovers.
-    ccr_url: str = ""
-    ccr_api_key: str = ""
-    ccr_model: str = ""
-    ccr_url_legacy_shim: bool = field(default=False, repr=False)
-
-    def __post_init__(self) -> None:
-        # If a v9 caller passed only ccr_url, treat it as engine_url so we
-        # don't silently misroute. CCR's 3457 won't respond to /v1/models
-        # though, so health() will go unhealthy — that's the right signal.
-        if self.ccr_url and self.engine_url == "http://127.0.0.1:10814":
-            self.engine_url = self.ccr_url
-        if self.ccr_api_key and self.engine_api_key is None:
-            self.engine_api_key = self.ccr_api_key
-
     @classmethod
     def from_env(cls) -> CuratorConfig:
         return cls(
-            engine_url=os.environ.get(
-                "HEYI_ENGINE_URL",
-                os.environ.get("HEYI_EVAL_CCR_URL", "http://127.0.0.1:10814"),
-            ),
+            engine_url=os.environ.get("HEYI_ENGINE_URL", "http://127.0.0.1:10814"),
             engine_api_key=os.environ.get("HEYI_ENGINE_API_KEY"),
             hf_endpoint=os.environ.get("HF_ENDPOINT", "https://hf-mirror.com"),
             max_card_chars=int(os.environ.get("HEYI_EVAL_CARD_MAX_CHARS",

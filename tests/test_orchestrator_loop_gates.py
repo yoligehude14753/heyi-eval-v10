@@ -1,7 +1,7 @@
 """Tests for orchestrator main-loop gates: pre-flight + heartbeat.
 
 The actual cmd_loop is an infinite loop so we test the extracted helpers
-(_ccr_preflight_gate and _maybe_emit_heartbeat) which carry all the
+(_engine_preflight_gate and _maybe_emit_heartbeat) which carry all the
 interesting transition logic.
 """
 from __future__ import annotations
@@ -15,11 +15,11 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from curator.health import CcrHealthReport  # noqa: E402
+from curator.health import EngineHealthReport  # noqa: E402
 from orchestrator.config import OrchestratorConfig  # noqa: E402
 from orchestrator.main import (  # noqa: E402
     LoopState,
-    _ccr_preflight_gate,
+    _engine_preflight_gate,
     _free_disk_gb,
     _maybe_emit_heartbeat,
 )
@@ -31,8 +31,7 @@ def _make_env():
     td = tempfile.TemporaryDirectory()
     cfg = OrchestratorConfig(
         data_root=Path(td.name), repo_root=REPO_ROOT,
-        ccr_url="http://ccr.test", ccr_apikey="k",
-        curator_llm_model="MiniMax-M2.7",
+        engine_url="http://engine.test", engine_api_key=None,
     )
     store = Store(cfg.data_root)
     return td, cfg, store
@@ -44,12 +43,12 @@ def _read_outbox(store: Store) -> list[dict]:
     return [json.loads(line) for line in store.outbox_path.read_text().splitlines() if line.strip()]
 
 
-def _healthy() -> CcrHealthReport:
-    return CcrHealthReport(ok=True, http_code=200, elapsed_s=0.5, detail="ok")
+def _healthy() -> EngineHealthReport:
+    return EngineHealthReport(ok=True, http_code=200, elapsed_s=0.5, detail="ok")
 
 
-def _unhealthy(detail: str = "upstream unreachable (HTTP 500, fetch failed)") -> CcrHealthReport:
-    return CcrHealthReport(ok=False, http_code=500, elapsed_s=0.5, detail=detail)
+def _unhealthy(detail: str = "upstream unreachable (HTTP 500, fetch failed)") -> EngineHealthReport:
+    return EngineHealthReport(ok=False, http_code=500, elapsed_s=0.5, detail=detail)
 
 
 class PreflightGateTests(unittest.TestCase):
@@ -58,29 +57,29 @@ class PreflightGateTests(unittest.TestCase):
         td, cfg, store = _make_env()
         with td:
             state = LoopState()
-            allow, reason = _ccr_preflight_gate(
+            allow, reason = _engine_preflight_gate(
                 state, cfg, store, probe=lambda *a, **k: _healthy(),
             )
             self.assertTrue(allow)
             self.assertEqual(reason, "healthy")
             self.assertEqual(len(_read_outbox(store)), 0)
-            self.assertIsNone(state.ccr_unhealthy_since)
+            self.assertIsNone(state.engine_unhealthy_since)
 
     def test_first_unhealthy_emits_paused_incident(self):
         td, cfg, store = _make_env()
         with td:
             state = LoopState()
-            allow, _reason = _ccr_preflight_gate(
+            allow, _reason = _engine_preflight_gate(
                 state, cfg, store, probe=lambda *a, **k: _unhealthy(),
                 now=1000.0,
             )
             self.assertFalse(allow)
-            self.assertEqual(state.ccr_unhealthy_since, 1000.0)
-            self.assertEqual(state.ccr_last_notify, 1000.0)
+            self.assertEqual(state.engine_unhealthy_since, 1000.0)
+            self.assertEqual(state.engine_last_notify, 1000.0)
 
             outbox = _read_outbox(store)
             self.assertEqual(len(outbox), 1)
-            self.assertIn("orchestrator-paused-ccr-down", outbox[0]["title"])
+            self.assertIn("orchestrator-paused-engine-down", outbox[0]["title"])
 
     def test_repeated_unhealthy_does_not_spam(self):
         td, cfg, store = _make_env()
@@ -88,10 +87,10 @@ class PreflightGateTests(unittest.TestCase):
             state = LoopState()
             t = 1000.0
             for i in range(5):
-                _ccr_preflight_gate(state, cfg, store,
-                                    probe=lambda *a, **k: _unhealthy(),
-                                    remind_interval_s=3600.0,
-                                    now=t + i * 60)  # +1 min each
+                _engine_preflight_gate(state, cfg, store,
+                                       probe=lambda *a, **k: _unhealthy(),
+                                       remind_interval_s=3600.0,
+                                       now=t + i * 60)  # +1 min each
             outbox = _read_outbox(store)
             # only 1 initial paused notification — no remind yet (we're < 1h)
             self.assertEqual(len(outbox), 1)
@@ -100,31 +99,31 @@ class PreflightGateTests(unittest.TestCase):
         td, cfg, store = _make_env()
         with td:
             state = LoopState()
-            _ccr_preflight_gate(state, cfg, store,
-                                probe=lambda *a, **k: _unhealthy(),
-                                remind_interval_s=3600.0, now=1000.0)
+            _engine_preflight_gate(state, cfg, store,
+                                   probe=lambda *a, **k: _unhealthy(),
+                                   remind_interval_s=3600.0, now=1000.0)
             # 1.5h later, still down
-            _ccr_preflight_gate(state, cfg, store,
-                                probe=lambda *a, **k: _unhealthy(),
-                                remind_interval_s=3600.0, now=1000.0 + 5400)
+            _engine_preflight_gate(state, cfg, store,
+                                   probe=lambda *a, **k: _unhealthy(),
+                                   remind_interval_s=3600.0, now=1000.0 + 5400)
             outbox = _read_outbox(store)
             self.assertEqual(len(outbox), 2)
-            self.assertIn("orchestrator-paused-ccr-down", outbox[0]["title"])
+            self.assertIn("orchestrator-paused-engine-down", outbox[0]["title"])
             self.assertIn("orchestrator-still-paused", outbox[1]["title"])
 
     def test_recovery_emits_resumed_incident(self):
         td, cfg, store = _make_env()
         with td:
             state = LoopState()
-            _ccr_preflight_gate(state, cfg, store,
-                                probe=lambda *a, **k: _unhealthy(),
-                                now=1000.0)
+            _engine_preflight_gate(state, cfg, store,
+                                   probe=lambda *a, **k: _unhealthy(),
+                                   now=1000.0)
             # 5 minutes later — back to healthy
-            allow, _ = _ccr_preflight_gate(
+            allow, _ = _engine_preflight_gate(
                 state, cfg, store, probe=lambda *a, **k: _healthy(), now=1300.0,
             )
             self.assertTrue(allow)
-            self.assertIsNone(state.ccr_unhealthy_since)
+            self.assertIsNone(state.engine_unhealthy_since)
 
             outbox = _read_outbox(store)
             self.assertEqual(len(outbox), 2)
@@ -137,8 +136,8 @@ class PreflightGateTests(unittest.TestCase):
         with td:
             state = LoopState()
             for _ in range(3):
-                _ccr_preflight_gate(state, cfg, store,
-                                    probe=lambda *a, **k: _healthy())
+                _engine_preflight_gate(state, cfg, store,
+                                       probe=lambda *a, **k: _healthy())
             self.assertEqual(len(_read_outbox(store)), 0)
 
 

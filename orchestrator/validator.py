@@ -3,7 +3,7 @@ runner_validator: deterministic post-stage check.
 
 CC's self-reported "success" is NOT trustworthy (proven by E8 attempt 1: CC
 exited result=success but capability.json/manifest.json were never written and
-e8-vllm was left dangling).
+the v8-era prefix was left dangling).
 
 After every stage, validator runs the appropriate check. Failure overrides
 whatever CC said; the stage is marked FAILED and the run goes to error path.

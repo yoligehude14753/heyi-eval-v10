@@ -1,8 +1,8 @@
 """Unit tests for orchestrator/stages.execute_stage routing.
 
-Pins that DEPLOY / READY_WAIT / CAPABILITY / CLEANUP route to the v10
-native Python executors, and SHOWCASE still routes to cc-agent until
-PR#5 restricts the latter.
+After PR#7a there is no docker-spawn path left in the dispatcher: every
+stage routes to a native Python executor. This file pins the routes for
+DEPLOY / READY_WAIT / CAPABILITY / CLEANUP / SHOWCASE.
 
 Test IDs map to docs/PR4_TEST_PLAN.md §Dispatcher.
 """
@@ -50,14 +50,11 @@ class DispatcherTests(unittest.TestCase):
             cfg = _make_cfg(tmp)
             run = _make_run()
             store = MagicMock()
-            with (
-                patch.object(stages_py, "execute_deploy", return_value=_ok_result()) as native,
-                patch.object(stages, "_docker_run_cc_agent") as cc,
-            ):
+            with patch.object(stages_py, "execute_deploy",
+                              return_value=_ok_result()) as native:
                 r = stages.execute_stage(run, StageName.DEPLOY, cfg, store)
             self.assertTrue(r.ok)
             native.assert_called_once_with(run, cfg)
-            cc.assert_not_called()
 
     def test_d2_ready_wait_routes_to_stages_py(self):
         with TemporaryDirectory() as td:
@@ -65,14 +62,10 @@ class DispatcherTests(unittest.TestCase):
             cfg = _make_cfg(tmp)
             run = _make_run()
             store = MagicMock()
-            with (
-                patch.object(stages_py, "execute_ready_wait",
-                             return_value=_ok_result()) as native,
-                patch.object(stages, "_docker_run_cc_agent") as cc,
-            ):
+            with patch.object(stages_py, "execute_ready_wait",
+                              return_value=_ok_result()) as native:
                 stages.execute_stage(run, StageName.READY_WAIT, cfg, store)
             native.assert_called_once_with(run, cfg)
-            cc.assert_not_called()
 
     def test_d3_capability_routes_to_capability_module(self):
         with TemporaryDirectory() as td:
@@ -80,14 +73,10 @@ class DispatcherTests(unittest.TestCase):
             cfg = _make_cfg(tmp)
             run = _make_run()
             store = MagicMock()
-            with (
-                patch.object(cap_mod, "execute_capability",
-                             return_value=_ok_cap_result()) as native,
-                patch.object(stages, "_docker_run_cc_agent") as cc,
-            ):
+            with patch.object(cap_mod, "execute_capability",
+                              return_value=_ok_cap_result()) as native:
                 stages.execute_stage(run, StageName.CAPABILITY, cfg, store)
             native.assert_called_once_with(run, cfg)
-            cc.assert_not_called()
 
     def test_d4_cleanup_routes_to_stages_py(self):
         with TemporaryDirectory() as td:
@@ -95,19 +84,15 @@ class DispatcherTests(unittest.TestCase):
             cfg = _make_cfg(tmp)
             run = _make_run()
             store = MagicMock()
-            with (
-                patch.object(stages_py, "execute_cleanup",
-                             return_value=_ok_result()) as native,
-                patch.object(stages, "_docker_run_cc_agent") as cc,
-            ):
+            with patch.object(stages_py, "execute_cleanup",
+                              return_value=_ok_result()) as native:
                 stages.execute_stage(run, StageName.CLEANUP, cfg, store)
             native.assert_called_once_with(run, cfg)
-            cc.assert_not_called()
 
-    def test_d5_showcase_now_routes_to_showcase_runner(self):
-        """PR#5 flip: SHOWCASE moves from cc-agent docker spawn to the
-        in-process cc_agent.showcase_runner. _docker_run_cc_agent is
-        never called for any stage after PR#5 — _CC_STAGES is empty."""
+    def test_d5_showcase_routes_to_showcase_runner(self):
+        """SHOWCASE routes to the in-process cc_agent.showcase_runner.
+        After PR#7a the dispatcher has no docker-spawn fallback to assert
+        against — that surface is gone entirely."""
         sc_ok = sc_mod.ShowcaseResult(
             ok=True, duration_s=0.01,
             artifacts=["showcase.json"], rc=0,
@@ -117,15 +102,28 @@ class DispatcherTests(unittest.TestCase):
             cfg = _make_cfg(tmp)
             run = _make_run()
             store = MagicMock()
-            with (
-                patch.object(sc_mod, "execute_showcase",
-                             return_value=sc_ok) as native,
-                patch.object(stages, "_docker_run_cc_agent") as cc,
-            ):
+            with patch.object(sc_mod, "execute_showcase",
+                              return_value=sc_ok) as native:
                 r = stages.execute_stage(run, StageName.SHOWCASE, cfg, store)
             self.assertTrue(r.ok)
             native.assert_called_once_with(run, cfg)
-            cc.assert_not_called()
+
+    def test_d6_dispatcher_has_no_docker_spawn_helper(self):
+        """INV-11 belt-and-suspenders: the dispatcher module must not
+        expose any cc-agent docker spawn helper after PR#7a. Anyone
+        re-adding a docker-spawn path will trip this guard."""
+        forbidden = (
+            "_docker_run_cc_agent",
+            "_execute_cc_stage",
+            "_CC_STAGES",
+            "_cc_agent_container_name",
+        )
+        for name in forbidden:
+            self.assertFalse(
+                hasattr(stages, name),
+                f"orchestrator/stages.py grew back {name!r} — that path was "
+                f"deleted in PR#7a; the dispatcher must stay docker-spawn-free.",
+            )
 
 
 if __name__ == "__main__":

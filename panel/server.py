@@ -22,9 +22,6 @@ import json
 import os
 import subprocess
 import sys
-import time
-import urllib.error
-import urllib.request
 from collections import Counter
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -32,9 +29,8 @@ from pathlib import Path
 
 DATA_ROOT = Path(os.environ.get("HEYI_EVAL_DATA", "/home/ai/heyi-eval-data"))
 BACKUPS_ROOT = Path(os.environ.get("HEYI_EVAL_BACKUPS", "/home/ai/heyi-eval-backups"))
-CCR_URL = os.environ.get("HEYI_EVAL_CCR_URL", "http://127.0.0.1:3457")
-CCR_API_KEY = os.environ.get("HEYI_EVAL_CCR_API_KEY", "heyi-eval-v9-local-key")
-CURATOR_MODEL = os.environ.get("HEYI_EVAL_CURATOR_MODEL", "Kimi-K2.6")
+ENGINE_URL = os.environ.get("HEYI_ENGINE_URL", "http://127.0.0.1:10814")
+ENGINE_API_KEY = os.environ.get("HEYI_ENGINE_API_KEY")
 LISTEN_HOST = os.environ.get("HEYI_PANEL_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("HEYI_PANEL_PORT", "8090"))
 
@@ -280,40 +276,21 @@ def backup_status() -> dict:
     }
 
 
-def ccr_probe() -> dict:
-    """Lightweight ccr probe (~1s)."""
-    body = json.dumps({
-        "model": CURATOR_MODEL,
-        "max_tokens": 512,
-        "messages": [{"role": "user", "content": "Reply only with the word PONG."}],
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        CCR_URL.rstrip("/") + "/v1/messages",
-        data=body,
-        headers={
-            "Content-Type": "application/json",
-            "x-api-key": CCR_API_KEY,
-            "anthropic-version": "2023-06-01",
-        },
-        method="POST",
-    )
-    t0 = time.time()
-    try:
-        with urllib.request.urlopen(req, timeout=8.0) as resp:
-            elapsed = time.time() - t0
-            data = json.loads(resp.read().decode("utf-8", errors="replace"))
-        text = "".join(c.get("text", "") for c in data.get("content", []) if c.get("type") == "text")
-        return {
-            "ok": bool(text.strip()),
-            "http": 200,
-            "elapsed_s": round(elapsed, 2),
-            "model": data.get("model"),
-            "text": (text or "").strip()[:60],
-        }
-    except urllib.error.HTTPError as e:
-        return {"ok": False, "http": e.code, "elapsed_s": round(time.time() - t0, 2), "detail": str(e)[:120]}
-    except Exception as e:
-        return {"ok": False, "http": None, "elapsed_s": round(time.time() - t0, 2), "detail": f"{type(e).__name__}: {e}"[:120]}
+def engine_probe() -> dict:
+    """heyi_engine /v1/models probe — much cheaper than v9's chat-completion
+    canary and gives us back the auto-discovered model name as a free side
+    effect."""
+    from heyi_engine.client import HeyiEngineClient
+    client = HeyiEngineClient(base_url=ENGINE_URL, api_key=ENGINE_API_KEY,
+                              timeout_s=8.0)
+    h = client.health()
+    return {
+        "ok": h.ok,
+        "http": h.http_code,
+        "elapsed_s": round(h.elapsed_s, 2),
+        "model": h.model_id,
+        "detail": (h.detail or "")[:120],
+    }
 
 
 def gpu_status() -> list[dict]:
@@ -368,10 +345,12 @@ def health_summary() -> dict:
         if last_hb and last_incident:
             break
     return {
-        "ccr": ccr_probe(),
-        "curator_model": CURATOR_MODEL,
+        "engine": engine_probe(),
         "gpu": gpu_status(),
-        "containers": docker_status(["heyi-eval-ccr", "heyi-eval-socket-proxy"]),
+        # v10 has no orchestrator-side containers to watch by default —
+        # the heyi_engine prod containers live in user-managed compose
+        # and are not the panel's responsibility.
+        "containers": docker_status([]),
         "last_heartbeat": last_hb,
         "last_incident": last_incident,
         "now": datetime.now(UTC).isoformat(),
@@ -517,16 +496,16 @@ async function refresh() {
 
   // health
   const h = await getJSON('/api/health');
-  const ccr = h.ccr || {};
+  const eng = h.engine || {};
   const gpu = h.gpu || [];
   const total_used = gpu.reduce((a,g)=>a+g.mem_used_mb, 0);
   const total_mem  = gpu.reduce((a,g)=>a+g.mem_total_mb, 0);
-  const ccrCls = ccr.ok ? 'ok' : 'err';
-  const ccrLabel = ccr.ok ? 'CCR ok' : 'CCR down';
+  const engCls = eng.ok ? 'ok' : 'err';
+  const engLabel = eng.ok ? 'engine ok' : 'engine down';
   document.getElementById('health-grid').innerHTML = `
-    <div class="stat"><div class="label">${ccrLabel}</div>
-      <div class="value ${ccrCls}">${ccr.elapsed_s != null ? ccr.elapsed_s + 's' : '?'}</div>
-      <div class="muted" style="font-size:11px">model: ${ccr.model || h.curator_model || '?'}</div></div>
+    <div class="stat"><div class="label">${engLabel}</div>
+      <div class="value ${engCls}">${eng.elapsed_s != null ? eng.elapsed_s + 's' : '?'}</div>
+      <div class="muted" style="font-size:11px">model: ${eng.model || '?'}</div></div>
     <div class="stat"><div class="label">GPU 使用</div>
       <div class="value">${Math.round(total_used/1024)}/${Math.round(total_mem/1024)}G</div>
       <div class="muted" style="font-size:11px">${gpu.length} 块卡</div></div>

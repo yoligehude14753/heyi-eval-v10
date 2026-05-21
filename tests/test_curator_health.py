@@ -2,11 +2,8 @@
 
 The v9 implementation did a real chat completion roundtrip; v10
 delegates to ``HeyiEngineClient.health()`` which probes /v1/models.
-These tests reflect the new contract while preserving:
-- the CcrHealthReport struct (so legacy gate code in orchestrator.main
-  continues to compile)
-- probe_ccr() as a compatibility shim
-- the "never raises" guarantee
+PR#7a removed the v9 back-compat shim and report alias; these tests
+now exercise the v10-only ``probe_engine`` + ``EngineHealthReport``.
 """
 from __future__ import annotations
 
@@ -19,8 +16,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from curator.health import (  # noqa: E402
-    CcrHealthReport,
-    probe_ccr,
+    EngineHealthReport,
     probe_engine,
 )
 from heyi_engine.client import HealthResult  # noqa: E402
@@ -71,34 +67,13 @@ class ProbeEngineTests(unittest.TestCase):
         self.assertIn("no models", r.detail)
 
 
-class ProbeCcrCompatTests(unittest.TestCase):
-    """Back-compat shim must still return CcrHealthReport."""
-
-    def test_probe_ccr_returns_compat_report(self) -> None:
-        with mock.patch("heyi_engine.client.HeyiEngineClient.health",
-                        return_value=_healthy("Kimi-K2.6")):
-            r = probe_ccr("http://x:10814", api_key="ignored",
-                          model="legacy-name-also-ignored")
-        self.assertIsInstance(r, CcrHealthReport)
-        self.assertTrue(r.ok)
-
-    def test_probe_ccr_ignores_model_param(self) -> None:
-        """v10: model name is auto-discovered. Passing a name is OK but ignored."""
-        with mock.patch("heyi_engine.client.HeyiEngineClient.health",
-                        return_value=_healthy("ACTUAL-MODEL")):
-            r = probe_ccr("http://x:10814", api_key=None,
-                          model="this-name-is-ignored-in-v10")
-        self.assertTrue(r.ok)
-        self.assertIn("ACTUAL-MODEL", r.detail)
-
-
 class ToDictTests(unittest.TestCase):
-    """CcrHealthReport.to_dict serializable (for outbox payloads)."""
+    """EngineHealthReport.to_dict serializable (for outbox payloads)."""
 
     def test_to_dict_serializable(self) -> None:
         import json
-        r = CcrHealthReport(ok=True, http_code=200, elapsed_s=0.123,
-                            detail="engine ok, model=X")
+        r = EngineHealthReport(ok=True, http_code=200, elapsed_s=0.123,
+                               detail="engine ok, model=X")
         d = r.to_dict()
         s = json.dumps(d)  # must not raise
         self.assertIn("X", s)

@@ -137,16 +137,22 @@ def test_outbox_recent_limits(fake_data_root):
 
 
 def test_health_summary_no_external(fake_data_root, monkeypatch):
-    """Health summary must not raise even when CCR/GPU/docker are unreachable."""
+    """Health summary must not raise even when engine/GPU/docker are unreachable."""
     srv, _ = fake_data_root
-    # Force ccr probe to fail fast
-    def boom(*_a, **_kw):
-        raise OSError("no upstream")
-    monkeypatch.setattr(srv.urllib.request, "urlopen", boom)
+    # Force engine probe to fail fast — patch HeyiEngineClient.health
+    # since PR#7a routes panel's probe through it.
+    from heyi_engine.client import HealthResult
+    monkeypatch.setattr(
+        "heyi_engine.client.HeyiEngineClient.health",
+        lambda self: HealthResult(
+            ok=False, model_id=None, detail="no upstream",
+            http_code=None, elapsed_s=0.01,
+        ),
+    )
     monkeypatch.setattr(srv.subprocess, "check_output",
                         lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError("no docker")))
     h = srv.health_summary()
-    assert h["ccr"]["ok"] is False
+    assert h["engine"]["ok"] is False
     assert h["gpu"] == []
     assert h["last_heartbeat"] is not None  # there's one in outbox
     assert h["last_incident"] is not None
@@ -155,8 +161,11 @@ def test_health_summary_no_external(fake_data_root, monkeypatch):
 def test_index_html_renders_without_data():
     """Index HTML must be servable even with no data root yet."""
     import panel.server as srv
-    assert "<title>heyi-eval-v9 panel</title>" in srv.INDEX_HTML
+    assert "<title>" in srv.INDEX_HTML
     assert "/api/health" in srv.INDEX_HTML
+    # PR#7a: the CCR card was removed in favour of an engine-ok/down indicator.
+    assert "CCR" not in srv.INDEX_HTML
+    assert "engine ok" in srv.INDEX_HTML
 
 
 def test_render_run_detail_handles_missing():
