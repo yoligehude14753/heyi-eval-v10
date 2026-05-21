@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Mac-side nightly mirror of nv8 backups (PR#6, INV-6 offsite redundancy).
+  Install:
+    cp deploy/launchd/com.heyi.eval.mac-mirror.plist \
+       ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.heyi.eval.mac-mirror.plist
+    launchctl enable gui/$(id -u)/com.heyi.eval.mac-mirror
+  Uninstall:
+    launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.heyi.eval.mac-mirror.plist
+    rm ~/Library/LaunchAgents/com.heyi.eval.mac-mirror.plist
+
+  Trigger window: every day at 02:00 local time. Adjust StartCalendarInterval
+  if multiple Macs share the same nv8 (stagger by 30 min).
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.heyi.eval.mac-mirror</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>~/Desktop/all/heyi-eval-v10/scripts/mac-mirror.sh</string>
+  </array>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>2</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/heyi-eval-mac-mirror.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/heyi-eval-mac-mirror.err.log</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+  </dict>
+</dict>
+</plist>

@@ -1,0 +1,27 @@
+[Unit]
+Description=heyi-eval-v10 data snapshot (rsync to HEYI_EVAL_BACKUPS)
+Documentation=https://github.com/yoligehude14753/heyi-eval-v10/blob/main/docs/PR6_TEST_PLAN.md
+# Don't fight a running orchestrator main loop; backup is best-effort.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ai
+Group=ai
+WorkingDirectory=/home/ai/heyi-eval-v10
+EnvironmentFile=-/etc/heyi-eval-v10/env
+# Hard-cap one snapshot pass. take_snapshot uses 1h internally; this is the
+# systemd-side belt-and-suspenders so a hung rsync doesn't block the next timer.
+TimeoutStartSec=3600
+ExecStart=/home/ai/heyi-eval-v10/.venv/bin/python -m backup
+# Failures are surfaced via notify_outbox.jsonl + WeChat mac bridge already;
+# don't restart-loop on the systemd side.
+Restart=no
+# Snapshots are I/O-heavy; nice + IO class keep eval pipeline responsive.
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+[Install]
+WantedBy=multi-user.target

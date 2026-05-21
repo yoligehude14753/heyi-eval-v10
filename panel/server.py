@@ -31,6 +31,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 DATA_ROOT = Path(os.environ.get("HEYI_EVAL_DATA", "/home/ai/heyi-eval-data"))
+BACKUPS_ROOT = Path(os.environ.get("HEYI_EVAL_BACKUPS", "/home/ai/heyi-eval-backups"))
 CCR_URL = os.environ.get("HEYI_EVAL_CCR_URL", "http://127.0.0.1:3457")
 CCR_API_KEY = os.environ.get("HEYI_EVAL_CCR_API_KEY", "heyi-eval-v9-local-key")
 CURATOR_MODEL = os.environ.get("HEYI_EVAL_CURATOR_MODEL", "Kimi-K2.6")
@@ -259,6 +260,26 @@ def outbox_recent(limit: int = 20) -> list[dict]:
     return _read_jsonl(DATA_ROOT / "store" / "notify_outbox.jsonl", limit=limit)
 
 
+def backup_status() -> dict:
+    """Read-only view of the v10 data-protection layer (PR#6, INV-6 / INV-9).
+
+    Delegates to ``backup.read_backup_state`` so panel and the systemd
+    backup unit always agree on the same source of truth. Returns a plain
+    dict so the JSON serializer doesn't need to know about dataclasses.
+    """
+    from backup import read_backup_state  # lazy: panel still works if backup/ is being refactored
+    state = read_backup_state(BACKUPS_ROOT)
+    return {
+        "last_backup_ts": state.last_backup_ts,
+        "last_backup_age_s": state.last_backup_age_s,
+        "snapshot_count": state.snapshot_count,
+        "total_size_bytes": state.total_size_bytes,
+        "health": state.health,
+        "backups_root": state.backups_root,
+        "snapshots_tail": state.snapshots[-10:],  # 10 newest is enough for the panel
+    }
+
+
 def ccr_probe() -> dict:
     """Lightweight ccr probe (~1s)."""
     body = json.dumps({
@@ -419,6 +440,12 @@ INDEX_HTML = """<!doctype html>
   </section>
 
   <section>
+    <h2>数据备份 (30min rsync · 7d 保留)</h2>
+    <div class="grid" id="backup-grid"></div>
+    <details><summary>最近 snapshots</summary><pre id="backup-snapshots"></pre></details>
+  </section>
+
+  <section>
     <h2>队列（待评测）</h2>
     <div id="queue-summary" class="muted">loading…</div>
     <table id="queue-table"><thead><tr>
@@ -509,6 +536,33 @@ async function refresh() {
       <div class="value ${h.last_incident ? 'warn' : 'ok'}" style="font-size:14px">${h.last_incident ? formatTs(h.last_incident.ts) : '<span class="muted">无</span>'}</div></div>
   `;
   document.getElementById('health-json').textContent = JSON.stringify(h, null, 2);
+
+  // backup
+  const bk = await getJSON('/api/backup');
+  const bkCls = bk.health === 'ok' ? 'ok' : (bk.health === 'warn' ? 'warn' : 'err');
+  function fmtAge(s) {
+    if (s == null) return '<span class="muted">无记录</span>';
+    if (s < 60) return s + 's 前';
+    if (s < 3600) return Math.floor(s/60) + 'm 前';
+    if (s < 86400) return (s/3600).toFixed(1) + 'h 前';
+    return (s/86400).toFixed(1) + 'd 前';
+  }
+  function fmtGB(b) { return b ? (b / (1024**3)).toFixed(2) + ' GB' : '<span class="muted">0</span>'; }
+  document.getElementById('backup-grid').innerHTML = `
+    <div class="stat"><div class="label">备份状态</div>
+      <div class="value ${bkCls}">${bk.health.toUpperCase()}</div>
+      <div class="muted" style="font-size:11px">${bk.backups_root}</div></div>
+    <div class="stat"><div class="label">最近成功</div>
+      <div class="value" style="font-size:14px">${fmtAge(bk.last_backup_age_s)}</div>
+      <div class="muted" style="font-size:11px">${bk.last_backup_ts || ''}</div></div>
+    <div class="stat"><div class="label">snapshot 数量</div>
+      <div class="value">${bk.snapshot_count}</div>
+      <div class="muted" style="font-size:11px">7d 保留窗口</div></div>
+    <div class="stat"><div class="label">总占用</div>
+      <div class="value">${fmtGB(bk.total_size_bytes)}</div>
+      <div class="muted" style="font-size:11px">hard-link 共享</div></div>
+  `;
+  document.getElementById('backup-snapshots').textContent = JSON.stringify(bk.snapshots_tail, null, 2);
 
   // queue
   const q = await getJSON('/api/queue');
@@ -803,6 +857,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(discover_summary())
             elif path == "/api/outbox":
                 self._json(outbox_recent(limit=30))
+            elif path == "/api/backup":
+                self._json(backup_status())
             elif path == "/api/results":
                 self._json(results_leaderboard())
             elif path == "/results":
