@@ -28,9 +28,10 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-# Top-level Python packages. cc-agent is omitted (it's a Docker entrypoint, not importable Python).
-# backup/ and deploy/ may be added in later PRs.
-packages = ["discover", "curator", "orchestrator", "panel"]
+# Top-level Python packages. After PR#5, cc_agent is a regular importable
+# module (was a Docker entrypoint in v9). backup/ and deploy/ join in
+# later PRs.
+packages = ["discover", "curator", "heyi_engine", "orchestrator", "panel", "cc_agent"]
 include-package-data = true
 
 [tool.setuptools.package-data]
@@ -91,7 +92,7 @@ markers = [
 ]
 
 [tool.coverage.run]
-source = ["discover", "curator", "heyi_engine", "orchestrator", "panel"]
+source = ["discover", "curator", "heyi_engine", "orchestrator", "panel", "cc_agent"]
 omit = [
   "*/tests/*",
   "*/__main__.py",

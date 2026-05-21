@@ -13,6 +13,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
+from cc_agent import showcase_runner as sc_mod
 from orchestrator import capability as cap_mod
 from orchestrator import stages, stages_py
 from orchestrator.config import OrchestratorConfig
@@ -103,28 +104,28 @@ class DispatcherTests(unittest.TestCase):
             native.assert_called_once_with(run, cfg)
             cc.assert_not_called()
 
-    def test_d5_showcase_still_routes_to_cc_until_pr5(self):
-        """v10-Until-PR5 contract: SHOWCASE is the last cc-agent stage.
-        Once PR#5 lands the restricted runner, this test flips to assert
-        the new restricted-runner module is called instead."""
+    def test_d5_showcase_now_routes_to_showcase_runner(self):
+        """PR#5 flip: SHOWCASE moves from cc-agent docker spawn to the
+        in-process cc_agent.showcase_runner. _docker_run_cc_agent is
+        never called for any stage after PR#5 — _CC_STAGES is empty."""
+        sc_ok = sc_mod.ShowcaseResult(
+            ok=True, duration_s=0.01,
+            artifacts=["showcase.json"], rc=0,
+        )
         with TemporaryDirectory() as td:
             tmp = Path(td)
             cfg = _make_cfg(tmp)
             run = _make_run()
             store = MagicMock()
             with (
-                patch.object(stages, "_docker_run_cc_agent",
-                             return_value=(0, "e8-cc-showcase-xyz")) as cc,
-                patch.object(stages, "validate_showcase",
-                             return_value={"items": [], "summary": "ok"}),
+                patch.object(sc_mod, "execute_showcase",
+                             return_value=sc_ok) as native,
+                patch.object(stages, "_docker_run_cc_agent") as cc,
             ):
-                stages.execute_stage(run, StageName.SHOWCASE, cfg, store)
-            cc.assert_called_once()
-            # Confirm the stage argument is SHOWCASE so the spawn isn't
-            # accidentally happening for some other stage by mistake.
-            call_args = cc.call_args
-            # _docker_run_cc_agent(run, stage, cfg) signature
-            self.assertEqual(call_args.args[1], StageName.SHOWCASE)
+                r = stages.execute_stage(run, StageName.SHOWCASE, cfg, store)
+            self.assertTrue(r.ok)
+            native.assert_called_once_with(run, cfg)
+            cc.assert_not_called()
 
 
 if __name__ == "__main__":
