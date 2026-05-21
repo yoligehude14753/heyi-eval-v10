@@ -1,6 +1,15 @@
-"""curator/enricher.py — fetch HF modelcard + ask CCR for structured metadata.
+"""curator/enricher.py — fetch HF modelcard + ask heyi_engine for structured metadata.
 
-Pure-ish: HF fetch and CCR call are isolated into small functions that can
+v10 change: the LLM call goes through ``heyi_engine.HeyiEngineClient`` instead
+of CCR. The client auto-discovers what's currently loaded on :10814 so the
+curator no longer hardcodes a model name (one of the v9 root causes — user
+swaps Kimi for M2.7 and CCR keeps requesting MiniMax-M2.7 → 404).
+
+The legacy ``call_ccr_messages`` is preserved as a deprecated path so old
+tests / scripts keep importing; new code should pass an ``engine_client`` in
+``CuratorConfig`` or rely on ``CuratorConfig.from_env()`` which builds one.
+
+Pure-ish: HF fetch and the LLM call are isolated into small functions that can
 be mocked in tests.
 
 Output schema is documented in `CURATED_SCHEMA` below and validated.
@@ -13,10 +22,12 @@ import re
 import urllib.error
 import urllib.request
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from heyi_engine import HeyiEngineClient
 
 # Max chars of modelcard markdown we send to the LLM. Beyond this, even
 # 16K-token-budget MiniMax thinks too long. Pick something that fits
@@ -271,26 +282,59 @@ def normalize_curated(parsed: dict[str, Any] | None) -> dict[str, Any]:
 
 @dataclass
 class CuratorConfig:
-    ccr_url: str = "http://127.0.0.1:3457"
-    ccr_api_key: str = "heyi-eval-v9-local-key"
-    ccr_model: str = "MiniMax-M2.7"
+    # heyi_engine endpoint (v10 default; replaces v9's CCR :3457). The
+    # client auto-discovers the model name from /v1/models — we no longer
+    # hardcode "MiniMax-M2.7" anywhere here.
+    engine_url: str = "http://127.0.0.1:10814"
+    engine_api_key: str | None = None
+    engine_client: HeyiEngineClient | None = field(default=None, repr=False)
     hf_endpoint: str = "https://hf-mirror.com"
     max_card_chars: int = DEFAULT_MAX_CARD_CHARS
     max_tokens: int = 4096
-    ccr_timeout_s: float = 120.0
+    engine_timeout_s: float = 120.0
     hf_timeout_s: float = 15.0
+
+    # ── back-compat shims (deprecated) ───────────────────────────────────
+    # v9 callers still passing ccr_url / ccr_api_key / ccr_model work, but
+    # those fields no longer drive behavior. ccr_model in particular is
+    # ignored because v10 auto-discovers.
+    ccr_url: str = ""
+    ccr_api_key: str = ""
+    ccr_model: str = ""
+    ccr_url_legacy_shim: bool = field(default=False, repr=False)
+
+    def __post_init__(self) -> None:
+        # If a v9 caller passed only ccr_url, treat it as engine_url so we
+        # don't silently misroute. CCR's 3457 won't respond to /v1/models
+        # though, so health() will go unhealthy — that's the right signal.
+        if self.ccr_url and self.engine_url == "http://127.0.0.1:10814":
+            self.engine_url = self.ccr_url
+        if self.ccr_api_key and self.engine_api_key is None:
+            self.engine_api_key = self.ccr_api_key
 
     @classmethod
     def from_env(cls) -> CuratorConfig:
         return cls(
-            ccr_url=os.environ.get("HEYI_EVAL_CCR_URL", "http://127.0.0.1:3457"),
-            ccr_api_key=os.environ.get("HEYI_EVAL_CCR_API_KEY", "heyi-eval-v9-local-key"),
-            ccr_model=os.environ.get("HEYI_EVAL_CCR_MODEL", "MiniMax-M2.7"),
+            engine_url=os.environ.get(
+                "HEYI_ENGINE_URL",
+                os.environ.get("HEYI_EVAL_CCR_URL", "http://127.0.0.1:10814"),
+            ),
+            engine_api_key=os.environ.get("HEYI_ENGINE_API_KEY"),
             hf_endpoint=os.environ.get("HF_ENDPOINT", "https://hf-mirror.com"),
             max_card_chars=int(os.environ.get("HEYI_EVAL_CARD_MAX_CHARS",
                                               str(DEFAULT_MAX_CARD_CHARS))),
             max_tokens=int(os.environ.get("HEYI_EVAL_CURATOR_MAX_TOKENS", "4096")),
         )
+
+    def get_or_create_client(self) -> HeyiEngineClient:
+        """Return the bound client, creating one on demand."""
+        if self.engine_client is None:
+            self.engine_client = HeyiEngineClient(
+                base_url=self.engine_url,
+                timeout_s=self.engine_timeout_s,
+                api_key=self.engine_api_key,
+            )
+        return self.engine_client
 
 
 def enrich_one(
@@ -315,14 +359,22 @@ def enrich_one(
             return fetch_modelcard(hid, endpoint=cfg.hf_endpoint, timeout_s=cfg.hf_timeout_s)
 
     if call_llm is None:
+        client = cfg.get_or_create_client()
+
         def call_llm(prompt: str) -> LlmResponse:
-            return call_ccr_messages(
-                cfg.ccr_url,
-                api_key=cfg.ccr_api_key,
-                model=cfg.ccr_model,
+            """Default v10 path: heyi_engine client. The client raises
+            HeyiEngineError on failure which enrich_one catches below."""
+            r = client.call(
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=cfg.max_tokens,
-                timeout_s=cfg.ccr_timeout_s,
+            )
+            return LlmResponse(
+                text=r.text,
+                model=r.model_id,
+                input_tokens=r.input_tokens,
+                output_tokens=r.output_tokens,
+                elapsed_s=r.elapsed_s,
+                raw=r.raw_response,
             )
 
     result: dict[str, Any] = {
@@ -331,7 +383,10 @@ def enrich_one(
         "card_truncated": False,
         **{k: v for k, v in _DEFAULT_VALUES.items()},
         "_llm_meta": {
-            "model": cfg.ccr_model,
+            # In v10 the model field is populated post-call from llm.model
+            # (which is the auto-discovered served name). Init as None so
+            # readers can tell when the call never ran.
+            "model": None,
             "input_tokens": 0,
             "output_tokens": 0,
             "elapsed_s": 0.0,

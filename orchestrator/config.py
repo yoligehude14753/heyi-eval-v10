@@ -21,15 +21,26 @@ class OrchestratorConfig:
     data_root: Path = field(default_factory=lambda: _env_path("HEYI_EVAL_DATA", "~/heyi-eval-data"))
     repo_root: Path = field(default_factory=lambda: Path(__file__).resolve().parent.parent)
 
-    # CCR (local to nv8)
-    ccr_url: str = os.environ.get("HEYI_EVAL_CCR_URL", "http://127.0.0.1:3457")
-    ccr_apikey: str = os.environ.get("HEYI_EVAL_CCR_APIKEY", "heyi-eval-v9-local-key")
-    ccr_model: str = os.environ.get("HEYI_EVAL_CCR_MODEL", "claude-sonnet-4-20250514")
+    # heyi_engine (local LLM, v10). Replaces v9's CCR layer. The model
+    # name is auto-discovered from /v1/models — no hardcoded ccr_model.
+    engine_url: str = os.environ.get("HEYI_ENGINE_URL", "http://127.0.0.1:10814")
+    engine_api_key: str | None = os.environ.get("HEYI_ENGINE_API_KEY")
 
-    # CCR model alias when the curator stage calls the local LLM (MiniMax / glm-51)
-    # via CCR. Differs from `ccr_model` (which is what claude code sees for its
-    # own self-prompting through CCR).
-    curator_llm_model: str = os.environ.get("HEYI_EVAL_CURATOR_MODEL", "MiniMax-M2.7")
+    # v9 back-compat (only read by legacy code paths; v10 prefers engine_url).
+    # ccr_url defaults to engine_url so any stale `cfg.ccr_url` accesses still
+    # land on the working endpoint.
+    ccr_url: str = os.environ.get(
+        "HEYI_EVAL_CCR_URL",
+        os.environ.get("HEYI_ENGINE_URL", "http://127.0.0.1:10814"),
+    )
+    ccr_apikey: str = os.environ.get("HEYI_EVAL_CCR_APIKEY", "")
+    ccr_model: str = os.environ.get(
+        "HEYI_EVAL_CCR_MODEL", "claude-sonnet-4-20250514",
+    )
+    # Curator's LLM choice — v10 ignores this (auto-discovered) but the
+    # field is kept so v9 callers don't fail with AttributeError. Default
+    # changed to empty string to make it obvious nobody should be reading it.
+    curator_llm_model: str = os.environ.get("HEYI_EVAL_CURATOR_MODEL", "")
 
     # HF mirror endpoint
     hf_endpoint: str = os.environ.get("HF_ENDPOINT", "https://hf-mirror.com")

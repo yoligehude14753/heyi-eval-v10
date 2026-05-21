@@ -1,30 +1,30 @@
-"""CCR upstream health probe.
+"""heyi_engine upstream health probe — v10 thin wrapper.
 
-CCR (claude-code-router) is an Anthropic-API-shaped proxy that forwards
-to an OpenAI-shaped upstream (in our setup: vllm/MiniMax-M2.7 at :10814).
-When the upstream is dead, CCR returns HTTP 500 with a fetch-failed
-error in the body — symptomatically identical to a transient timeout.
+In v9 this module did a real chat completion roundtrip (the "MiniMax
+echoes 'ok'" canary). In v10 we delegate to
+``HeyiEngineClient.health()`` which probes /v1/models — much cheaper
+(no GPU work), more reliable signal (a model being loaded is what we
+actually care about for curator + showcase to work).
 
-This probe sends a tiny prompt that should respond in < 2s if the
-upstream is healthy, and within 10s if it's slow. It's the canary we
-call before queuing real curator work, and the watchdog calls
-periodically.
+The legacy ``probe_ccr`` function is kept as a back-compat shim so old
+call sites that imported it (e.g. orchestrator.main._ccr_preflight_gate
+in v9) continue to compile. New code should call ``probe_engine``
+directly or use ``HeyiEngineClient.health()``.
 """
 from __future__ import annotations
 
-import json
-import time
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
+
+from heyi_engine import HeyiEngineClient
 
 
 @dataclass
 class CcrHealthReport:
+    """v9 compat report struct. New code should use HealthResult."""
     ok: bool
     http_code: int | None
     elapsed_s: float
-    detail: str  # short human-friendly description
+    detail: str
 
     def to_dict(self) -> dict:
         return {
@@ -35,81 +35,47 @@ class CcrHealthReport:
         }
 
 
-_PROBE_PROMPT = (
-    "Respond with the single JSON object {\"ok\": true}, no extra text."
-)
+def probe_engine(
+    engine_url: str = "http://127.0.0.1:10814",
+    *,
+    api_key: str | None = None,
+    timeout_s: float = 10.0,
+) -> CcrHealthReport:
+    """v10 native probe: ask HeyiEngineClient for health.
+
+    Returns a CcrHealthReport so legacy gate code keeps working without
+    a struct change. ``model_id`` from HealthResult is folded into
+    ``detail`` so the report still carries it forward.
+    """
+    client = HeyiEngineClient(
+        base_url=engine_url, timeout_s=timeout_s, api_key=api_key,
+    )
+    h = client.health()
+    if h.ok:
+        detail = f"engine ok, model={h.model_id}"
+    else:
+        detail = h.detail or "unknown failure"
+    return CcrHealthReport(
+        ok=h.ok,
+        http_code=h.http_code,
+        elapsed_s=h.elapsed_s,
+        detail=detail,
+    )
 
 
 def probe_ccr(
     ccr_url: str,
     *,
-    api_key: str,
-    model: str = "MiniMax-M2.7",
+    api_key: str | None = None,
+    model: str | None = None,  # ignored in v10 (auto-discovered)
     timeout_s: float = 10.0,
-    max_tokens: int = 2048,
+    max_tokens: int = 2048,    # ignored in v10
 ) -> CcrHealthReport:
-    """Returns a CcrHealthReport. Never raises.
+    """v9 back-compat shim. Maps to ``probe_engine``.
 
-    Note: even when the upstream is healthy, MiniMax may emit a lot of
-    <think> tokens that get stripped by the strip-think transformer, so
-    we set max_tokens=2048 even for this minimal probe (Q-016 lesson).
+    The ``model`` and ``max_tokens`` params are accepted for signature
+    compatibility but ignored — v10 doesn't need a model name to know
+    if the engine is alive.
     """
-    body = json.dumps({
-        "model": model,
-        "max_tokens": max_tokens,
-        "messages": [{"role": "user", "content": _PROBE_PROMPT}],
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        ccr_url.rstrip("/") + "/v1/messages",
-        data=body,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-            "User-Agent": "heyi-eval/v9 ccr-health-probe",
-        },
-        method="POST",
-    )
-    started = time.time()
-    try:
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-            elapsed = time.time() - started
-            data = json.loads(resp.read().decode("utf-8", errors="replace"))
-        text = "".join(
-            c.get("text", "") for c in data.get("content", []) if c.get("type") == "text"
-        )
-        usage = data.get("usage", {}) or {}
-        if not text.strip():
-            return CcrHealthReport(
-                ok=False, http_code=200, elapsed_s=elapsed,
-                detail=f"empty content (in={usage.get('input_tokens')} out={usage.get('output_tokens')})",
-            )
-        return CcrHealthReport(
-            ok=True, http_code=200, elapsed_s=elapsed,
-            detail=f"text={text[:60]!r}",
-        )
-    except urllib.error.HTTPError as e:
-        elapsed = time.time() - started
-        try:
-            err_body = e.read().decode("utf-8", errors="replace")[:200]
-        except Exception:
-            err_body = ""
-        # Classify common cases
-        if "fetch failed" in err_body or "ECONNREFUSED" in err_body:
-            detail = f"upstream unreachable (HTTP {e.code}, {err_body[:80]})"
-        else:
-            detail = f"HTTP {e.code}: {err_body[:80]}"
-        return CcrHealthReport(
-            ok=False, http_code=e.code, elapsed_s=elapsed, detail=detail,
-        )
-    except (urllib.error.URLError, OSError, TimeoutError) as e:
-        elapsed = time.time() - started
-        return CcrHealthReport(
-            ok=False, http_code=None, elapsed_s=elapsed,
-            detail=f"transport: {type(e).__name__}: {e}",
-        )
-    except Exception as e:
-        elapsed = time.time() - started
-        return CcrHealthReport(
-            ok=False, http_code=None, elapsed_s=elapsed,
-            detail=f"unexpected: {type(e).__name__}: {e}",
-        )
+    del model, max_tokens
+    return probe_engine(ccr_url, api_key=api_key, timeout_s=timeout_s)
