@@ -1,0 +1,76 @@
+# discover/whitelist.yaml — HF org whitelist + trending thresholds
+#
+# Maintained in-repo so changes go through code review.
+# Edit this file then `python -m discover.main once` to re-scan.
+#
+# Last edited: 2026-05-21
+
+tracker:
+  # Orgs that publish canonical foundation models or important ones.
+  # Order doesn't matter; we scan all of them every round.
+  whitelist_orgs:
+    # Chinese tech / research:
+    - Qwen
+    - deepseek-ai
+    - MiniMaxAI
+    - moonshotai
+    - 01-ai
+    - baichuan-inc
+    - InternLM
+    - stepfun-ai
+    - bytedance-research
+    - bytedance-seed
+    - ByteDance-Seed
+    - tencent
+    - TencentARC
+    - Skywork
+    - OpenBMB
+
+    # US labs:
+    - meta-llama
+    - mistralai
+    - microsoft
+    - google
+    - openai-community
+    - nvidia
+    - allenai
+    - HuggingFaceH4
+    - HuggingFaceM4
+    - HuggingFaceTB
+
+    # EU / image / multimodal:
+    - black-forest-labs
+    - stabilityai
+    - apple
+    - briaai
+    - kyutai
+
+    # Specialized:
+    - facebook
+    - lerobot
+
+  # Trending sweep — catch breakouts not in whitelist.
+  # Either threshold passes admits the model.
+  min_downloads_30d: 100000
+  min_likes: 200
+
+  # Only consider models with last_modified ≥ this date.
+  # Bumped to 2026 — we don't care about older models for v9.
+  from_date: "2026-01-01T00:00:00Z"
+
+  # Modality filter (HF's pipeline_tag). If a model has no tag we let it
+  # through; engine_select downstream can refuse if it really can't handle it.
+  modality_pipeline_tags:
+    - text-generation
+    - image-text-to-text
+    - text-to-image
+    - text-to-video
+    - image-to-text
+    - any-to-any
+    - automatic-speech-recognition
+    - text-to-speech
+    - video-to-text
+
+  # Caps to keep one round bounded (don't hammer hf-mirror.com).
+  per_org_limit: 50
+  trending_sweep_limit: 200

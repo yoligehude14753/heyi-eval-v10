@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://heyi-eval.local/schemas/ready.schema.json",
+  "title": "DEPLOY stage artifact (ready.json)",
+  "type": "object",
+  "required": ["stage", "run_id", "hf_id", "engine", "container_name", "endpoint", "served_model_name", "gpu_index"],
+  "properties": {
+    "stage": { "const": "DEPLOY" },
+    "run_id": { "type": "string", "minLength": 1 },
+    "hf_id": { "type": "string", "minLength": 1 },
+    "engine": { "enum": ["vllm", "sglang", "transformers"] },
+    "engine_image": { "type": "string" },
+    "container_name": {
+      "type": "string",
+      "pattern": "^e8-",
+      "description": "INV-3: must start with e8- prefix"
+    },
+    "endpoint": { "type": "string", "format": "uri" },
+    "served_model_name": { "type": "string" },
+    "gpu_index": { "type": "integer", "minimum": 4, "maximum": 7,
+                   "description": "INV-1: GPUs 0-3 are reserved for production minimax" },
+    "boot_seconds": { "type": "number" },
+    "started_at": { "type": "string" },
+    "ready_at": { "type": "string" },
+    "vllm_models_response": { "type": "object" },
+    "error": { "type": "string" }
+  },
+  "additionalProperties": true
+}

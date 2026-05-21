@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://heyi-eval.local/schemas/showcase.schema.json",
+  "title": "SHOWCASE stage artifact (showcase.json)",
+  "description": "Permissive schema; even 1 item counts. CC decides count and depth from modelcard.",
+  "type": "object",
+  "required": ["stage", "run_id", "hf_id", "items", "summary"],
+  "properties": {
+    "stage": { "const": "SHOWCASE" },
+    "run_id": { "type": "string", "minLength": 1 },
+    "hf_id": { "type": "string", "minLength": 1 },
+    "items": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "rationale", "prompt", "actual"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "rationale": { "type": "string", "minLength": 1,
+                         "description": "Why this prompt is interesting given the model's claimed strengths" },
+          "prompt": { "type": "string", "minLength": 1 },
+          "params": {
+            "type": "object",
+            "properties": {
+              "max_tokens": { "type": "number" },
+              "temperature": { "type": "number" }
+            },
+            "additionalProperties": true
+          },
+          "actual": { "type": "string",
+                      "description": "Full untruncated model output" },
+          "tokens_in": { "type": "number" },
+          "tokens_out": { "type": "number" },
+          "latency_ms": { "type": "number" },
+          "comment": { "type": "string" }
+        },
+        "additionalProperties": true
+      }
+    },
+    "summary": { "type": "string", "minLength": 1 },
+    "model_first_impression": { "type": "string" },
+    "aborted_due_to": { "type": "string" }
+  },
+  "additionalProperties": true
+}
