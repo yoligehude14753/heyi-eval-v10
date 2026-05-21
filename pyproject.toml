@@ -22,6 +22,19 @@ dev = [
   "types-requests",
 ]
 
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+# Top-level Python packages. cc-agent is omitted (it's a Docker entrypoint, not importable Python).
+# backup/ and deploy/ may be added in later PRs.
+packages = ["discover", "curator", "orchestrator", "panel"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+discover = ["whitelist.yaml"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
@@ -37,6 +50,15 @@ select = [
 ]
 ignore = [
   "E501",              # line-too-long (rely on formatter)
+  # CJK punctuation false positives. The project's docstrings and Chinese
+  # comments deliberately use full-width parens / colons / semicolons.
+  "RUF001", "RUF002", "RUF003",
+  # Style preferences deferred to PR#3 (orchestrator rewrite). The legacy
+  # v9 code uses try/except/pass and (str, Enum) inheritance widely; we
+  # migrate as-is in PR#1 and modernize in the rewrite PR.
+  "UP042",             # StrEnum migration
+  "SIM105",            # contextlib.suppress preference
+  "SIM108",            # ternary if/else
 ]
 
 [tool.ruff.lint.per-file-ignores]

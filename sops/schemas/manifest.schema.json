@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://heyi-eval.local/schemas/manifest.schema.json",
+  "title": "CLEANUP stage artifact (manifest.json)",
+  "description": "Final aggregate. Other stages may have partial results; manifest tolerates missing fields with explicit ok:false.",
+  "type": "object",
+  "required": ["run_id", "hf_id", "engine"],
+  "properties": {
+    "run_id": { "type": "string", "minLength": 1 },
+    "hf_id": { "type": "string", "minLength": 1 },
+    "engine": { "enum": ["vllm", "sglang", "transformers"] },
+    "engine_image": { "type": "string" },
+    "host": { "type": "string" },
+    "gpu_index": { "type": "integer", "minimum": 4, "maximum": 7 },
+    "started_at": { "type": "string" },
+    "ended_at": { "type": "string" },
+    "elapsed_total_sec": { "type": "number" },
+    "deploy": {
+      "type": "object",
+      "properties": {
+        "ok": { "type": "boolean" },
+        "boot_seconds": { "type": "number" },
+        "reason": { "type": "string" }
+      }
+    },
+    "capability": {
+      "type": "object",
+      "properties": {
+        "ok": { "type": "boolean" },
+        "score": { "type": "string" },
+        "pass_rate": { "type": "number" },
+        "reason": { "type": "string" }
+      }
+    },
+    "showcase": {
+      "type": "object",
+      "properties": {
+        "ok": { "type": "boolean" },
+        "n_items": { "type": "number" },
+        "first_impression": { "type": "string" },
+        "reason": { "type": "string" }
+      }
+    },
+    "cleanup": {
+      "type": "object",
+      "properties": {
+        "containers_removed": { "type": "array", "items": { "type": "string" } },
+        "containers_remaining": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  },
+  "additionalProperties": true
+}

@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://heyi-eval.local/schemas/capability.schema.json",
+  "title": "CAPABILITY stage artifact (capability.json)",
+  "type": "object",
+  "required": ["stage", "run_id", "hf_id", "results"],
+  "properties": {
+    "stage": { "const": "CAPABILITY" },
+    "run_id": { "type": "string", "minLength": 1 },
+    "hf_id": { "type": "string", "minLength": 1 },
+    "results": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "prompt", "expected_substring", "pass"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "prompt": { "type": "string", "minLength": 1 },
+          "expected_substring": { "type": "string" },
+          "actual": { "type": ["string", "null"] },
+          "pass": { "type": "boolean" },
+          "latency_ms": { "type": "number" },
+          "tokens_in": { "type": "number" },
+          "tokens_out": { "type": "number" },
+          "error": { "type": "string" }
+        },
+        "additionalProperties": true
+      }
+    },
+    "score": { "type": "string", "pattern": "^[0-9]+/[0-9]+$" },
+    "pass_rate": { "type": "number", "minimum": 0, "maximum": 1 },
+    "total_duration_s": { "type": "number" },
+    "aborted_due_to": { "type": "string" }
+  },
+  "additionalProperties": true
+}

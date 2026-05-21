@@ -1,0 +1,620 @@
+"""
+Stage executors.
+
+Three flavors:
+
+  * STUB stages — DISCOVER / READY_WAIT — placeholder, just write a
+    minimal _meta payload and return ok. These won't graduate to "real"
+    in v9 since they're trivial (DISCOVER is satisfied by enqueue; the
+    actual discovery cron runs in discover/ as a daemon, not per-run).
+
+  * PYTHON stages — CURATE / METADATA / ENGINE_SELECT — pure-Python
+    deterministic logic that talks to CCR and HF Hub. No claude
+    involvement (cheap, fast, well-specified).
+
+  * CC stages — DEPLOY / CAPABILITY / SHOWCASE / CLEANUP — spawn the
+    heyi-eval/cc-agent:v9 container with the appropriate task.md mounted,
+    let Claude Code orchestrate the work end-to-end (it has Bash and can
+    docker-run inner vllm container), then run runner_validator on the
+    artifacts. CC's self-reported success doesn't decide the stage — the
+    validator does.
+
+All flavors return a `StageResult` describing what happened. The Run object
+mutation (mark_started / mark_ok / mark_failed) is done by the caller in
+main.run_pipeline so all stages have consistent observability.
+"""
+from __future__ import annotations
+
+import subprocess
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from . import notify
+from .config import OrchestratorConfig
+from .state_machine import Run, StageName
+from .store import Store
+from .validator import (
+    ValidationError,
+    validate_capability,
+    validate_deploy,
+    validate_showcase,
+)
+
+
+@dataclass
+class StageResult:
+    ok: bool
+    duration_s: float
+    artifacts: list[str]
+    error: str | None = None
+    payload: dict[str, Any] | None = None       # parsed artifact for downstream
+    rc: int | None = None
+    container_name: str | None = None
+
+
+# ── stub stages ────────────────────────────────────────────────────────────
+
+
+def _execute_stub(run: Run, stage: StageName, cfg: OrchestratorConfig) -> StageResult:
+    """Stub: immediately succeeds, writes a minimal _meta payload where needed."""
+    t0 = time.time()
+    rd = cfg.run_dir(run.run_id)
+    rd.mkdir(parents=True, exist_ok=True)
+    meta_dir = rd / "_meta"
+    meta_dir.mkdir(exist_ok=True)
+
+    if stage == StageName.DISCOVER:
+        import json
+        (meta_dir / "discover.json").write_text(
+            json.dumps({"stage": "DISCOVER", "hf_id": run.hf_id,
+                        "source": "enqueue"}, indent=2)
+        )
+    # READY_WAIT: nothing to write here — actual readiness probe runs
+    # at the end of DEPLOY (cc-agent writes ready.json after smoke test).
+
+    return StageResult(ok=True, duration_s=time.time() - t0, artifacts=[], rc=0)
+
+
+# ── python stages: CURATE / METADATA / ENGINE_SELECT ──────────────────────
+
+
+# Default values when CURATE is degraded — match curator.enricher's
+# normalize_curated() defaults exactly so downstream sees a consistent schema.
+_DEFAULT_CURATED_SCHEMA: dict[str, Any] = {
+    "card_truncated": False,
+    "publisher": {"name": None, "type": "unknown", "homepage": None},
+    "contributors": [],
+    "summary": None,
+    "claimed_strengths": [],
+    "innovations": [],
+    "limitations": [],
+    "license": None,
+    "modalities": [],
+    "languages": [],
+    "context_length": None,
+    "param_count": None,
+    "training_data": None,
+    "interesting_points": [],
+    "first_impression_tag": None,
+}
+
+
+def _execute_curate_stage(
+    run: Run, cfg: OrchestratorConfig,
+) -> StageResult:
+    """Read HF modelcard → ask CCR (MiniMax) for structured metadata.
+
+    Writes:
+      runs/<run_id>/_meta/curated.json     — full schema
+      runs/<run_id>/_meta/modelcard.md     — original card (for showcase to read)
+      data/curated/<safe>.json             — cache for reuse across runs
+
+    Always returns ok=True (degraded enrichment is fine — downstream stages
+    will see _llm_meta.parse_error and decide what to do).
+    """
+    import json
+
+    from curator.enricher import (
+        CuratorConfig,
+        enrich_one,
+        fetch_modelcard,
+        write_curated,
+    )
+    from curator.health import probe_ccr
+
+    from .store import Store as _StoreLocal  # only for outbox path lookup
+
+    t0 = time.time()
+    rd = cfg.run_dir(run.run_id)
+    meta_dir = rd / "_meta"
+    meta_dir.mkdir(parents=True, exist_ok=True)
+
+    cur_cfg = CuratorConfig(
+        ccr_url=cfg.ccr_url,
+        ccr_api_key=cfg.ccr_apikey,
+        ccr_model=cfg.curator_llm_model,   # NOT cfg.ccr_model (which is claude's self-model)
+        hf_endpoint=cfg.hf_endpoint,
+        max_tokens=8192,
+    )
+
+    # cache lookup
+    safe = run.hf_id.replace("/", "__")
+    cache_path = cfg.data_root / "curated" / f"{safe}.json"
+    curated: dict[str, Any]
+    cache_hit = False
+    if cache_path.exists():
+        try:
+            curated = json.loads(cache_path.read_text(encoding="utf-8"))
+            cache_hit = True
+            print(f"  [curate] cache hit: {cache_path.name}")
+        except Exception:
+            curated = enrich_one(run.hf_id, cur_cfg)
+    else:
+        # Pre-flight: probe CCR upstream so we fail fast on outages
+        # (Q-019: CCR returns 500 silently when MiniMax/glm-51 container Exited).
+        # If unhealthy, emit incident + skip the enrichment (don't waste 30s)
+        # but DON'T fail the run — METADATA can still produce useful output
+        # from HF Hub alone.
+        print("  [curate] CCR pre-flight probe …")
+        health = probe_ccr(cfg.ccr_url, api_key=cfg.ccr_apikey,
+                           model=cfg.curator_llm_model, timeout_s=10.0)
+        if not health.ok:
+            print(f"  [curate] PRE-FLIGHT FAIL: {health.detail}  "
+                  f"(http={health.http_code} t={health.elapsed_s:.1f}s)")
+            # emit incident — uses orchestrator's outbox via notify module
+            try:
+                store = _StoreLocal(cfg.data_root)
+                notify.incident(
+                    store.outbox_path,
+                    what="curator-ccr-upstream",
+                    detail=(f"CCR upstream unhealthy: {health.detail}. "
+                            f"Curator stage will run DEGRADED (HF Hub only). "
+                            f"hf_id={run.hf_id}"),
+                    run_id=run.run_id,
+                )
+            except Exception as e:
+                print(f"  [curate] notify.incident failed: {e}")
+            curated = {
+                "hf_id": run.hf_id,
+                "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()),
+                **({k: v for k, v in _DEFAULT_CURATED_SCHEMA.items()}),
+                "_llm_meta": {
+                    "model": cur_cfg.ccr_model,
+                    "input_tokens": 0, "output_tokens": 0, "elapsed_s": health.elapsed_s,
+                    "parse_error": f"ccr-preflight-fail: {health.detail}",
+                    "card_fetch_error": None,
+                },
+            }
+        else:
+            print(f"  [curate] enriching {run.hf_id} via CCR  (preflight {health.elapsed_s:.1f}s)")
+            curated = enrich_one(run.hf_id, cur_cfg)
+        try:
+            write_curated(cfg.data_root / "curated", curated)
+        except Exception as e:
+            print(f"  [curate] cache write failed: {e}")
+
+    # always write run-dir artifact
+    (meta_dir / "curated.json").write_text(
+        json.dumps(curated, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # also save the raw modelcard for showcase
+    mc_path = meta_dir / "modelcard.md"
+    if not mc_path.exists():
+        try:
+            md = fetch_modelcard(run.hf_id, endpoint=cfg.hf_endpoint, timeout_s=15.0)
+            mc_path.write_text(md, encoding="utf-8")
+        except Exception as e:
+            mc_path.write_text(
+                f"# {run.hf_id}\n\n(modelcard fetch failed: {e})\n", encoding="utf-8"
+            )
+
+    lm = curated.get("_llm_meta", {}) or {}
+    err = lm.get("parse_error") or lm.get("card_fetch_error")
+    return StageResult(
+        ok=True,
+        duration_s=time.time() - t0,
+        artifacts=["_meta/curated.json", "_meta/modelcard.md"],
+        payload={"first_impression_tag": curated.get("first_impression_tag"),
+                 "degraded": bool(err),
+                 "cache_hit": cache_hit},
+        rc=0,
+    )
+
+
+def _execute_metadata_stage(
+    run: Run, cfg: OrchestratorConfig,
+) -> StageResult:
+    """Merge curated.json + HF Hub structured metadata → metadata.json.
+
+    HF Hub provides authoritative fields (license, library_name,
+    pipeline_tag, downloads, last_modified, model size) that we should
+    NOT rely on the LLM for. CURATE got the interpretive fields; this
+    stage joins.
+    """
+    import json
+    t0 = time.time()
+    rd = cfg.run_dir(run.run_id)
+    meta_dir = rd / "_meta"
+    meta_dir.mkdir(parents=True, exist_ok=True)
+
+    curated: dict[str, Any] = {}
+    cp = meta_dir / "curated.json"
+    if cp.exists():
+        try:
+            curated = json.loads(cp.read_text(encoding="utf-8"))
+        except Exception:
+            curated = {}
+
+    hf_info: dict[str, Any] = {}
+    try:
+        from huggingface_hub import HfApi  # type: ignore[import-not-found]
+        api = HfApi(endpoint=cfg.hf_endpoint)
+        info = api.model_info(run.hf_id, files_metadata=False)
+        hf_info = {
+            "id": info.id,
+            "author": getattr(info, "author", None),
+            "private": bool(getattr(info, "private", False) or False),
+            "gated": bool(getattr(info, "gated", False) or False),
+            "downloads": int(getattr(info, "downloads", 0) or 0) or None,
+            "likes": int(getattr(info, "likes", 0) or 0) or None,
+            "library_name": getattr(info, "library_name", None),
+            "pipeline_tag": getattr(info, "pipeline_tag", None),
+            "tags": list(getattr(info, "tags", []) or []),
+            "last_modified": str(getattr(info, "last_modified", None) or ""),
+        }
+    except Exception as e:
+        print(f"  [metadata] HF model_info failed: {type(e).__name__}: {e}")
+        hf_info = {"id": run.hf_id, "error": f"{type(e).__name__}: {e}"}
+
+    # primary modality — prefer curator's list, fall back to HF pipeline_tag mapping
+    modalities = list(curated.get("modalities") or [])
+    if not modalities and hf_info.get("pipeline_tag"):
+        modalities = _pipeline_to_modalities(hf_info["pipeline_tag"])
+
+    metadata = {
+        "stage": "METADATA",
+        "hf_id": run.hf_id,
+        "hf_info": hf_info,
+        "publisher": curated.get("publisher"),
+        "contributors": curated.get("contributors", []),
+        "summary": curated.get("summary"),
+        "modality": modalities[0] if modalities else "unknown",
+        "modalities": modalities,
+        "license": curated.get("license") or _license_from_tags(hf_info.get("tags", [])),
+        "context_length": curated.get("context_length"),
+        "param_count": curated.get("param_count"),
+        "claimed_strengths": curated.get("claimed_strengths", []),
+        "innovations": curated.get("innovations", []),
+        "interesting_points": curated.get("interesting_points", []),
+        "first_impression_tag": curated.get("first_impression_tag"),
+        "languages": curated.get("languages", []),
+        "degraded": bool((curated.get("_llm_meta", {}) or {}).get("parse_error")
+                         or (curated.get("_llm_meta", {}) or {}).get("card_fetch_error")),
+    }
+    (meta_dir / "metadata.json").write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    return StageResult(
+        ok=True, duration_s=time.time() - t0,
+        artifacts=["_meta/metadata.json"],
+        payload={"modality": metadata["modality"],
+                 "params": metadata["param_count"],
+                 "license": metadata["license"]},
+        rc=0,
+    )
+
+
+def _execute_engine_select_stage(
+    run: Run, cfg: OrchestratorConfig,
+) -> StageResult:
+    """Decide which inference engine to use, based on metadata.json.
+
+    Decision tree (kept simple — handbook owns the engine command details):
+
+      modality                          | first choice  | fallback
+      ----------------------------------|---------------|-----------
+      text / code / text-to-text        | vllm          | transformers
+      image-text-to-text (VL)           | vllm          | transformers
+      automatic-speech-recognition       | transformers  | -
+      text-to-speech                    | transformers  | -
+      text-to-image / text-to-video     | transformers  | -  (diffusers via cc-agent)
+      any-to-any / multimodal mix       | vllm          | transformers
+      unknown                           | vllm          | transformers
+    """
+    import json
+    t0 = time.time()
+    rd = cfg.run_dir(run.run_id)
+    meta_dir = rd / "_meta"
+    meta_dir.mkdir(parents=True, exist_ok=True)
+
+    metadata: dict[str, Any] = {}
+    mp = meta_dir / "metadata.json"
+    if mp.exists():
+        try:
+            metadata = json.loads(mp.read_text(encoding="utf-8"))
+        except Exception:
+            metadata = {}
+
+    modality = (metadata.get("modality") or "unknown").lower()
+    pipeline_tag = ((metadata.get("hf_info") or {}).get("pipeline_tag") or "").lower()
+
+    engine, image, reason, fallback = _pick_engine(modality, pipeline_tag,
+                                                   library_name=(metadata.get("hf_info") or {}).get("library_name"))
+
+    plan = {
+        "stage": "ENGINE_SELECT",
+        "hf_id": run.hf_id,
+        "engine": engine,
+        "engine_image": image,
+        "reason": reason,
+        "fallback_engine": fallback,
+        # cc-agent reads these env vars to actually launch the inner container
+        "vllm_args": _vllm_args_hint(metadata),
+    }
+    (meta_dir / "engine.json").write_text(
+        json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    return StageResult(
+        ok=True, duration_s=time.time() - t0,
+        artifacts=["_meta/engine.json"],
+        payload={"engine": engine, "fallback": fallback},
+        rc=0,
+    )
+
+
+def _pipeline_to_modalities(tag: str) -> list[str]:
+    """HF pipeline_tag → our modality list."""
+    t = tag.lower()
+    if t in ("text-generation", "text2text-generation", "fill-mask",
+             "question-answering", "summarization", "translation"):
+        return ["text"]
+    if t in ("text-to-image", "image-to-image", "inpainting"):
+        return ["image"]
+    if t in ("text-to-video", "image-to-video", "video-to-video"):
+        return ["video"]
+    if t in ("automatic-speech-recognition", "audio-classification"):
+        return ["audio"]
+    if t in ("text-to-speech",):
+        return ["audio"]
+    if t in ("image-to-text", "image-text-to-text", "visual-question-answering"):
+        return ["text", "image"]
+    if t in ("video-to-text",):
+        return ["text", "video"]
+    if t == "any-to-any":
+        return ["text", "image", "audio"]
+    return []
+
+
+def _license_from_tags(tags: list[str]) -> str | None:
+    """HF stores license as a tag like `license:apache-2.0`."""
+    for t in tags or []:
+        if isinstance(t, str) and t.startswith("license:"):
+            return t.split(":", 1)[1]
+    return None
+
+
+def _pick_engine(modality: str, pipeline_tag: str,
+                 library_name: str | None = None) -> tuple[str, str, str, str | None]:
+    """Returns (engine, image, reason, fallback). image is what cc-agent docker-runs."""
+    # vllm-compatible modalities
+    if modality in ("text", "code") or pipeline_tag in (
+        "text-generation", "text2text-generation", "image-text-to-text",
+        "any-to-any",
+    ):
+        return ("vllm", "vllm/vllm-openai:v0.11.0", "text-generation family", "transformers")
+
+    # Speech in/out — transformers is the safe path
+    if pipeline_tag in ("automatic-speech-recognition", "audio-classification",
+                        "text-to-speech"):
+        return ("transformers", "heyi-eval/transformers-runner:v9",
+                f"audio pipeline_tag={pipeline_tag}", None)
+
+    # Image/Video generation — diffusers via transformers runner
+    if pipeline_tag in ("text-to-image", "image-to-image", "inpainting",
+                        "text-to-video", "image-to-video"):
+        return ("transformers", "heyi-eval/transformers-runner:v9",
+                f"diffusion pipeline_tag={pipeline_tag}", None)
+
+    # library_name hints
+    if (library_name or "").lower() in ("diffusers", "sentence-transformers"):
+        return ("transformers", "heyi-eval/transformers-runner:v9",
+                f"library={library_name}", None)
+
+    # default: vllm with transformers fallback (handbook decides the actual command)
+    return ("vllm", "vllm/vllm-openai:v0.11.0",
+            f"default (modality={modality}, pipeline_tag={pipeline_tag or 'unknown'})",
+            "transformers")
+
+
+def _vllm_args_hint(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Best-effort vllm flag suggestions for cc-agent's DEPLOY stage.
+
+    Not authoritative — cc-agent can still adapt at runtime (e.g. lower
+    gpu-memory-utilization to fit alongside glm-51, like it did in T11).
+    """
+    ctx = metadata.get("context_length")
+    param_str = (metadata.get("param_count") or "").lower()
+    hint: dict[str, Any] = {}
+    if ctx and isinstance(ctx, int) and ctx > 0:
+        # cap to 32k unless explicitly long-context model
+        hint["max_model_len"] = min(ctx, 32_768)
+    # crude size heuristic for tp
+    if param_str:
+        if any(s in param_str for s in ("70b", "72b", "100b", "180b", "405b")):
+            hint["tensor_parallel_size"] = 4
+        elif any(s in param_str for s in ("30b", "32b", "34b")):
+            hint["tensor_parallel_size"] = 2
+        else:
+            hint["tensor_parallel_size"] = 1
+    return hint
+
+
+# ── CC stages ──────────────────────────────────────────────────────────────
+
+
+def _cc_agent_container_name(run: Run, stage: StageName) -> str:
+    short = run.run_id[-8:].replace("_", "-")
+    return f"e8-cc-{stage.value.lower()}-{short}"
+
+
+def _docker_run_cc_agent(
+    run: Run, stage: StageName, cfg: OrchestratorConfig, *, dry_run: bool = False,
+) -> tuple[int, str]:
+    """
+    Spawn one cc-agent container for `stage`. Returns (rc, container_name).
+
+    Synchronous: blocks until the container exits or `cfg.timeout_for(stage)`
+    wall-clock seconds elapse, whichever is first. On timeout we
+    docker rm -f the container and the rc will be 124 (matching `timeout`'s
+    convention).
+
+    Container layout (mirrors cc-agent/run_cc.sh expectations):
+      /workspace/handbook.md       (bind cfg.handbook_path:ro)
+      /workspace/task.md           (bind cfg.task_md(stage):ro)
+      /workspace/runs/<run_id>/    (bind cfg.run_dir(run.run_id))
+      /var/run/docker.sock         (host docker socket)
+      /usr/bin/docker              (host docker binary; matched GLIBC bookworm)
+      /DATA/Model/_eval-cache      (model weights, ro)
+    """
+    container = _cc_agent_container_name(run, stage)
+    rd = cfg.run_dir(run.run_id)
+    rd.mkdir(parents=True, exist_ok=True)
+    task_path = cfg.task_md(stage.value)
+
+    # CRITICAL: cc-agent still runs as root inside (apt + useradd in stage
+    # 1-3 require it), but we pass HOST_UID/HOST_GID so the `agent` user
+    # created inside matches the host orchestrator's uid. Then chown -R
+    # agent:agent at the end of run_cc.sh leaves files owned by the host
+    # user, not root. Caught by the first real T11 attempt on nv8 (2026-05)
+    # where state.json writes hit Permission denied. (See Q-014.)
+    import os as _os
+    host_uid = _os.getuid()
+    host_gid = _os.getgid()
+    cmd = [
+        "docker", "run", "--rm",
+        "--name", container,
+        "--network", "host",
+        "-v", f"{cfg.handbook_path}:/workspace/handbook.md:ro",
+        "-v", f"{task_path}:/workspace/task.md:ro",
+        "-v", f"{rd}:/workspace/runs/{run.run_id}",
+        "-v", f"{cfg.docker_socket}:/var/run/docker.sock",
+        "-v", f"{cfg.model_cache_root}:/DATA/Model/_eval-cache:ro",
+        "-e", f"HOST_UID={host_uid}",
+        "-e", f"HOST_GID={host_gid}",
+    ]
+    if cfg.host_docker_bin and Path(cfg.host_docker_bin).exists():
+        cmd += ["-v", f"{cfg.host_docker_bin}:/usr/bin/docker:ro"]
+    cmd += [
+        "-e", f"STAGE={stage.value}",
+        "-e", f"RUN_ID={run.run_id}",
+        "-e", f"HF_ID={run.hf_id}",
+        "-e", f"HF_LOCAL_DIR={cfg.hf_local_dir(run.hf_id)}",
+        "-e", f"PORT={cfg.vllm_port}",
+        "-e", f"ANTHROPIC_BASE_URL={cfg.ccr_url}",
+        "-e", f"ANTHROPIC_AUTH_TOKEN={cfg.ccr_apikey}",
+        "-e", f"ANTHROPIC_MODEL={cfg.ccr_model}",
+        "-e", f"MAX_TURNS={cfg.cc_agent_max_turns}",
+        cfg.cc_agent_image,
+    ]
+
+    if dry_run:
+        return (0, container)
+
+    timeout = cfg.timeout_for(stage.value)
+    print(f"  [cc-agent] spawn {container} (timeout={timeout}s)")
+
+    try:
+        cp = subprocess.run(cmd, timeout=timeout, capture_output=False, check=False)
+        rc = cp.returncode
+    except subprocess.TimeoutExpired:
+        print(f"  [cc-agent] TIMEOUT after {timeout}s, removing container")
+        subprocess.run(["docker", "rm", "-f", container], capture_output=True, check=False)
+        rc = 124
+    except FileNotFoundError as e:
+        # docker not in PATH (dev workstation without docker)
+        print(f"  [cc-agent] docker missing: {e}")
+        return (127, container)
+
+    return (rc, container)
+
+
+def _execute_cc_stage(
+    run: Run,
+    stage: StageName,
+    cfg: OrchestratorConfig,
+    store: Store,
+) -> StageResult:
+    t0 = time.time()
+    rc, container = _docker_run_cc_agent(run, stage, cfg)
+    duration = time.time() - t0
+
+    rd = cfg.run_dir(run.run_id)
+
+    # Always run the validator after CC exits — its rc is advisory, not
+    # authoritative (E8 lesson: CC will print "result: success" even when it
+    # produced nothing).
+    try:
+        if stage == StageName.DEPLOY:
+            payload = validate_deploy(
+                rd, schema_root=cfg.schema_root, check_container_live=True,
+            )
+        elif stage == StageName.CAPABILITY:
+            payload = validate_capability(rd, schema_root=cfg.schema_root)
+        elif stage == StageName.SHOWCASE:
+            payload = validate_showcase(rd, schema_root=cfg.schema_root)
+        elif stage == StageName.CLEANUP:
+            # Cleanup: assert e8-vllm is gone. Container name comes from
+            # ready.json if it exists; otherwise fall back to default.
+            import json
+            ready = rd / "ready.json"
+            evname = cfg.vllm_container
+            if ready.exists():
+                try:
+                    evname = json.loads(ready.read_text()).get("container_name", evname)
+                except Exception:
+                    pass
+            from .validator import validate_cleanup
+            validate_cleanup(rd, ephemeral_container=evname)
+            payload = {"cleanup": "ok", "container": evname}
+        else:
+            raise ValueError(f"unexpected CC stage: {stage}")
+    except ValidationError as ve:
+        return StageResult(
+            ok=False, duration_s=duration, artifacts=[],
+            error=f"validator: {ve}", rc=rc, container_name=container,
+        )
+
+    return StageResult(
+        ok=True, duration_s=duration, artifacts=[],
+        payload=payload, rc=rc, container_name=container,
+    )
+
+
+# ── top-level dispatch ─────────────────────────────────────────────────────
+
+
+_STUB_STAGES = {StageName.DISCOVER, StageName.READY_WAIT}
+_PY_STAGES = {StageName.CURATE, StageName.METADATA, StageName.ENGINE_SELECT}
+_CC_STAGES = {StageName.DEPLOY, StageName.CAPABILITY, StageName.SHOWCASE, StageName.CLEANUP}
+
+
+def execute_stage(
+    run: Run,
+    stage: StageName,
+    cfg: OrchestratorConfig,
+    store: Store,
+) -> StageResult:
+    if stage in _STUB_STAGES:
+        return _execute_stub(run, stage, cfg)
+    if stage in _PY_STAGES:
+        if stage == StageName.CURATE:
+            return _execute_curate_stage(run, cfg)
+        if stage == StageName.METADATA:
+            return _execute_metadata_stage(run, cfg)
+        if stage == StageName.ENGINE_SELECT:
+            return _execute_engine_select_stage(run, cfg)
+    if stage in _CC_STAGES:
+        return _execute_cc_stage(run, stage, cfg, store)
+    raise ValueError(f"no executor for stage {stage}")
