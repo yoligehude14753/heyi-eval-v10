@@ -57,6 +57,9 @@ ALLOWED_PATHS = {
     # INV-11 guard test asserts the dispatcher module no longer exposes
     # the v9 docker-spawn helpers — it must reference their names by string.
     "tests/test_dispatcher_routes.py",
+    # Deploy-side static lint also asserts env.example does NOT contain
+    # certain v9 keys — same reason as above.
+    "tests/test_systemd_units.py",
     "docs/PLAN.md",
     "docs/PR3_TEST_PLAN.md",
     "docs/PR4_TEST_PLAN.md",
