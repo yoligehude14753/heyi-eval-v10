@@ -12,13 +12,13 @@
     "engine_image": { "type": "string" },
     "container_name": {
       "type": "string",
-      "pattern": "^e8-",
-      "description": "INV-3: must start with e8- prefix"
+      "pattern": "^e9-",
+      "description": "INV-1 (v10): must start with e9- prefix. v9 used e8- and required gpu_index pinning; v10 enforces isolation via labels + e9- name prefix instead."
     },
     "endpoint": { "type": "string", "format": "uri" },
     "served_model_name": { "type": "string" },
-    "gpu_index": { "type": "integer", "minimum": 4, "maximum": 7,
-                   "description": "INV-1: GPUs 0-3 are reserved for production minimax" },
+    "gpu_index": { "type": "integer", "minimum": 0, "maximum": 7,
+                   "description": "Informational only in v10. Production GPU pinning is handled by the orchestrator's label-based filter, not by reserved index ranges (heyi_engine moved off the nv8 box in places — INV-1 v9 no longer applies)." },
     "boot_seconds": { "type": "number" },
     "started_at": { "type": "string" },
     "ready_at": { "type": "string" },

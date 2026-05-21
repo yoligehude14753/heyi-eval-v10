@@ -72,27 +72,28 @@ def validate_deploy(
     check_container_live: bool = True,
 ) -> dict[str, Any]:
     """
-    DEPLOY OK = ready.json exists & schema-valid & container_name has e8- prefix
+    DEPLOY OK = ready.json exists & schema-valid & container_name has e9- prefix
                 & (optionally) docker inspect reports container is running.
 
     Returns the parsed ready.json so the orchestrator can read e.g.
     container_name / endpoint for downstream stages.
+
+    v10 changes vs v9:
+      - prefix is e9- (not e8-) so we can run alongside any v9 leftovers
+        during the migration window;
+      - gpu_index range check removed — production GPU isolation moved
+        to label-based filtering in stages_py.execute_cleanup (see INV-1
+        rationale in docs/PLAN.md). gpu_index in ready.json is now
+        informational only.
     """
     payload = _require_file(run_dir / "ready.json", "ready.json")
     if schema_root is not None:
         _validate_schema(payload, schema_root / "ready.schema.json", "ready.json")
 
     container_name = payload.get("container_name", "")
-    if not container_name.startswith("e8-"):
+    if not container_name.startswith("e9-"):
         raise ValidationError(
-            f"INV-3 violation: container '{container_name}' lacks e8- prefix"
-        )
-
-    gpu_index = payload.get("gpu_index")
-    if gpu_index is not None and gpu_index < 4:
-        raise ValidationError(
-            f"INV-1 violation: ready.json reports gpu_index={gpu_index} "
-            f"(only 4-7 allowed; 0-3 are reserved for minimax)"
+            f"INV-1 violation: container '{container_name}' lacks e9- prefix"
         )
 
     if check_container_live:
