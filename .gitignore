@@ -20,6 +20,10 @@ heyi-eval-data/
 *.sqlite
 *.db
 *.jsonl
+# Exception: bundled capability micro-slices are intentionally committed
+# so the CAPABILITY stage runs deterministically on every host without
+# pulling weight from HF Hub. Full benchmark datasets stay external.
+!orchestrator/capability_data/*.jsonl
 
 # CCR runtime (deprecated in v10 but legacy artifact possible)
 ccr/.cache/

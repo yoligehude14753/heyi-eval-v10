@@ -1,27 +1,27 @@
 """
-Stage executors.
+Stage executors (v10).
 
-Three flavors:
+Four flavors after PR#3 + PR#4:
 
-  * STUB stages — DISCOVER / READY_WAIT — placeholder, just write a
-    minimal _meta payload and return ok. These won't graduate to "real"
-    in v9 since they're trivial (DISCOVER is satisfied by enqueue; the
-    actual discovery cron runs in discover/ as a daemon, not per-run).
+  * STUB stages — DISCOVER — placeholder, just write a minimal _meta
+    payload and return ok. (READY_WAIT moved to native in PR#3.)
 
   * PYTHON stages — CURATE / METADATA / ENGINE_SELECT — pure-Python
-    deterministic logic that talks to CCR and HF Hub. No claude
-    involvement (cheap, fast, well-specified).
+    deterministic logic that talks to heyi_engine (curator) and HF Hub.
 
-  * CC stages — DEPLOY / CAPABILITY / SHOWCASE / CLEANUP — spawn the
-    heyi-eval/cc-agent:v9 container with the appropriate task.md mounted,
-    let Claude Code orchestrate the work end-to-end (it has Bash and can
-    docker-run inner vllm container), then run runner_validator on the
-    artifacts. CC's self-reported success doesn't decide the stage — the
-    validator does.
+  * NATIVE stages (v10, PR#3 + PR#4) — DEPLOY / READY_WAIT / CAPABILITY
+    / CLEANUP — Python implementations in ``stages_py.py`` and
+    ``capability.py`` that own the docker socket and the eval HTTP
+    boundary directly. No cc-agent involvement.
 
-All flavors return a `StageResult` describing what happened. The Run object
-mutation (mark_started / mark_ok / mark_failed) is done by the caller in
-main.run_pipeline so all stages have consistent observability.
+  * CC stages — SHOWCASE only (until PR#5 restricts even this). Spawns
+    the cc-agent container; the v10 cc-agent has docker access stripped
+    and a read-only mount on metadata, read-write only on the run's
+    showcase/ subdir.
+
+All flavors return a `StageResult`. Run object mutation (mark_started /
+mark_ok / mark_failed) is done by the caller in main.run_pipeline so all
+stages have consistent observability.
 """
 from __future__ import annotations
 
@@ -595,9 +595,33 @@ def _execute_cc_stage(
 # ── top-level dispatch ─────────────────────────────────────────────────────
 
 
-_STUB_STAGES = {StageName.DISCOVER, StageName.READY_WAIT}
+_STUB_STAGES = {StageName.DISCOVER}
 _PY_STAGES = {StageName.CURATE, StageName.METADATA, StageName.ENGINE_SELECT}
-_CC_STAGES = {StageName.DEPLOY, StageName.CAPABILITY, StageName.SHOWCASE, StageName.CLEANUP}
+# v10 native stages: orchestrator owns docker socket + eval HTTP path.
+# DEPLOY / READY_WAIT / CLEANUP land in stages_py (PR#3);
+# CAPABILITY lands in capability.py (this PR).
+_NATIVE_STAGES = {
+    StageName.DEPLOY, StageName.READY_WAIT,
+    StageName.CAPABILITY, StageName.CLEANUP,
+}
+# Only SHOWCASE still spawns cc-agent. PR#5 restricts its mounts.
+_CC_STAGES = {StageName.SHOWCASE}
+
+
+def _adapt_native(native_result: Any) -> StageResult:
+    """stages_py / capability return their own StageResult dataclass with
+    extra fields (error_kind, extra). Pack the common subset back into
+    the dispatcher's StageResult so existing call sites keep working
+    unchanged."""
+    return StageResult(
+        ok=native_result.ok,
+        duration_s=native_result.duration_s,
+        artifacts=native_result.artifacts,
+        error=native_result.error,
+        payload=native_result.payload,
+        rc=native_result.rc,
+        container_name=native_result.container_name,
+    )
 
 
 def execute_stage(
@@ -615,6 +639,20 @@ def execute_stage(
             return _execute_metadata_stage(run, cfg)
         if stage == StageName.ENGINE_SELECT:
             return _execute_engine_select_stage(run, cfg)
+    if stage in _NATIVE_STAGES:
+        # Lazy imports — stages_py imports docker-py at module load and
+        # we don't want to force that on processes that only run the
+        # stub or python stages (e.g. discover daemon).
+        from . import capability as cap_mod
+        from . import stages_py
+        if stage == StageName.DEPLOY:
+            return _adapt_native(stages_py.execute_deploy(run, cfg))
+        if stage == StageName.READY_WAIT:
+            return _adapt_native(stages_py.execute_ready_wait(run, cfg))
+        if stage == StageName.CAPABILITY:
+            return _adapt_native(cap_mod.execute_capability(run, cfg))
+        if stage == StageName.CLEANUP:
+            return _adapt_native(stages_py.execute_cleanup(run, cfg))
     if stage in _CC_STAGES:
         return _execute_cc_stage(run, stage, cfg, store)
     raise ValueError(f"no executor for stage {stage}")
