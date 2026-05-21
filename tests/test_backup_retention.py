@@ -158,22 +158,39 @@ def test_empty_backups_root(tmp_path: Path):
     assert result.failed == []
 
 
+def test_safe_mtime_returns_none_for_missing_path(tmp_path: Path):
+    """Direct unit-test of _safe_mtime so its OSError → None branch is real."""
+    from backup.retention import _safe_mtime
+    assert _safe_mtime(tmp_path / "does-not-exist") is None
+    real = tmp_path / "exists"
+    real.mkdir()
+    val = _safe_mtime(real)
+    assert val is not None
+    assert val > 0
+
+
 def test_stat_failure_listed_as_failed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
+    """If retention can't read mtime on a single snapshot we mark it failed
+    and keep going. We patch the dedicated `_safe_mtime` seam so this test
+    doesn't accidentally break Path.is_dir() on the prefilter pass — which
+    is what happens on Python 3.11 where is_dir() internally calls stat()."""
     root = tmp_path / "backups"
     root.mkdir()
     _make_snapshot(root, "20260101_120000", mtime_days_ago=140)
     _make_snapshot(root, "20260520_120000", mtime_days_ago=1)
 
-    real_stat = Path.stat
+    import backup.retention as ret
 
-    def flaky_stat(self: Path, *a: object, **kw: object):
-        if self.name == "20260101_120000":
-            raise OSError("simulated stat fail")
-        return real_stat(self, *a, **kw)  # type: ignore[arg-type]
+    real_safe_mtime = ret._safe_mtime
 
-    monkeypatch.setattr(Path, "stat", flaky_stat)
+    def flaky(path: Path) -> float | None:
+        if path.name == "20260101_120000":
+            return None
+        return real_safe_mtime(path)
+
+    monkeypatch.setattr(ret, "_safe_mtime", flaky)
 
     result = prune_old_snapshots(root, keep_days=7, now_fn=_now)
 

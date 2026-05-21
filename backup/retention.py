@@ -65,9 +65,8 @@ def prune_old_snapshots(
         if snap == forced_keep:
             kept.append(snap.name)
             continue
-        try:
-            mtime = snap.stat().st_mtime
-        except OSError:
+        mtime = _safe_mtime(snap)
+        if mtime is None:
             failed.append(snap.name)
             continue
         if mtime >= cutoff_ts:
@@ -80,3 +79,13 @@ def prune_old_snapshots(
             failed.append(snap.name)
 
     return PruneResult(removed=removed, failed=failed, kept=kept)
+
+
+def _safe_mtime(path: Path) -> float | None:
+    """Standalone seam so tests can simulate a single-file stat failure
+    without breaking the `Path.is_dir()` filter (whose implementation also
+    calls stat on Python 3.11)."""
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
