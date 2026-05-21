@@ -50,7 +50,7 @@ class ValidateDeployTests(unittest.TestCase):
             "run_id": "r-1",
             "hf_id": "Qwen/Qwen2.5-0.5B-Instruct",
             "engine": "vllm",
-            "container_name": "e8-vllm",
+            "container_name": "e9-vllm",
             "endpoint": "http://localhost:18200/v1",
             "served_model_name": "Qwen2.5-0.5B-Instruct",
             "gpu_index": 7,
@@ -59,58 +59,58 @@ class ValidateDeployTests(unittest.TestCase):
         payload = validate_deploy(
             self.tmp, schema_root=SCHEMA_ROOT, check_container_live=False
         )
-        self.assertEqual(payload["container_name"], "e8-vllm")
+        self.assertEqual(payload["container_name"], "e9-vllm")
 
     def test_missing_ready_json(self):
         with self.assertRaises(ValidationError) as cm:
             validate_deploy(self.tmp, schema_root=SCHEMA_ROOT, check_container_live=False)
         self.assertIn("ready.json", str(cm.exception))
 
-    def test_inv3_container_name_must_have_e8_prefix(self):
+    def test_inv1_container_name_must_have_e9_prefix(self):
+        # v10: prefix flipped from e8- to e9-. The check fires after schema
+        # validation passes, so we use schema_root=None to isolate it.
         _write(self.tmp / "ready.json", {
             "stage": "DEPLOY",
             "run_id": "r-1",
             "hf_id": "x",
             "engine": "vllm",
-            "container_name": "my-vllm",  # missing e8-
+            "container_name": "my-vllm",  # missing e9-
             "endpoint": "http://x/v1",
             "served_model_name": "x",
             "gpu_index": 7,
         })
         with self.assertRaises(ValidationError) as cm:
             validate_deploy(self.tmp, schema_root=None, check_container_live=False)
-        self.assertIn("INV-3", str(cm.exception))
+        self.assertIn("INV-1", str(cm.exception))
 
-    def test_inv1_gpu_must_be_4_through_7(self):
-        # Schema enforces this; we test via schema_root path
+    def test_gpu_index_no_longer_constrained(self):
+        # v9 enforced gpu_index ∈ [4, 7] because production minimax owned
+        # GPUs 0-3. v10 manages isolation via labels + container name, so
+        # the schema accepts 0-7 freely. This test pins the new contract.
         _write(self.tmp / "ready.json", {
             "stage": "DEPLOY",
             "run_id": "r-1",
             "hf_id": "x",
             "engine": "vllm",
-            "container_name": "e8-vllm",
+            "container_name": "e9-vllm",
             "endpoint": "http://x/v1",
             "served_model_name": "x",
-            "gpu_index": 2,  # forbidden
+            "gpu_index": 0,  # would have been forbidden in v9
         })
-        with self.assertRaises(ValidationError):
-            validate_deploy(self.tmp, schema_root=SCHEMA_ROOT, check_container_live=False)
+        payload = validate_deploy(
+            self.tmp, schema_root=SCHEMA_ROOT, check_container_live=False
+        )
+        self.assertEqual(payload["gpu_index"], 0)
 
-    @unittest.expectedFailure
     def test_schema_rejects_unknown_engine(self):
-        """v9 inherited bug: ready.schema.json doesn't constrain engine enum.
-
-        Test was already failing in v9 (verified by re-running there). Kept
-        as expectedFailure to keep the gap visible. Will be fixed in PR#3
-        when stages are rewritten in Python and the schema is tightened to
-        engine ∈ {vllm, sglang, transformers}.
-        """
+        # PR#3 fixed the v9 gap: schema's `engine` enum now rejects
+        # arbitrary strings. Test was xfail in PR#1, now passing.
         _write(self.tmp / "ready.json", {
             "stage": "DEPLOY",
             "run_id": "r-1",
             "hf_id": "x",
             "engine": "made-up-engine",
-            "container_name": "e8-vllm",   # v9 prefix; flips to e9- in PR#3
+            "container_name": "e9-vllm",
             "endpoint": "http://x/v1",
             "served_model_name": "x",
             "gpu_index": 7,
