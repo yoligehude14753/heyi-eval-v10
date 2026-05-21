@@ -250,3 +250,117 @@ def test_render_results_page_empty_when_no_runs(tmp_path, monkeypatch):
     importlib.reload(srv)
     html = srv.render_results_page()
     assert "无评测结果" in html
+
+
+# ─── PR#6 backup panel integration ─────────────────────────────────────────
+
+
+@pytest.fixture
+def fake_backups_root(tmp_path, monkeypatch):
+    """A backups_root fixture independent of fake_data_root so each backup
+    test can dial in last_backup.txt age without disturbing run state."""
+    backups = tmp_path / "bk"
+    backups.mkdir()
+    monkeypatch.setenv("HEYI_EVAL_BACKUPS", str(backups))
+    import importlib
+
+    import panel.server as srv
+    importlib.reload(srv)
+    return srv, backups
+
+
+def _ts(iso: str) -> str:
+    return iso  # readability shim
+
+
+def test_p1_api_backup_returns_health_ok(fake_backups_root, monkeypatch):
+    srv, backups = fake_backups_root
+    from datetime import UTC, datetime, timedelta
+
+    # Two completed snapshots, last one 10 minutes ago → ok.
+    now = datetime.now(UTC)
+    for i, ts in enumerate(["20260520_180000", "20260521_120000"]):
+        d = backups / ts
+        d.mkdir()
+        (d / "backup_meta.json").write_text(json.dumps({"size_bytes": 1000 * (i + 1)}))
+    (backups / "last_backup.txt").write_text((now - timedelta(minutes=10)).isoformat())
+
+    out = srv.backup_status()
+    assert out["health"] == "ok"
+    assert out["snapshot_count"] == 2
+    assert out["total_size_bytes"] == 3000
+    assert 0 <= out["last_backup_age_s"] <= 3600
+    assert out["last_backup_ts"] is not None
+    assert isinstance(out["snapshots_tail"], list)
+
+
+def test_p2_no_last_backup_txt_is_down(fake_backups_root):
+    srv, backups = fake_backups_root
+    # snapshot dir exists but no last_backup.txt
+    (backups / "20260521_120000").mkdir()
+    out = srv.backup_status()
+    assert out["health"] == "down"
+    assert out["last_backup_ts"] is None
+
+
+def test_p3_old_backup_24h_plus_is_down(fake_backups_root):
+    srv, backups = fake_backups_root
+    from datetime import UTC, datetime, timedelta
+    (backups / "20260521_120000").mkdir()
+    (backups / "20260521_120000" / "backup_meta.json").write_text("{}")
+    stale = datetime.now(UTC) - timedelta(hours=36)
+    (backups / "last_backup.txt").write_text(stale.isoformat())
+    out = srv.backup_status()
+    assert out["health"] == "down"
+
+
+def test_p4_recent_backup_under_60min_is_ok(fake_backups_root):
+    srv, backups = fake_backups_root
+    from datetime import UTC, datetime, timedelta
+    (backups / "20260521_120000").mkdir()
+    (backups / "20260521_120000" / "backup_meta.json").write_text("{}")
+    (backups / "last_backup.txt").write_text(
+        (datetime.now(UTC) - timedelta(minutes=5)).isoformat()
+    )
+    out = srv.backup_status()
+    assert out["health"] == "ok"
+
+
+def test_p5_backups_root_absent(tmp_path, monkeypatch):
+    absent = tmp_path / "nope"
+    monkeypatch.setenv("HEYI_EVAL_BACKUPS", str(absent))
+    import importlib
+
+    import panel.server as srv
+    importlib.reload(srv)
+    out = srv.backup_status()
+    assert out["health"] == "down"
+    assert out["snapshot_count"] == 0
+    assert out["last_backup_ts"] is None
+
+
+def test_p6_index_html_mentions_backup_card():
+    import panel.server as srv
+    assert "数据备份" in srv.INDEX_HTML
+    assert "/api/backup" in srv.INDEX_HTML
+    assert 'id="backup-grid"' in srv.INDEX_HTML
+
+
+def test_api_backup_route_responds(fake_backups_root):
+    srv, _ = fake_backups_root
+    # Dispatch through Handler to make sure the route is wired.
+    from io import BytesIO
+    from unittest.mock import MagicMock
+
+    handler = MagicMock(spec=srv.Handler)
+    handler.path = "/api/backup"
+    handler.wfile = BytesIO()
+    handler._json = lambda payload, status=200: handler.wfile.write(  # type: ignore[attr-defined]
+        json.dumps(payload).encode("utf-8")
+    )
+    handler._html = lambda *a, **kw: None  # type: ignore[attr-defined]
+    srv.Handler.do_GET(handler)
+    body = handler.wfile.getvalue()
+    parsed = json.loads(body.decode("utf-8"))
+    assert "health" in parsed
+    assert "backups_root" in parsed

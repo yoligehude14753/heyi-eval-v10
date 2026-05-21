@@ -1,0 +1,15 @@
+[Unit]
+Description=heyi-eval-v10 backup timer (every 30 min, randomized 60s jitter)
+
+[Timer]
+# 30 minutes after boot, then every 30 minutes wall-clock.
+OnBootSec=15min
+OnUnitActiveSec=30min
+# Wall-clock aligned schedule for predictable on-call windows.
+OnCalendar=*:0/30
+RandomizedDelaySec=60
+Persistent=true
+Unit=heyi-eval-backup.service
+
+[Install]
+WantedBy=timers.target

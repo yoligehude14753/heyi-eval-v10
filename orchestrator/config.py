@@ -20,6 +20,11 @@ class OrchestratorConfig:
     # data layout
     data_root: Path = field(default_factory=lambda: _env_path("HEYI_EVAL_DATA", "~/heyi-eval-data"))
     repo_root: Path = field(default_factory=lambda: Path(__file__).resolve().parent.parent)
+    # PR#6: out-of-tree snapshot root. Must NOT live under data_root (INV-9).
+    # Override via HEYI_EVAL_BACKUPS for test/dev environments.
+    backups_root: Path = field(
+        default_factory=lambda: _env_path("HEYI_EVAL_BACKUPS", "~/heyi-eval-backups")
+    )
 
     # heyi_engine (local LLM, v10). Replaces v9's CCR layer. The model
     # name is auto-discovered from /v1/models — no hardcoded ccr_model.
