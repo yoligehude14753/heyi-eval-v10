@@ -1,0 +1,25 @@
+[Unit]
+Description=heyi-eval-v10 notify_outbox → WeChat bridge (placeholder)
+Documentation=https://github.com/yoligehude14753/heyi-eval-v10/blob/main/docs/PR7b_TEST_PLAN.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ai
+Group=ai
+WorkingDirectory=/home/ai/heyi-eval-v10
+EnvironmentFile=-/etc/heyi-eval-v10/env
+# TODO(notify-sync): implement `notify_sync` module that tails
+# data_root/store/notify_outbox.jsonl and forwards `channels: ["wechat"]`
+# events through the user's wechat bridge. For now this exits 0 immediately
+# so the unit file can ship without breaking deploy automation.
+ExecStart=/home/ai/heyi-eval-v10/.venv/bin/python -c "import sys; print('notify-sync: placeholder, exiting 0'); sys.exit(0)"
+Restart=no
+Nice=15
+MemoryHigh=256M
+MemoryMax=512M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

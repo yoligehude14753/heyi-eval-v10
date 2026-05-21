@@ -1,0 +1,31 @@
+[Unit]
+Description=heyi-eval-v10 orchestrator main loop (DISCOVER → CURATE → ... → CLEANUP)
+Documentation=https://github.com/yoligehude14753/heyi-eval-v10/blob/main/docs/PR7b_TEST_PLAN.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ai
+Group=ai
+WorkingDirectory=/home/ai/heyi-eval-v10
+EnvironmentFile=-/etc/heyi-eval-v10/env
+# heyi_engine readiness is gated INSIDE the loop (_engine_preflight_gate);
+# don't tie systemd start order to it — the engine is user-managed and may
+# bounce independently.
+ExecStart=/home/ai/heyi-eval-v10/.venv/bin/python -m orchestrator loop
+Restart=on-failure
+RestartSec=10s
+StartLimitBurst=5
+StartLimitIntervalSec=300s
+# Yield to heyi_engine production traffic (INV-1).
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+# Defensive caps against runaway memory / forks.
+MemoryHigh=8G
+MemoryMax=16G
+TasksMax=512
+
+[Install]
+WantedBy=multi-user.target
