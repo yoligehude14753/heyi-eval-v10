@@ -89,7 +89,7 @@ markers = [
 ]
 
 [tool.coverage.run]
-source = ["discover", "curator", "orchestrator", "panel"]
+source = ["discover", "curator", "heyi_engine", "orchestrator", "panel"]
 omit = [
   "*/tests/*",
   "*/__main__.py",
