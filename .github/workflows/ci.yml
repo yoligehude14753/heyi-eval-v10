@@ -39,7 +39,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
       - name: mypy
-        run: mypy discover curator heyi_engine orchestrator panel backup 2>&1 | tail -50 || true
+        run: mypy discover curator heyi_engine orchestrator panel cc_agent backup 2>&1 | tail -50 || true
         # NOTE: not yet --strict-enforced; ramp up after PR#3.
 
   test:

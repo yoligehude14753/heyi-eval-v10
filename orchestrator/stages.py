@@ -599,13 +599,18 @@ _STUB_STAGES = {StageName.DISCOVER}
 _PY_STAGES = {StageName.CURATE, StageName.METADATA, StageName.ENGINE_SELECT}
 # v10 native stages: orchestrator owns docker socket + eval HTTP path.
 # DEPLOY / READY_WAIT / CLEANUP land in stages_py (PR#3);
-# CAPABILITY lands in capability.py (this PR).
+# CAPABILITY lands in capability.py (PR#4);
+# SHOWCASE moved here in PR#5 (cc_agent.showcase_runner) — pure Python,
+# no docker spawn anywhere.
 _NATIVE_STAGES = {
     StageName.DEPLOY, StageName.READY_WAIT,
     StageName.CAPABILITY, StageName.CLEANUP,
+    StageName.SHOWCASE,
 }
-# Only SHOWCASE still spawns cc-agent. PR#5 restricts its mounts.
-_CC_STAGES = {StageName.SHOWCASE}
+# Empty set kept for the v9-style cc-agent docker spawn path. After PR#5
+# no stage uses it; PR#7 removes the cc-agent docker image refs and
+# this constant + _docker_run_cc_agent + _execute_cc_stage entirely.
+_CC_STAGES: set[StageName] = set()
 
 
 def _adapt_native(native_result: Any) -> StageResult:
@@ -643,6 +648,8 @@ def execute_stage(
         # Lazy imports — stages_py imports docker-py at module load and
         # we don't want to force that on processes that only run the
         # stub or python stages (e.g. discover daemon).
+        from cc_agent import showcase_runner as sc_mod  # PR#5
+
         from . import capability as cap_mod
         from . import stages_py
         if stage == StageName.DEPLOY:
@@ -653,6 +660,8 @@ def execute_stage(
             return _adapt_native(cap_mod.execute_capability(run, cfg))
         if stage == StageName.CLEANUP:
             return _adapt_native(stages_py.execute_cleanup(run, cfg))
-    if stage in _CC_STAGES:
+        if stage == StageName.SHOWCASE:
+            return _adapt_native(sc_mod.execute_showcase(run, cfg))
+    if stage in _CC_STAGES:  # pragma: no cover — empty in v10
         return _execute_cc_stage(run, stage, cfg, store)
     raise ValueError(f"no executor for stage {stage}")
