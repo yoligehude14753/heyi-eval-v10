@@ -124,7 +124,7 @@ class PromptBuildingTests(unittest.TestCase):
 class EnrichOneIntegrationTests(unittest.TestCase):
 
     def _config(self):
-        return CuratorConfig(ccr_url="x", ccr_api_key="k", ccr_model="MiniMax-M2.7")
+        return CuratorConfig(engine_url="http://engine.test", engine_api_key=None)
 
     def test_happy_path(self):
         card = "---\nlicense: mit\n---\n# Cool Model\nIt does text-generation."
@@ -200,7 +200,7 @@ class EnrichOneIntegrationTests(unittest.TestCase):
             return "# Model"
 
         def fake_llm(prompt):
-            raise TimeoutError("CCR slow")
+            raise TimeoutError("engine slow")
 
         out = enrich_one("OrgA/Model", self._config(),
                          fetch_card=fake_fetch, call_llm=fake_llm)

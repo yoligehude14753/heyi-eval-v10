@@ -178,29 +178,24 @@ class EnrichOneViaEngineClientTests(unittest.TestCase):
 
 
 class CuratorConfigEnvTests(unittest.TestCase):
-    """Env var compat: HEYI_ENGINE_URL and v9 HEYI_EVAL_CCR_URL both honored."""
+    """CuratorConfig env-var resolution. PR#7a removed all v9 fallbacks."""
 
-    def test_engine_url_env_takes_precedence(self) -> None:
+    def test_engine_url_env_is_honored(self) -> None:
         with mock.patch.dict("os.environ", {
             "HEYI_ENGINE_URL": "http://primary:10814",
-            "HEYI_EVAL_CCR_URL": "http://legacy:3457",
         }, clear=False):
             cfg = CuratorConfig.from_env()
         self.assertEqual(cfg.engine_url, "http://primary:10814")
 
-    def test_ccr_url_env_used_as_fallback(self) -> None:
-        with mock.patch.dict("os.environ", {
-            "HEYI_EVAL_CCR_URL": "http://legacy:3457",
-        }, clear=False):
-            # clear HEYI_ENGINE_URL if present
-            import os
-            os.environ.pop("HEYI_ENGINE_URL", None)
+    def test_engine_url_defaults_to_local(self) -> None:
+        import os
+        prev = os.environ.pop("HEYI_ENGINE_URL", None)
+        try:
             cfg = CuratorConfig.from_env()
-        self.assertEqual(cfg.engine_url, "http://legacy:3457")
-
-    def test_v9_ccr_url_param_promoted_to_engine_url(self) -> None:
-        cfg = CuratorConfig(ccr_url="http://legacy:3457")
-        self.assertEqual(cfg.engine_url, "http://legacy:3457")
+            self.assertEqual(cfg.engine_url, "http://127.0.0.1:10814")
+        finally:
+            if prev is not None:
+                os.environ["HEYI_ENGINE_URL"] = prev
 
     def test_get_or_create_client_idempotent(self) -> None:
         cfg = CuratorConfig(engine_url="http://x:10814")

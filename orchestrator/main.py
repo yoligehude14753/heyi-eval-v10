@@ -67,8 +67,8 @@ class LoopState:
     tested in isolation.
     """
     last_heartbeat: float = 0.0
-    ccr_unhealthy_since: float | None = None
-    ccr_last_notify: float = 0.0
+    engine_unhealthy_since: float | None = None
+    engine_last_notify: float = 0.0
     completed_today: int = 0
     failed_today: int = 0
     today_date: object = None  # datetime.date
@@ -79,61 +79,60 @@ class LoopState:
             self.today_date = _date.today()
 
 
-def _ccr_preflight_gate(
+def _engine_preflight_gate(
     state: LoopState, cfg: OrchestratorConfig, store: Store,
     *, remind_interval_s: float = 3600.0, now: float | None = None,
     probe=None,
 ) -> tuple[bool, str]:
     """Returns (allow_intake, reason).
 
-    `allow_intake=True` means CCR is healthy, the loop should proceed to
-    pop a job. `allow_intake=False` means we must back off this iteration.
-    Emits incident events on state transitions.
+    `allow_intake=True` means heyi_engine is healthy, the loop should
+    proceed to pop a job. `allow_intake=False` means we must back off
+    this iteration. Emits incident events on state transitions.
     """
     if probe is None:
-        from curator.health import probe_ccr as probe
+        from curator.health import probe_engine as probe
     now = now or time.time()
-    h = probe(cfg.ccr_url, api_key=cfg.ccr_apikey,
-              model=cfg.curator_llm_model, timeout_s=10.0)
+    h = probe(cfg.engine_url, api_key=cfg.engine_api_key, timeout_s=10.0)
 
     if h.ok:
-        if state.ccr_unhealthy_since is not None:
-            down_s = int(now - state.ccr_unhealthy_since)
+        if state.engine_unhealthy_since is not None:
+            down_s = int(now - state.engine_unhealthy_since)
             try:
                 notify.incident(
                     store.outbox_path,
-                    what="orchestrator-resumed-ccr-recovered",
-                    detail=f"CCR upstream healthy after {down_s}s. Resuming job intake.",
+                    what="orchestrator-resumed-engine-recovered",
+                    detail=f"heyi_engine healthy after {down_s}s. Resuming job intake.",
                 )
             except Exception:
                 pass
-            state.ccr_unhealthy_since = None
-            state.ccr_last_notify = 0.0
+            state.engine_unhealthy_since = None
+            state.engine_last_notify = 0.0
         return True, "healthy"
 
     # unhealthy
-    if state.ccr_unhealthy_since is None:
-        state.ccr_unhealthy_since = now
+    if state.engine_unhealthy_since is None:
+        state.engine_unhealthy_since = now
         try:
             notify.incident(
                 store.outbox_path,
-                what="orchestrator-paused-ccr-down",
-                detail=(f"CCR upstream unhealthy: {h.detail}. "
+                what="orchestrator-paused-engine-down",
+                detail=(f"heyi_engine unhealthy: {h.detail}. "
                         f"Orchestrator will pause job intake until upstream recovers. "
                         f"Queue is preserved."),
             )
-            state.ccr_last_notify = now
+            state.engine_last_notify = now
         except Exception:
             pass
-    elif now - state.ccr_last_notify > remind_interval_s:
-        down_s = int(now - state.ccr_unhealthy_since)
+    elif now - state.engine_last_notify > remind_interval_s:
+        down_s = int(now - state.engine_unhealthy_since)
         try:
             notify.incident(
                 store.outbox_path,
                 what="orchestrator-still-paused",
-                detail=f"Still paused: CCR upstream down for {down_s}s. Last probe: {h.detail}",
+                detail=f"Still paused: heyi_engine down for {down_s}s. Last probe: {h.detail}",
             )
-            state.ccr_last_notify = now
+            state.engine_last_notify = now
         except Exception:
             pass
     return False, h.detail
@@ -421,7 +420,7 @@ def cmd_loop(args: argparse.Namespace) -> int:
     store = Store(_default_data_root())
     state = LoopState()
     heartbeat_interval = float(os.environ.get("HEYI_HEARTBEAT_INTERVAL", "14400"))  # 4h
-    ccr_remind_interval = float(os.environ.get("HEYI_CCR_REMIND_INTERVAL", "3600"))  # 1h
+    engine_remind_interval = float(os.environ.get("HEYI_ENGINE_REMIND_INTERVAL", "3600"))  # 1h
     print(f"loop mode (stub_only={args.stub_only}), ctrl-c to stop")
 
     while True:
@@ -435,23 +434,22 @@ def cmd_loop(args: argparse.Namespace) -> int:
         if not args.stub_only:
             _maybe_emit_heartbeat(state, cfg, store, interval_s=heartbeat_interval)
 
-            # Pre-flight: don't pop a job from the queue if CCR upstream is
-            # dead. The job needs CC stages (DEPLOY → CLEANUP) which all
-            # route through CCR. Better to leave the job queued and re-probe
-            # in `idle_sleep` seconds than to pull it, fail it, and have it
-            # disappear. (INV-5)
-            allow, reason = _ccr_preflight_gate(
-                state, cfg, store, remind_interval_s=ccr_remind_interval,
+            # Pre-flight: don't pop a job from the queue if heyi_engine is
+            # dead. The curator + showcase stages need it; better to leave
+            # the job queued and re-probe in `idle_sleep` seconds than to
+            # pull it, fail it, and have it disappear. (INV-5)
+            allow, reason = _engine_preflight_gate(
+                state, cfg, store, remind_interval_s=engine_remind_interval,
             )
             if not allow:
-                if state.ccr_unhealthy_since is not None and (
-                    time.time() - state.ccr_unhealthy_since < args.idle_sleep + 1
+                if state.engine_unhealthy_since is not None and (
+                    time.time() - state.engine_unhealthy_since < args.idle_sleep + 1
                 ):
-                    print(f"[loop] CCR upstream UNHEALTHY: {reason}. Pausing job intake.")
+                    print(f"[loop] heyi_engine UNHEALTHY: {reason}. Pausing job intake.")
                 time.sleep(args.idle_sleep)
                 continue
-            if state.ccr_unhealthy_since is None and reason == "healthy" and \
-               state.ccr_last_notify == 0.0:
+            if state.engine_unhealthy_since is None and reason == "healthy" and \
+               state.engine_last_notify == 0.0:
                 pass  # no-op; just a probe-success branch
 
         item = pop_one(store)

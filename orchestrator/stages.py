@@ -1,7 +1,7 @@
 """
 Stage executors (v10).
 
-Four flavors after PR#3 + PR#4:
+Three flavors after PR#7a (the v9 cc-agent docker-spawn flavor is gone):
 
   * STUB stages — DISCOVER — placeholder, just write a minimal _meta
     payload and return ok. (READY_WAIT moved to native in PR#3.)
@@ -9,15 +9,14 @@ Four flavors after PR#3 + PR#4:
   * PYTHON stages — CURATE / METADATA / ENGINE_SELECT — pure-Python
     deterministic logic that talks to heyi_engine (curator) and HF Hub.
 
-  * NATIVE stages (v10, PR#3 + PR#4) — DEPLOY / READY_WAIT / CAPABILITY
-    / CLEANUP — Python implementations in ``stages_py.py`` and
-    ``capability.py`` that own the docker socket and the eval HTTP
-    boundary directly. No cc-agent involvement.
+  * NATIVE stages — DEPLOY / READY_WAIT / CAPABILITY / CLEANUP /
+    SHOWCASE — Python implementations in ``stages_py.py``,
+    ``capability.py`` and ``cc_agent/showcase_runner.py`` that own the
+    docker socket and the eval HTTP boundary directly.
 
-  * CC stages — SHOWCASE only (until PR#5 restricts even this). Spawns
-    the cc-agent container; the v10 cc-agent has docker access stripped
-    and a read-only mount on metadata, read-write only on the run's
-    showcase/ subdir.
+PR#7a removed the legacy cc-agent docker spawn path and the v9 LLM
+proxy pre-flight branch in CURATE. The single LLM endpoint is now
+heyi_engine on :10814.
 
 All flavors return a `StageResult`. Run object mutation (mark_started /
 mark_ok / mark_failed) is done by the caller in main.run_pipeline so all
@@ -25,22 +24,14 @@ stages have consistent observability.
 """
 from __future__ import annotations
 
-import subprocess
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 from . import notify
 from .config import OrchestratorConfig
 from .state_machine import Run, StageName
 from .store import Store
-from .validator import (
-    ValidationError,
-    validate_capability,
-    validate_deploy,
-    validate_showcase,
-)
 
 
 @dataclass
@@ -104,7 +95,7 @@ _DEFAULT_CURATED_SCHEMA: dict[str, Any] = {
 def _execute_curate_stage(
     run: Run, cfg: OrchestratorConfig,
 ) -> StageResult:
-    """Read HF modelcard → ask CCR (MiniMax) for structured metadata.
+    """Read HF modelcard → ask heyi_engine for structured metadata.
 
     Writes:
       runs/<run_id>/_meta/curated.json     — full schema
@@ -122,7 +113,7 @@ def _execute_curate_stage(
         fetch_modelcard,
         write_curated,
     )
-    from curator.health import probe_ccr
+    from curator.health import probe_engine
 
     from .store import Store as _StoreLocal  # only for outbox path lookup
 
@@ -132,9 +123,8 @@ def _execute_curate_stage(
     meta_dir.mkdir(parents=True, exist_ok=True)
 
     cur_cfg = CuratorConfig(
-        ccr_url=cfg.ccr_url,
-        ccr_api_key=cfg.ccr_apikey,
-        ccr_model=cfg.curator_llm_model,   # NOT cfg.ccr_model (which is claude's self-model)
+        engine_url=cfg.engine_url,
+        engine_api_key=cfg.engine_api_key,
         hf_endpoint=cfg.hf_endpoint,
         max_tokens=8192,
     )
@@ -152,24 +142,21 @@ def _execute_curate_stage(
         except Exception:
             curated = enrich_one(run.hf_id, cur_cfg)
     else:
-        # Pre-flight: probe CCR upstream so we fail fast on outages
-        # (Q-019: CCR returns 500 silently when MiniMax/glm-51 container Exited).
+        # Pre-flight: probe heyi_engine so we fail fast on outages.
         # If unhealthy, emit incident + skip the enrichment (don't waste 30s)
         # but DON'T fail the run — METADATA can still produce useful output
         # from HF Hub alone.
-        print("  [curate] CCR pre-flight probe …")
-        health = probe_ccr(cfg.ccr_url, api_key=cfg.ccr_apikey,
-                           model=cfg.curator_llm_model, timeout_s=10.0)
+        print("  [curate] heyi_engine pre-flight probe …")
+        health = probe_engine(cfg.engine_url, api_key=cfg.engine_api_key, timeout_s=10.0)
         if not health.ok:
             print(f"  [curate] PRE-FLIGHT FAIL: {health.detail}  "
                   f"(http={health.http_code} t={health.elapsed_s:.1f}s)")
-            # emit incident — uses orchestrator's outbox via notify module
             try:
                 store = _StoreLocal(cfg.data_root)
                 notify.incident(
                     store.outbox_path,
-                    what="curator-ccr-upstream",
-                    detail=(f"CCR upstream unhealthy: {health.detail}. "
+                    what="curator-engine-upstream",
+                    detail=(f"heyi_engine unhealthy: {health.detail}. "
                             f"Curator stage will run DEGRADED (HF Hub only). "
                             f"hf_id={run.hf_id}"),
                     run_id=run.run_id,
@@ -181,14 +168,14 @@ def _execute_curate_stage(
                 "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()),
                 **({k: v for k, v in _DEFAULT_CURATED_SCHEMA.items()}),
                 "_llm_meta": {
-                    "model": cur_cfg.ccr_model,
+                    "model": None,
                     "input_tokens": 0, "output_tokens": 0, "elapsed_s": health.elapsed_s,
-                    "parse_error": f"ccr-preflight-fail: {health.detail}",
+                    "parse_error": f"engine-preflight-fail: {health.detail}",
                     "card_fetch_error": None,
                 },
             }
         else:
-            print(f"  [curate] enriching {run.hf_id} via CCR  (preflight {health.elapsed_s:.1f}s)")
+            print(f"  [curate] enriching {run.hf_id}  (preflight {health.elapsed_s:.1f}s)")
             curated = enrich_one(run.hf_id, cur_cfg)
         try:
             write_curated(cfg.data_root / "curated", curated)
@@ -451,166 +438,21 @@ def _vllm_args_hint(metadata: dict[str, Any]) -> dict[str, Any]:
     return hint
 
 
-# ── CC stages ──────────────────────────────────────────────────────────────
-
-
-def _cc_agent_container_name(run: Run, stage: StageName) -> str:
-    short = run.run_id[-8:].replace("_", "-")
-    return f"e8-cc-{stage.value.lower()}-{short}"
-
-
-def _docker_run_cc_agent(
-    run: Run, stage: StageName, cfg: OrchestratorConfig, *, dry_run: bool = False,
-) -> tuple[int, str]:
-    """
-    Spawn one cc-agent container for `stage`. Returns (rc, container_name).
-
-    Synchronous: blocks until the container exits or `cfg.timeout_for(stage)`
-    wall-clock seconds elapse, whichever is first. On timeout we
-    docker rm -f the container and the rc will be 124 (matching `timeout`'s
-    convention).
-
-    Container layout (mirrors cc-agent/run_cc.sh expectations):
-      /workspace/handbook.md       (bind cfg.handbook_path:ro)
-      /workspace/task.md           (bind cfg.task_md(stage):ro)
-      /workspace/runs/<run_id>/    (bind cfg.run_dir(run.run_id))
-      /var/run/docker.sock         (host docker socket)
-      /usr/bin/docker              (host docker binary; matched GLIBC bookworm)
-      /DATA/Model/_eval-cache      (model weights, ro)
-    """
-    container = _cc_agent_container_name(run, stage)
-    rd = cfg.run_dir(run.run_id)
-    rd.mkdir(parents=True, exist_ok=True)
-    task_path = cfg.task_md(stage.value)
-
-    # CRITICAL: cc-agent still runs as root inside (apt + useradd in stage
-    # 1-3 require it), but we pass HOST_UID/HOST_GID so the `agent` user
-    # created inside matches the host orchestrator's uid. Then chown -R
-    # agent:agent at the end of run_cc.sh leaves files owned by the host
-    # user, not root. Caught by the first real T11 attempt on nv8 (2026-05)
-    # where state.json writes hit Permission denied. (See Q-014.)
-    import os as _os
-    host_uid = _os.getuid()
-    host_gid = _os.getgid()
-    cmd = [
-        "docker", "run", "--rm",
-        "--name", container,
-        "--network", "host",
-        "-v", f"{cfg.handbook_path}:/workspace/handbook.md:ro",
-        "-v", f"{task_path}:/workspace/task.md:ro",
-        "-v", f"{rd}:/workspace/runs/{run.run_id}",
-        "-v", f"{cfg.docker_socket}:/var/run/docker.sock",
-        "-v", f"{cfg.model_cache_root}:/DATA/Model/_eval-cache:ro",
-        "-e", f"HOST_UID={host_uid}",
-        "-e", f"HOST_GID={host_gid}",
-    ]
-    if cfg.host_docker_bin and Path(cfg.host_docker_bin).exists():
-        cmd += ["-v", f"{cfg.host_docker_bin}:/usr/bin/docker:ro"]
-    cmd += [
-        "-e", f"STAGE={stage.value}",
-        "-e", f"RUN_ID={run.run_id}",
-        "-e", f"HF_ID={run.hf_id}",
-        "-e", f"HF_LOCAL_DIR={cfg.hf_local_dir(run.hf_id)}",
-        "-e", f"PORT={cfg.vllm_port}",
-        "-e", f"ANTHROPIC_BASE_URL={cfg.ccr_url}",
-        "-e", f"ANTHROPIC_AUTH_TOKEN={cfg.ccr_apikey}",
-        "-e", f"ANTHROPIC_MODEL={cfg.ccr_model}",
-        "-e", f"MAX_TURNS={cfg.cc_agent_max_turns}",
-        cfg.cc_agent_image,
-    ]
-
-    if dry_run:
-        return (0, container)
-
-    timeout = cfg.timeout_for(stage.value)
-    print(f"  [cc-agent] spawn {container} (timeout={timeout}s)")
-
-    try:
-        cp = subprocess.run(cmd, timeout=timeout, capture_output=False, check=False)
-        rc = cp.returncode
-    except subprocess.TimeoutExpired:
-        print(f"  [cc-agent] TIMEOUT after {timeout}s, removing container")
-        subprocess.run(["docker", "rm", "-f", container], capture_output=True, check=False)
-        rc = 124
-    except FileNotFoundError as e:
-        # docker not in PATH (dev workstation without docker)
-        print(f"  [cc-agent] docker missing: {e}")
-        return (127, container)
-
-    return (rc, container)
-
-
-def _execute_cc_stage(
-    run: Run,
-    stage: StageName,
-    cfg: OrchestratorConfig,
-    store: Store,
-) -> StageResult:
-    t0 = time.time()
-    rc, container = _docker_run_cc_agent(run, stage, cfg)
-    duration = time.time() - t0
-
-    rd = cfg.run_dir(run.run_id)
-
-    # Always run the validator after CC exits — its rc is advisory, not
-    # authoritative (E8 lesson: CC will print "result: success" even when it
-    # produced nothing).
-    try:
-        if stage == StageName.DEPLOY:
-            payload = validate_deploy(
-                rd, schema_root=cfg.schema_root, check_container_live=True,
-            )
-        elif stage == StageName.CAPABILITY:
-            payload = validate_capability(rd, schema_root=cfg.schema_root)
-        elif stage == StageName.SHOWCASE:
-            payload = validate_showcase(rd, schema_root=cfg.schema_root)
-        elif stage == StageName.CLEANUP:
-            # Cleanup: assert e8-vllm is gone. Container name comes from
-            # ready.json if it exists; otherwise fall back to default.
-            import json
-            ready = rd / "ready.json"
-            evname = cfg.vllm_container
-            if ready.exists():
-                try:
-                    evname = json.loads(ready.read_text()).get("container_name", evname)
-                except Exception:
-                    pass
-            from .validator import validate_cleanup
-            validate_cleanup(rd, ephemeral_container=evname)
-            payload = {"cleanup": "ok", "container": evname}
-        else:
-            raise ValueError(f"unexpected CC stage: {stage}")
-    except ValidationError as ve:
-        return StageResult(
-            ok=False, duration_s=duration, artifacts=[],
-            error=f"validator: {ve}", rc=rc, container_name=container,
-        )
-
-    return StageResult(
-        ok=True, duration_s=duration, artifacts=[],
-        payload=payload, rc=rc, container_name=container,
-    )
-
-
 # ── top-level dispatch ─────────────────────────────────────────────────────
 
 
 _STUB_STAGES = {StageName.DISCOVER}
 _PY_STAGES = {StageName.CURATE, StageName.METADATA, StageName.ENGINE_SELECT}
 # v10 native stages: orchestrator owns docker socket + eval HTTP path.
-# DEPLOY / READY_WAIT / CLEANUP land in stages_py (PR#3);
-# CAPABILITY lands in capability.py (PR#4);
-# SHOWCASE moved here in PR#5 (cc_agent.showcase_runner) — pure Python,
-# no docker spawn anywhere.
+# DEPLOY / READY_WAIT / CLEANUP land in stages_py;
+# CAPABILITY lands in capability.py;
+# SHOWCASE lands in cc_agent.showcase_runner — pure Python, no docker
+# spawn anywhere.
 _NATIVE_STAGES = {
     StageName.DEPLOY, StageName.READY_WAIT,
     StageName.CAPABILITY, StageName.CLEANUP,
     StageName.SHOWCASE,
 }
-# Empty set kept for the v9-style cc-agent docker spawn path. After PR#5
-# no stage uses it; PR#7 removes the cc-agent docker image refs and
-# this constant + _docker_run_cc_agent + _execute_cc_stage entirely.
-_CC_STAGES: set[StageName] = set()
 
 
 def _adapt_native(native_result: Any) -> StageResult:
@@ -662,6 +504,4 @@ def execute_stage(
             return _adapt_native(stages_py.execute_cleanup(run, cfg))
         if stage == StageName.SHOWCASE:
             return _adapt_native(sc_mod.execute_showcase(run, cfg))
-    if stage in _CC_STAGES:  # pragma: no cover — empty in v10
-        return _execute_cc_stage(run, stage, cfg, store)
     raise ValueError(f"no executor for stage {stage}")

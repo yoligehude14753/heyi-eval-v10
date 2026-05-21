@@ -30,9 +30,8 @@ def _make_cfg(data_root: Path, repo_root: Path) -> OrchestratorConfig:
     return OrchestratorConfig(
         data_root=data_root,
         repo_root=repo_root,
-        ccr_url="http://ccr.test",
-        ccr_apikey="k",
-        curator_llm_model="MiniMax-M2.7",
+        engine_url="http://engine.test",
+        engine_api_key=None,
         hf_endpoint="https://hf-mirror.test",
     )
 
@@ -118,9 +117,9 @@ class CurateStageTests(unittest.TestCase):
                               "parse_error": None, "card_fetch_error": None},
             }
 
-            from curator.health import CcrHealthReport
-            healthy = CcrHealthReport(ok=True, http_code=200, elapsed_s=1.0, detail="ok")
-            with mock.patch("curator.health.probe_ccr", return_value=healthy), \
+            from curator.health import EngineHealthReport
+            healthy = EngineHealthReport(ok=True, http_code=200, elapsed_s=1.0, detail="ok")
+            with mock.patch("curator.health.probe_engine", return_value=healthy), \
                  mock.patch("curator.enricher.enrich_one", return_value=fake_curated), \
                  mock.patch("curator.enricher.fetch_modelcard", return_value="# OrgA/Model-X\n\nbody"):
                 res = _execute_curate_stage(run, cfg)
@@ -169,36 +168,35 @@ class CurateStageTests(unittest.TestCase):
 
             degraded = {"hf_id": run.hf_id, "_llm_meta": {"parse_error": "no json"},
                         "first_impression_tag": None}
-            from curator.health import CcrHealthReport
-            healthy = CcrHealthReport(ok=True, http_code=200, elapsed_s=1.0, detail="ok")
+            from curator.health import EngineHealthReport
+            healthy = EngineHealthReport(ok=True, http_code=200, elapsed_s=1.0, detail="ok")
             with mock.patch("curator.enricher.enrich_one", return_value=degraded), \
                  mock.patch("curator.enricher.fetch_modelcard", return_value="# x"), \
-                 mock.patch("curator.health.probe_ccr", return_value=healthy):
+                 mock.patch("curator.health.probe_engine", return_value=healthy):
                 res = _execute_curate_stage(run, cfg)
 
             self.assertTrue(res.ok)
             self.assertTrue(res.payload["degraded"])
 
     def test_curate_preflight_fail_emits_incident_and_degrades(self):
-        """Q-019: when CCR upstream is dead (500 fetch failed), we should
-        emit an incident, write a degraded curated.json, and let the run
-        continue (so METADATA/ENGINE_SELECT can still produce useful output
-        from HF Hub alone).
+        """When heyi_engine is dead, emit an incident, write a degraded
+        curated.json, and let the run continue (so METADATA/ENGINE_SELECT
+        can still produce useful output from HF Hub alone).
         """
-        from curator.health import CcrHealthReport
+        from curator.health import EngineHealthReport
 
         with tempfile.TemporaryDirectory() as td:
             cfg = _make_cfg(Path(td), REPO_ROOT)
             run = _make_run()
 
-            unhealthy = CcrHealthReport(
+            unhealthy = EngineHealthReport(
                 ok=False, http_code=500, elapsed_s=0.5,
                 detail="upstream unreachable (HTTP 500, fetch failed)",
             )
 
             # enrich_one must NOT be called when pre-flight fails
             enrich_mock = mock.MagicMock()
-            with mock.patch("curator.health.probe_ccr", return_value=unhealthy), \
+            with mock.patch("curator.health.probe_engine", return_value=unhealthy), \
                  mock.patch("curator.enricher.enrich_one", enrich_mock), \
                  mock.patch("curator.enricher.fetch_modelcard", return_value="# x"):
                 res = _execute_curate_stage(run, cfg)
@@ -211,7 +209,7 @@ class CurateStageTests(unittest.TestCase):
             outbox = Path(td) / "store" / "notify_outbox.jsonl"
             self.assertTrue(outbox.exists(), f"no outbox at {outbox}")
             lines = outbox.read_text().splitlines()
-            self.assertTrue(any('curator-ccr-upstream' in line for line in lines),
+            self.assertTrue(any('curator-engine-upstream' in line for line in lines),
                             f"incident not in outbox: {lines}")
             # also verify event_type
             self.assertTrue(any('"event_type": "incident"' in line for line in lines),
@@ -221,7 +219,7 @@ class CurateStageTests(unittest.TestCase):
             curated_p = cfg.run_dir(run.run_id) / "_meta" / "curated.json"
             self.assertTrue(curated_p.exists())
             doc = json.loads(curated_p.read_text())
-            self.assertIn("ccr-preflight-fail", doc["_llm_meta"]["parse_error"])
+            self.assertIn("engine-preflight-fail", doc["_llm_meta"]["parse_error"])
 
 
 class MetadataStageTests(unittest.TestCase):
