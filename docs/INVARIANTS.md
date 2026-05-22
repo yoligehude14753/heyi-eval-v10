@@ -34,6 +34,7 @@ v10 同一台机器上同时存在**两类**完全不同的 LLM 容器。把它�
 | **INV-11** | 卫生 | 任何 v9 残余符号(ccr_*、cc-agent、e8-、HEYI_EVAL_CCR_*)禁止重新出现 | `tests/test_no_v9_residue.py` | — |
 | **INV-12** | 卫生 | 任何 mutating docker 操作(rm/stop/exec/run/restart 等)必须走 docker-py SDK,禁止 `subprocess.run(["docker", ...])` mutating verb | `tests/test_inv_production_isolation.py::TestINV12*` | docker-socket-proxy 也阻断,见 INV-2 |
 | **INV-13** | 卫生 | `scripts/*.sh` 不得对产线容器名出现 mutating docker verb | `tests/test_inv_production_isolation.py::TestINV13*` | — |
+| **INV-14** | 隔离 | LLM-judge 单向跨域：CAPABILITY 可把 EVAL 产物字节发 PROD VLM 评分,但绝不把测试 prompt 文本 / expected_substring 发 PROD | `tests/test_inv14_llm_judge_boundary.py` | `orchestrator/llm_judge.py` 仅使用 `_JUDGE_PROMPT` 模板 |
 
 ## 为什么这些是红线
 
@@ -45,6 +46,27 @@ v10 同一台机器上同时存在**两类**完全不同的 LLM 容器。把它�
 2. **代码隔离**: 仓库源代码不允许任何 mutating 调用提到产线名字(INV-1 静态扫描 + INV-13 shell 扫描)
 3. **配置隔离**: 评估系统的 systemd unit 全部叫 `heyi-eval-*.service`,不会与产线 `heyi-engine.service` 名字相撞(INV-4 命名空间)
 4. **数据隔离**: 备份目录在仓库外,模型缓存也在仓库外(INV-9),`git clean -fdx` 不会误删任何东西
+
+## INV-14 详解：LLM-judge 跨域的窄豁免
+
+PR#15 引入多模态分轨 CAPABILITY 后,出现一个新的合法跨域流量:
+**llm_judge 评分器**(`orchestrator/llm_judge.py`)需要把 EVAL 引擎产出的
+图像/视频字节发给 PROD 端 heyi_engine 的 VLM 让它描述,然后据此判分。
+
+这看起来违反 PR#4 文档里的"INV-2: CAPABILITY 只调 `deploy.json::base_url`"
+表述。INV-14 把这个例外**显式声明**为合法路径,并加守护:
+
+1. **方向**: EVAL → PROD,**单向**;PROD 永不回写 EVAL 上下文。
+2. **内容**: 只允许发 EVAL **产出的 artifact 字节** + 固定的
+   `_JUDGE_PROMPT` 模板(描述是否含 `expected_description`)。
+3. **禁止**: 不得把测试 prompt 原文、`expected_substring`、capability_data
+   下任何 JSONL 内容发给 PROD VLM。这条由
+   `tests/test_inv14_llm_judge_boundary.py` 静态扫描守护。
+4. **作用域**: 仅 `image_gen` / `video_gen` 两个 category 走此路径;
+   其余 11 个 category 仍严格遵守 INV-2(只调 eval base_url)。
+
+违反 INV-14 = 数据污染:把测试 prompt 给 PROD 等于用线上模型给评估打分,
+完全破坏评估独立性。
 
 ## 怎么读一条不变量违例
 

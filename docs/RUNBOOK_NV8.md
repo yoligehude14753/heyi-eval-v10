@@ -319,3 +319,33 @@ sudo systemctl restart heyi-eval-orchestrator
 - [ ] 10.4 outbox 有 `event_type=run_aborted` `level=warn`
 - [ ] 10.5 产线容器和 GPU 占用未变化
 - [ ] 10.6 切回稳态后能正常跑 9 stage
+
+---
+
+## 11 · 已知限制(PR#15 多模态架构落地后,2026-05)
+
+### 11.1 transformers-runner 镜像未就绪
+
+`orchestrator/stages_py.py::_ENGINE_IMAGES["transformers"]` 指向
+`heyi-eval/transformers-runner:v10`,该镜像**目前 nv8 上未构建/未推送**。
+
+**结果**:`capability_tags` 包含 `asr` / `tts` / `image_gen` / `video_gen`
+/ `music_gen` 的模型,DEPLOY 阶段会因 `ImageNotFound` 失败。
+PR#15 引入的对应 dispatcher 已在 `orchestrator/capability.py` 里实现,
+但短期内只有 vLLM 能服务的 text / vision / ocr 模型可以端到端跑通。
+
+**生效观察**:对纯文本 / VLM 模型(默认 `capability_tags=["text", "code"]`
+或 `["text", "code", "vision"]`),全部 9 stage 正常工作;CAPABILITY
+会展示 11 个 category 中"applicable=false"(其余靠 `vision` 解锁
+的会跑)。
+
+**何时解除**:PR#19+ 会构建并推送 transformers-runner 镜像后,本节移除。
+
+### 11.2 capability artifact 不自动清理
+
+PR#15 的 tts / image_gen / video_gen / music_gen dispatcher 会把
+生成的二进制写到 `runs/<run_id>/_artifacts/*.bin`。CLEANUP 阶段
+**不删**这些字节产物(仅删 `e9-*` 容器和模型权重 cache)。
+长期会在 `~/heyi-eval-data/runs/*/` 下累积。
+
+**何时解除**:PR#18 面板会展示这些 artifact;到时考虑 14 天后自动归档/删除。
