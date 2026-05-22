@@ -376,11 +376,24 @@ items,但所有 items 都用合成正弦波 WAV 作 fixture(`a01_tone_440hz...`�
 - 是否生成了合规的 CategoryRunResult
 
 它**无法**验证模型的 ASR / 音乐理解准确度。真正的精度评估需要在
-PR#21+ 接入 CC0 LibriSpeech / MusicCaps 样本后,把 `scorer_override`
+PR#22+ 接入 CC0 LibriSpeech / MusicCaps 样本后,把 `scorer_override`
 去掉,改回 `substring`。
 
-`video_understanding` 仍然 N/A(无 stdlib 生成 MP4 的路径,真 CC0
-视频还在 PR#21+ 排期)。
+### 11.4 (PR#21) video_understanding 用 lavfi 合成视频烟测
+
+PR#21 用 ffmpeg `lavfi` 合成源生成了 3 段小 H.264 MP4(SMPTE 色条 +
+红色纯色 + RGB 色彩循环,合计 60 KiB),并填了 5 条 `video_understanding`
+items:其中 3 条用 `substring` 评(可断言"red" / "test" 等颜色或测试
+模式关键字),2 条用 `scorer_override="non_empty_output"` 评(开放式
+"summary"问题,只验证非空回答)。
+
+固件依赖 ffmpeg。**ffmpeg 不在 PATH 时**,`scripts/build_capability_fixtures.py`
+会跳过视频生成并打印 WARN;现有已 commit 的视频文件不会被删。nv8 的
+`transformers-runner` Dockerfile (`apt-get install ffmpeg`)和 Mac
+开发机上的 Homebrew 都自带 ffmpeg,所以默认就能用。
+
+真正的视频理解评估(MVBench / Video-MME 等)需要真实视频语料,排在
+PR#22+。`video_gen` category 仍然按原计划走 LLM-judge,无需视频固件。
 
 ---
 

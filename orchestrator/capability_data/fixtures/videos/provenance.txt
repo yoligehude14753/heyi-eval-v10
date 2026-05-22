@@ -1,3 +1,5 @@
-# PR#16: no video fixtures bundled. video_understanding and
-# video_gen categories are blocked until real CC0 video samples
-# (e.g. NTU RGB+D 60 SOFT clips) are curated. See RUNBOOK §11.1.
+# Per-file provenance & license
+
+v01_testpattern_3s.mp4	CC0/synthetic	Synthetic SMPTE color-bars (lavfi testsrc2), 320x240@15fps, 3s, H.264
+v02_solid_red_2s.mp4	CC0/synthetic	Synthetic solid red (lavfi color=red), 320x240@15fps, 2s, H.264
+v03_color_cycle_3s.mp4	CC0/synthetic	Synthetic color cycle red→green→blue (lavfi concat), 320x240@15fps, 3s, H.264

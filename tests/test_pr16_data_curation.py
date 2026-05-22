@@ -39,10 +39,12 @@ _EXPECTED_COUNTS: dict[str, int] = {
     # PR#20: 5 plumbing-only items per audio category, using synthetic
     # CC0 fixtures + non_empty_output scorer override. Upgraded to
     # substring-scored corpora once real CC0 LibriSpeech/MusicCaps
-    # samples land (PR#21+).
+    # samples land (PR#22+).
     "asr":                 5,
     "music_understanding": 5,
-    "video_understanding": 0,   # blocked: real CC0 video TBD (PR#21+)
+    # PR#21: 5 items against ffmpeg-synthesized lavfi test patterns
+    # (testsrc2 + solid colors). Mix of substring + non_empty_output.
+    "video_understanding": 5,
     "tts":                10,
     "image_gen":          10,
     "video_gen":          10,
@@ -203,8 +205,16 @@ class FixtureProvenance(unittest.TestCase):
 
     def test_each_fixture_file_is_listed_in_provenance(self):
         # images/{vision,ocr}/provenance.txt + audio/provenance.txt
-        for sub in ("images/vision", "images/ocr", "audio"):
-            prov_file = FIXTURES_DIR / sub / "provenance.txt"
+        # + videos/provenance.txt (PR#21; only enforced if any file
+        # exists in that subdir — operators without ffmpeg can still
+        # build the rest of the fixtures)
+        for sub in ("images/vision", "images/ocr", "audio", "videos"):
+            d = FIXTURES_DIR / sub
+            on_disk = {f.name for f in d.iterdir()
+                       if f.is_file() and f.name != "provenance.txt"}
+            if sub == "videos" and not on_disk:
+                continue  # video fixtures opt-in for ffmpeg-less hosts
+            prov_file = d / "provenance.txt"
             self.assertTrue(prov_file.is_file(),
                             f"{sub}/provenance.txt missing")
             listed: set[str] = set()
@@ -215,10 +225,6 @@ class FixtureProvenance(unittest.TestCase):
                 parts = line.split("\t")
                 if parts:
                     listed.add(parts[0])
-            # Find every fixture file in this subdir
-            d = FIXTURES_DIR / sub
-            on_disk = {f.name for f in d.iterdir()
-                       if f.is_file() and f.name != "provenance.txt"}
             missing = on_disk - listed
             self.assertEqual(
                 missing, set(),

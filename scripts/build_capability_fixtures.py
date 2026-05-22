@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import argparse
 import math
+import shutil
 import struct
+import subprocess
 import sys
 import wave
 import zlib
@@ -362,6 +364,75 @@ AUDIO_FIXTURES: list[tuple[str, callable, str]] = [  # type: ignore[type-arg]
 ]
 
 
+# ── Video fixtures (ffmpeg-generated synthetic; CC0/synthetic) ────────────
+#
+# Unlike images and audio, MP4/H.264 muxing isn't realistic to do from
+# stdlib — so this section gates on ``ffmpeg`` being present on PATH.
+# nv8's transformers-runner Dockerfile installs ffmpeg; locally on Mac
+# it usually comes with Homebrew. When ffmpeg is missing we skip and
+# print a notice; existing videos on disk aren't deleted.
+
+
+def _have_ffmpeg() -> bool:
+    return shutil.which("ffmpeg") is not None
+
+
+def _ffmpeg_run(args: list[str]) -> None:
+    """Invoke ffmpeg quietly; raise on non-zero exit."""
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *args]
+    res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if res.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg failed (rc={res.returncode}): {res.stderr.strip()[:400]}",
+        )
+
+
+def _build_video_testpattern(path: Path) -> None:
+    """3s SMPTE color-bars testsrc2 — colorful pattern with timecode."""
+    _ffmpeg_run([
+        "-f", "lavfi",
+        "-i", "testsrc2=duration=3:size=320x240:rate=15",
+        "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p",
+        "-tune", "stillimage", "-crf", "30",
+        str(path),
+    ])
+
+
+def _build_video_solid_red(path: Path) -> None:
+    """2s of pure red — easy 'what color is in this video' target."""
+    _ffmpeg_run([
+        "-f", "lavfi",
+        "-i", "color=c=red:size=320x240:rate=15:duration=2",
+        "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p",
+        "-tune", "stillimage", "-crf", "30",
+        str(path),
+    ])
+
+
+def _build_video_color_cycle(path: Path) -> None:
+    """3s sequence: red → green → blue (1s each)."""
+    _ffmpeg_run([
+        "-f", "lavfi", "-i", "color=c=red:size=320x240:rate=15:duration=1",
+        "-f", "lavfi", "-i", "color=c=green:size=320x240:rate=15:duration=1",
+        "-f", "lavfi", "-i", "color=c=blue:size=320x240:rate=15:duration=1",
+        "-filter_complex", "[0:v][1:v][2:v]concat=n=3:v=1:a=0",
+        "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p",
+        "-tune", "stillimage", "-crf", "30",
+        str(path),
+    ])
+
+
+VIDEO_FIXTURES: list[tuple[str, callable, str]] = [  # type: ignore[type-arg]
+    # All ffmpeg-synthesized; CC0/synthetic; no third-party content.
+    ("videos/v01_testpattern_3s.mp4", _build_video_testpattern,
+     "Synthetic SMPTE color-bars (lavfi testsrc2), 320x240@15fps, 3s, H.264"),
+    ("videos/v02_solid_red_2s.mp4", _build_video_solid_red,
+     "Synthetic solid red (lavfi color=red), 320x240@15fps, 2s, H.264"),
+    ("videos/v03_color_cycle_3s.mp4", _build_video_color_cycle,
+     "Synthetic color cycle red→green→blue (lavfi concat), 320x240@15fps, 3s, H.264"),
+]
+
+
 # ── provenance writer ──────────────────────────────────────────────────────
 
 
@@ -416,13 +487,29 @@ def main() -> int:
         audio_entries.append((filename, prov))
     write_provenance(audio_dir, audio_entries)
 
-    # Videos: empty for PR#16 (real CC0 video samples TBD)
-    (videos_dir / "provenance.txt").write_text(
-        "# PR#16: no video fixtures bundled. video_understanding and\n"
-        "# video_gen categories are blocked until real CC0 video samples\n"
-        "# (e.g. NTU RGB+D 60 SOFT clips) are curated. See RUNBOOK §11.1.\n",
-        encoding="utf-8",
-    )
+    # Videos: PR#21 lavfi-synthesized via ffmpeg. Skip gracefully if
+    # ffmpeg isn't on PATH so this script stays runnable on minimal CI.
+    if _have_ffmpeg():
+        video_entries: list[tuple[str, str]] = []
+        for rel, builder, prov in VIDEO_FIXTURES:
+            sub, filename = rel.split("/", 1)
+            path = videos_dir / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            builder(path)
+            video_entries.append((filename, prov))
+        write_provenance(videos_dir, video_entries)
+    else:
+        print("WARN: ffmpeg not found on PATH — skipping video fixtures. "
+              "Install ffmpeg and rerun to populate videos/.",
+              file=sys.stderr)
+        if not (videos_dir / "provenance.txt").exists():
+            (videos_dir / "provenance.txt").write_text(
+                "# ffmpeg not available at fixture-build time. Run\n"
+                "# `python scripts/build_capability_fixtures.py` again on\n"
+                "# a host that has ffmpeg installed (e.g. nv8 or a Mac\n"
+                "# with Homebrew ffmpeg) to populate this directory.\n",
+                encoding="utf-8",
+            )
 
     total_bytes = sum(f.stat().st_size for f in FIXTURES.rglob("*") if f.is_file())
     n_files = sum(1 for f in FIXTURES.rglob("*") if f.is_file())
