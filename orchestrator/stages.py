@@ -401,18 +401,18 @@ def _pick_engine(modality: str, pipeline_tag: str,
     # Speech in/out — transformers is the safe path
     if pipeline_tag in ("automatic-speech-recognition", "audio-classification",
                         "text-to-speech"):
-        return ("transformers", "heyi-eval/transformers-runner:v9",
+        return ("transformers", "heyi-eval/transformers-runner:v10",
                 f"audio pipeline_tag={pipeline_tag}", None)
 
     # Image/Video generation — diffusers via transformers runner
     if pipeline_tag in ("text-to-image", "image-to-image", "inpainting",
                         "text-to-video", "image-to-video"):
-        return ("transformers", "heyi-eval/transformers-runner:v9",
+        return ("transformers", "heyi-eval/transformers-runner:v10",
                 f"diffusion pipeline_tag={pipeline_tag}", None)
 
     # library_name hints
     if (library_name or "").lower() in ("diffusers", "sentence-transformers"):
-        return ("transformers", "heyi-eval/transformers-runner:v9",
+        return ("transformers", "heyi-eval/transformers-runner:v10",
                 f"library={library_name}", None)
 
     # default: vllm with transformers fallback (handbook decides the actual command)

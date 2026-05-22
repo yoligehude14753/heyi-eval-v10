@@ -35,6 +35,7 @@ v10 同一台机器上同时存在**两类**完全不同的 LLM 容器。把它�
 | **INV-12** | 卫生 | 任何 mutating docker 操作(rm/stop/exec/run/restart 等)必须走 docker-py SDK,禁止 `subprocess.run(["docker", ...])` mutating verb | `tests/test_inv_production_isolation.py::TestINV12*` | docker-socket-proxy 也阻断,见 INV-2 |
 | **INV-13** | 卫生 | `scripts/*.sh` 不得对产线容器名出现 mutating docker verb | `tests/test_inv_production_isolation.py::TestINV13*` | — |
 | **INV-14** | 隔离 | LLM-judge 单向跨域：CAPABILITY 可把 EVAL 产物字节发 PROD VLM 评分,但绝不把测试 prompt 文本 / expected_substring 发 PROD | `tests/test_inv14_llm_judge_boundary.py` | `orchestrator/llm_judge.py` 仅使用 `_JUDGE_PROMPT` 模板 |
+| **INV-15** | 隔离 | transformers-runner 镜像源码(`transformers_runner/`)不得引用任何 PROD 配置(`heyi_engine` 容器名 / `OrchestratorConfig` / `prod_engine_*`),只服务 `--model-path` 指向的本地目录 | `tests/test_inv15_transformers_runner_isolation.py`(静态扫描) | Dockerfile `HF_HUB_OFFLINE=1` 阻断意外的 HF Hub 拉取 |
 
 ## 为什么这些是红线
 
@@ -67,6 +68,30 @@ PR#15 引入多模态分轨 CAPABILITY 后,出现一个新的合法跨域流量:
 
 违反 INV-14 = 数据污染:把测试 prompt 给 PROD 等于用线上模型给评估打分,
 完全破坏评估独立性。
+
+## INV-15 详解：transformers-runner 不得引用 PROD 配置
+
+PR#19 引入 `transformers_runner/` 作为 ASR / TTS / image_gen / video_gen
+/ music_gen 等非 vLLM 模态的容器入口。该镜像跑在 EVAL 端,但因为它的
+源代码就在 v10 仓库里、且 Docker `network_mode=host`,如果不约束就有
+两种风险:
+
+1. **配置混淆**:`server.py` 误 import `OrchestratorConfig` 等 PROD 配置,
+   把容器名 / GPU 列表 / 凭证带进 image 层。
+2. **被动调用 PROD**:`server.py` 偷懒访问 `127.0.0.1:<prod_engine_port>`
+   来 "校验自己" — 这会把 EVAL 产出送到 PROD 模型,违反 INV-14 之外
+   的另一条静默通道。
+
+INV-15 用静态扫描守住这两条:`transformers_runner/` 包内任何 `.py`
+文件,不得出现以下 token:
+
+- `heyi_engine`、`minimax`、`prod_engine_container`、`prod_engine_gpus`
+- `OrchestratorConfig`、`orchestrator.config`、`orchestrator.capability`
+- `xrouter`、`/etc/heyi-engine`
+
+允许 import: stdlib + `torch` + `transformers` + `diffusers` +
+`accelerate` + `safetensors` + `PIL` + `numpy` + `soundfile` + `librosa`。
+其余白名单外 import 在 review 阶段单独评估。
 
 ## 怎么读一条不变量违例
 

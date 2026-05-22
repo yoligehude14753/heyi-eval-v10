@@ -331,5 +331,6 @@ class TestInvariantsDocExists:
         assert doc.exists(), "docs/INVARIANTS.md must exist"
         text = doc.read_text(encoding="utf-8")
         for label in ("INV-1", "INV-2", "INV-3", "INV-4",
-                      "INV-9", "INV-11", "INV-12", "INV-13"):
+                      "INV-9", "INV-11", "INV-12", "INV-13",
+                      "INV-14", "INV-15"):
             assert label in text, f"{label} missing from docs/INVARIANTS.md"

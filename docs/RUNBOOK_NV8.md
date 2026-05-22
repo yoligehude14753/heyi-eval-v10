@@ -324,22 +324,30 @@ sudo systemctl restart heyi-eval-orchestrator
 
 ## 11 · 已知限制(PR#15 多模态架构落地后,2026-05)
 
-### 11.1 transformers-runner 镜像未就绪
+### 11.1 transformers-runner 镜像 (PR#19 引入,需在 nv8 上构建)
 
 `orchestrator/stages_py.py::_ENGINE_IMAGES["transformers"]` 指向
-`heyi-eval/transformers-runner:v10`,该镜像**目前 nv8 上未构建/未推送**。
+`heyi-eval/transformers-runner:v10`,PR#19 已经把镜像源码落地在
+`transformers_runner/`(Dockerfile + 入口 server + 检测器),但仍需
+**在 nv8 上首次构建** 才能真正解锁非 vLLM 模态(ASR / TTS / image_gen
+/ video_gen / music_gen)。
 
-**结果**:`capability_tags` 包含 `asr` / `tts` / `image_gen` / `video_gen`
-/ `music_gen` 的模型,DEPLOY 阶段会因 `ImageNotFound` 失败。
-PR#15 引入的对应 dispatcher 已在 `orchestrator/capability.py` 里实现,
-但短期内只有 vLLM 能服务的 text / vision / ocr 模型可以端到端跑通。
+**构建步骤**(详细落地见 §12):
 
-**生效观察**:对纯文本 / VLM 模型(默认 `capability_tags=["text", "code"]`
-或 `["text", "code", "vision"]`),全部 9 stage 正常工作;CAPABILITY
-会展示 11 个 category 中"applicable=false"(其余靠 `vision` 解锁
-的会跑)。
+```bash
+cd ~/heyi-eval-v10
+bash scripts/build_transformers_runner.sh --smoke
+```
 
-**何时解除**:PR#19+ 会构建并推送 transformers-runner 镜像后,本节移除。
+**当前 image 已实现的端点**:
+- `/v1/chat/completions`(text / vlm)
+- `/v1/audio/transcriptions`(asr)
+- `/v1/audio/speech`(tts)
+- `/v1/images/generations`(image_gen)
+- `/v1/videos/generations` → 501 deferred(留给 PR#22 接入 CogVideoX/Mochi)
+- `/v1/music/generations` → 501 deferred(留给 PR#22 接入 MusicGen)
+
+**何时彻底解除**:构建成功 + PR#22(video/music 推理接入)合并后。
 
 ### 11.2 capability artifact 不自动清理
 
@@ -349,3 +357,82 @@ PR#15 的 tts / image_gen / video_gen / music_gen dispatcher 会把
 长期会在 `~/heyi-eval-data/runs/*/` 下累积。
 
 **何时解除**:PR#18 面板会展示这些 artifact;到时考虑 14 天后自动归档/删除。
+
+---
+
+## 12 · 构建 transformers-runner:v10 镜像(PR#19)
+
+> 一次性操作,首次部署非 vLLM 模态前必做。重新构建只有在升级
+> torch/transformers/diffusers 大版本时才需要(走 ADR)。
+
+### 12.1 前置检查
+
+```bash
+# 确认 nvidia container runtime 已注册
+docker info 2>/dev/null | grep -i "runtimes" | grep -q nvidia || \
+    echo "WARN: nvidia runtime 未启用,需要先 systemctl restart docker"
+
+# 确认 /var/lib/docker 有 ≥ 30 GB(镜像约 13 GB + 缓冲)
+df -h /var/lib/docker | tail -1
+
+# 确认 cu124 wheel 镜像源可访问(国内可能要走代理)
+curl -sI https://download.pytorch.org/whl/cu124/ | head -1
+```
+
+### 12.2 构建
+
+```bash
+cd ~/heyi-eval-v10
+
+# 仅构建(约 15-25 min,看网络)
+bash scripts/build_transformers_runner.sh
+
+# 构建 + /health 烟测(推荐;耗时多约 30 s)
+bash scripts/build_transformers_runner.sh --smoke
+```
+
+预期输出末尾:`✓ smoke OK`,且 `/health` 返回
+`{"status":"ok","capability":"text",...}`。
+
+### 12.3 单模型联调(用真实的 Whisper-tiny 做最便宜的 ASR 烟测)
+
+```bash
+# 取一个 Whisper-tiny(~150 MB),放到本地
+MODEL_DIR=$(mktemp -d)
+huggingface-cli download openai/whisper-tiny --local-dir "$MODEL_DIR"
+
+# 启动 runner
+docker run --rm --name tf-runner-asr-smoke \
+    --gpus '"device=4"' \
+    -p 18000:8000 \
+    -v "$MODEL_DIR:/model:ro" \
+    heyi-eval/transformers-runner:v10 &
+
+# 等 15 s 让模型 load
+sleep 15
+
+# 探针:检测应该判定为 asr
+curl -fsS http://127.0.0.1:18000/health
+# → {"capability": "asr", ...}
+
+# 拿一段 fixture 音频试转录
+curl -fsS -X POST http://127.0.0.1:18000/v1/audio/transcriptions \
+    -F file=@orchestrator/capability_data/fixtures/audio/tone_440hz.wav
+# → {"text": "..."}
+
+docker stop tf-runner-asr-smoke
+```
+
+### 12.4 加入 orchestrator 全流程
+
+构建并 smoke 通过后,**不需要任何配置改动**——
+`orchestrator/stages_py.py::_ENGINE_IMAGES["transformers"]` 已经指向
+`heyi-eval/transformers-runner:v10`,下一个 enqueue 进来的非 vLLM 模型
+会自动用上。
+
+### 12.5 §12 核对清单
+
+- [ ] `docker images | grep transformers-runner` 显示 `:v10` 标签
+- [ ] `--smoke` 烟测通过
+- [ ] §12.3 Whisper-tiny 联调返回非空 `text`
+- [ ] §11.1 「未就绪」状态可以从文档移除
