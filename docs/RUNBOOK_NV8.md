@@ -511,10 +511,13 @@ docker stop tf-runner-asr-smoke && docker rm tf-runner-asr-smoke
 transformers 5.8),我们只 layer 真正缺的 `diffusers / soundfile /
 librosa` 三个包。任何后续 base 升级需要重跑 §12.3 + §12.6 矩阵。
 
-## 13 · Agent sandbox 部署(PR#22a)
+## 13 · Agent sandbox 部署(PR#22a + PR#22b-M1)
 
 PR#22a 在 nv8 上落地了一个用来跑 Claude Code agent 的隔离沙箱(详见
-`docs/INVARIANTS.md` §INV-16~20 与 `deploy/agent-sandbox/README.md`)。
+`docs/INVARIANTS.md` §INV-16~21 与 `deploy/agent-sandbox/README.md`)。
+PR#22b-M1 在沙箱里加了**追加式审计写入通道**:setuid 包装脚本 +
+sudoers 白名单 + INV-21 静态守护,保证 agent 既不能伪造审计记录也
+不能擦掉已记录的命令。
 v9 时代 agent 直接以 `ai` 用户跑——而 `ai` 在 `docker` + `sudo` 组,
 导致 `docker exec minimax bash -c 'rm -rf /'` 等事故可以一行命令发起。
 v10 的 PR#22a 把 agent 钉死在 `heyi-eval-agent` 这个无 docker / 无
@@ -544,29 +547,35 @@ sudo install -m 0644 ../systemd/heyi-eval-agent@.service /etc/systemd/system/
 sudo systemd-analyze verify /etc/systemd/system/heyi-eval-agent@.service \
     /etc/systemd/system/heyi-eval-agent.slice
 sudo systemctl daemon-reload
+# PR#22b-M1
+sudo install -m 0755 -o root -g root \
+    heyi-eval-agent-audit-record /usr/local/sbin/heyi-eval-agent-audit-record
+sudo /usr/local/sbin/heyi-eval-agent-audit-record init
 ```
 
-### 13.2 验证沙箱五层
+### 13.2 验证沙箱六层
 
-`drills/run_all.sh` 顺序跑 5 个攻击演练,任一 BREACH 立刻 exit 1:
+`drills/run_all.sh` 顺序跑 6 个攻击演练,任一 BREACH 立刻 exit 1
+(drill-6 在 audit wrapper 未安装时自动跳过,不影响 PR#22a-only 的部署):
 
 ```bash
 sudo bash /home/ai/heyi-eval-v10/deploy/agent-sandbox/drills/run_all.sh
 ```
 
-期望输出尾部:
+期望输出尾部(完整 PR#22a+PR#22b-M1 部署):
 
 ```
-ALL 5 DRILLS PASSED — INV-16/17/18/19/20 hold end-to-end
+ALL 6 DRILLS PASSED — INV-16/17/18/19/20/21 hold end-to-end
   drill-1 rc=0   # store deletion blocked (filesystem ACL)
   drill-2 rc=0   # docker exec into minimax blocked (socket proxy 403)
   drill-3 rc=0   # sudo escalation blocked (whitelist denies forbidden)
   drill-4 rc=0   # audit log evasion blocked (deny-all ACL)
   drill-5 rc=0   # fork-bomb cgroup-capped + RuntimeMaxSec watchdog
+  drill-6 rc=0   # audit write append-only (wrapper EUID + subcommand WL + INV-18 ACL)
 ```
 
-任何一项 BREACH = 沙箱漏洞,**不要继续 PR#22b 接入 agent**,先回到
-`deploy/agent-sandbox/` 排查。
+任何一项 BREACH = 沙箱漏洞,**不要继续 PR#22b-M2 接入 agent runner**,
+先回到 `deploy/agent-sandbox/` 排查。
 
 ### 13.3 常见排错
 
@@ -586,5 +595,8 @@ ALL 5 DRILLS PASSED — INV-16/17/18/19/20 hold end-to-end
 - [x] `getfacl /var/log/heyi-eval-agent` 显示 `user:heyi-eval-agent:---`
 - [x] `curl http://127.0.0.1:2377/_ping` 返回 `OK`,`curl -X POST .../containers/minimax/stop` 返回 `403`
 - [x] `systemctl list-unit-files heyi-eval-agent@.service` 显示 `static`
-- [x] `bash deploy/agent-sandbox/drills/run_all.sh` 退出 0,5/5 BLOCKED OK
-- [ ] (推迟到 PR#22b)`heyi-eval-agent-run` 脚本接入 + audit daemon 注入
+- [x] `bash deploy/agent-sandbox/drills/run_all.sh` 退出 0,6/6 BLOCKED OK
+- [x] PR#22b-M1: `/usr/local/sbin/heyi-eval-agent-audit-record` 安装且 0755 root:root,`sudo` 它的 `init` / `begin` / `end` 在 sudoers 白名单内
+- [x] PR#22b-M1: drill-6 真机绿(`run_all.sh` 末尾"drill-6 rc=0")
+- [ ] (推迟到 PR#22b-M2)`heyi-eval-agent-run` ExecStart 脚本接入(替换 `@.service` 里的 `sleep 60` 占位)
+- [ ] (推迟到 PR#22b-M3)orchestrator 主 loop 通过 `systemctl start heyi-eval-agent@<run-id>` 拉起 agent + 回收结果

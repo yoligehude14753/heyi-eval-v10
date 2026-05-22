@@ -131,14 +131,28 @@ class TestInv19Sudoers(unittest.TestCase):
                 )
 
     def test_whitelist_is_minimal(self) -> None:
-        # NOPASSWD entries must be limited to orchestrator bounce only.
+        # All NOPASSWD entries must be on a SINGLE line, and may
+        # reference only the explicitly-named, narrowly-scoped aliases.
+        # Adding a new alias here is a security review event — list
+        # explicitly so an unintended addition trips the test.
         nopasswd = re.findall(r"^\s*heyi-eval-agent\s+ALL=.*NOPASSWD.*$", self.sudoers, re.MULTILINE)
         self.assertEqual(
             len(nopasswd),
             1,
             f"expected exactly 1 NOPASSWD line, got {len(nopasswd)}: {nopasswd}",
         )
-        self.assertIn("HEYI_EVAL_ORCH_BOUNCE", nopasswd[0])
+        ALLOWED_NOPASSWD_ALIASES = {"HEYI_EVAL_ORCH_BOUNCE", "HEYI_EVAL_AUDIT_RECORD"}
+        line = nopasswd[0]
+        # extract token list after "NOPASSWD:" — must consist only of
+        # known aliases or comma whitespace.
+        after = line.split("NOPASSWD:", 1)[1].strip()
+        tokens = {tok.strip() for tok in after.split(",") if tok.strip()}
+        self.assertSetEqual(
+            tokens,
+            ALLOWED_NOPASSWD_ALIASES,
+            "NOPASSWD aliases drifted; if you're adding a new one, "
+            "review docs/INVARIANTS.md and update ALLOWED_NOPASSWD_ALIASES",
+        )
 
     def test_orchestrator_bounce_does_not_include_destructive_verbs(self) -> None:
         bounce_block = re.search(

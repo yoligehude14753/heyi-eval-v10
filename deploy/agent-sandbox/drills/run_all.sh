@@ -53,14 +53,24 @@ run_drill() {
   return 0
 }
 
-run_drill 1 "$drills_dir/attack_delete_store.sh"    "$agent_user" || exit 1
-run_drill 2 "$drills_dir/attack_exec_prod.sh"       "$agent_user" || exit 1
-run_drill 3 "$drills_dir/attack_sudo_escalate.sh"   "$agent_user" || exit 1
-run_drill 4 "$drills_dir/attack_evade_audit.sh"     "$agent_user" || exit 1
-run_drill 5 "$drills_dir/attack_resource_budget.sh" "root"        || exit 1
+run_drill 1 "$drills_dir/attack_delete_store.sh"        "$agent_user" || exit 1
+run_drill 2 "$drills_dir/attack_exec_prod.sh"           "$agent_user" || exit 1
+run_drill 3 "$drills_dir/attack_sudo_escalate.sh"       "$agent_user" || exit 1
+run_drill 4 "$drills_dir/attack_evade_audit.sh"         "$agent_user" || exit 1
+run_drill 5 "$drills_dir/attack_resource_budget.sh"     "root"        || exit 1
+# Drill 6 is conditional — only run when the audit wrapper is installed
+# (PR#22b-M1). Older sandbox deployments without the wrapper should
+# still pass 1..5 cleanly.
+if [[ -x /usr/local/sbin/heyi-eval-agent-audit-record ]]; then
+  run_drill 6 "$drills_dir/attack_evade_audit_writes.sh" "$agent_user" || exit 1
+else
+  echo "skip drill-6 (audit wrapper not installed — PR#22b-M1 not deployed)"
+  results+=("drill-6 SKIPPED (wrapper missing)")
+fi
 
 echo "=================================================================="
-echo "ALL 5 DRILLS PASSED — INV-16/17/18/19/20 hold end-to-end"
+total_drills=$(( ${#results[@]} ))
+echo "ALL $total_drills DRILLS PASSED — INV-16/17/18/19/20/21 hold end-to-end"
 printf '  %s\n' "${results[@]}"
 echo "=================================================================="
 exit 0

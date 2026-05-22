@@ -22,6 +22,14 @@ Cmnd_Alias HEYI_EVAL_ORCH_BOUNCE = \
     /usr/bin/systemctl restart heyi-eval-orchestrator.service, \
     /usr/bin/systemctl status  heyi-eval-orchestrator.service
 
+# Append-only audit write entrypoint (INV-21). The agent can ONLY
+# invoke `init`, `begin`, `end` — enforced both in the wrapper and in
+# the underlying agent_audit.py CLI. No other path can write the DB.
+Cmnd_Alias HEYI_EVAL_AUDIT_RECORD = \
+    /usr/local/sbin/heyi-eval-agent-audit-record begin *, \
+    /usr/local/sbin/heyi-eval-agent-audit-record end *, \
+    /usr/local/sbin/heyi-eval-agent-audit-record init
+
 # Explicit DENY list — keeps any future inheritance from breaking the
 # trust boundary even if a parent rule changes.
 Cmnd_Alias HEYI_EVAL_FORBIDDEN = \
@@ -40,7 +48,7 @@ Cmnd_Alias HEYI_EVAL_FORBIDDEN = \
     /usr/bin/passwd, \
     /usr/bin/chsh
 
-heyi-eval-agent ALL=(root) NOPASSWD: HEYI_EVAL_ORCH_BOUNCE
+heyi-eval-agent ALL=(root) NOPASSWD: HEYI_EVAL_ORCH_BOUNCE, HEYI_EVAL_AUDIT_RECORD
 heyi-eval-agent ALL=(ALL)       !HEYI_EVAL_FORBIDDEN
 
 # Hard ceiling on env vars the agent can inherit through sudo.

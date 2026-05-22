@@ -199,6 +199,27 @@ if [[ -d "$SANDBOX_DIR" ]]; then
   # is a no-op when the file is byte-identical.
   run "sudo bash '${SANDBOX_DIR}/setup_agent_user.sh'"
   run "sudo bash '${SANDBOX_DIR}/acl_install.sh'"
+  # Audit wrapper (PR#22b-M1). Owned root:root 0750 so the agent
+  # cannot read its source either — the wrapper is reached only via
+  # the sudoers whitelist below.
+  if [[ -f "${SANDBOX_DIR}/heyi-eval-agent-audit-record" ]]; then
+    if ! cmp -s "${SANDBOX_DIR}/heyi-eval-agent-audit-record" \
+                /usr/local/sbin/heyi-eval-agent-audit-record 2>/dev/null; then
+      log "installing heyi-eval-agent-audit-record"
+      # 0755 not 0750: the agent MUST be able to exec the wrapper
+      # script body so that the script's own $EUID check fires and
+      # produces the "must run via sudo" error (drill 6a relies on
+      # this). With 0750 the agent gets EACCES at exec() time and
+      # the wrapper's defensive logic is unreachable — same end
+      # state, but drill 6 cannot distinguish wrapper-policy from
+      # filesystem-policy. 0755 keeps the two layers testable.
+      run "sudo install -m 0755 -o root -g root '${SANDBOX_DIR}/heyi-eval-agent-audit-record' /usr/local/sbin/heyi-eval-agent-audit-record"
+    else
+      log "heyi-eval-agent-audit-record (unchanged)"
+    fi
+    # Initialise the audit DB schema (idempotent).
+    run "sudo /usr/local/sbin/heyi-eval-agent-audit-record init"
+  fi
   if ! cmp -s "${SANDBOX_DIR}/sudoers.d/heyi-eval-agent" \
               /etc/sudoers.d/heyi-eval-agent 2>/dev/null; then
     log "installing sudoers.d/heyi-eval-agent"

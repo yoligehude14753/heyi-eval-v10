@@ -1,4 +1,4 @@
-# Agent Sandbox (PR#22a)
+# Agent Sandbox (PR#22a + PR#22b)
 
 Purpose: re-introduce a Claude Code agent into the evaluation pipeline (v10 was
 fully Python-hardcoded as a reaction to v9 incidents) **without** giving the
@@ -6,16 +6,17 @@ agent the v9-era privileges (`docker` group + full `sudo`) that previously led
 to store/* deletion and prod-engine restarts.
 
 The agent runs as a dedicated Linux user `heyi-eval-agent` whose effective
-privileges are constrained by four mechanisms; INV-16~20 each pins one of them
+privileges are constrained by six mechanisms; INV-16~21 each pins one of them
 and `drills/` contains the adversarial verification scripts.
 
-| Layer                  | Pinned by  | Drill                                  |
-|------------------------|-----------|----------------------------------------|
-| filesystem ACL         | INV-16    | `drills/attack_delete_store.sh`        |
-| docker access (proxy)  | INV-17    | `drills/attack_exec_prod.sh`           |
-| audit log no-access    | INV-18    | `drills/attack_evade_audit.sh`         |
-| cgroup + watchdog      | INV-19    | `drills/attack_resource_budget.sh`     |
-| sudoers + identity     | INV-20    | `drills/attack_sudo_escalate.sh`       |
+| Layer                       | Pinned by  | Drill                                       |
+|-----------------------------|-----------|---------------------------------------------|
+| filesystem ACL              | INV-16    | `drills/attack_delete_store.sh`             |
+| docker access (proxy)       | INV-17    | `drills/attack_exec_prod.sh`                |
+| audit log no-access         | INV-18    | `drills/attack_evade_audit.sh`              |
+| cgroup + watchdog           | INV-19    | `drills/attack_resource_budget.sh`          |
+| sudoers + identity          | INV-20    | `drills/attack_sudo_escalate.sh`            |
+| audit write append-only     | INV-21    | `drills/attack_evade_audit_writes.sh`       |
 
 All `drills/*.sh` MUST run as `heyi-eval-agent` (use `sudo -u heyi-eval-agent`)
 and MUST exit non-zero when the protection works (i.e. the attack is blocked).
@@ -43,6 +44,18 @@ sudo -u heyi-eval-agent bash drills/attack_exec_prod.sh
 # M3a — audit dir is part of acl_install.sh §5; re-running it is fine
 sudo -u heyi-eval-agent bash drills/attack_evade_audit.sh
 # expect: "BLOCKED OK — INV-18 holds" (6/6 access attempts EACCES)
+
+# PR#22b-M1 — append-only audit write path (INV-21)
+# Wrapper is owned root:root 0755 so the agent can exec it and hit
+# the EUID check, but the actual append is gated by sudo NOPASSWD.
+sudo install -m 0755 -o root -g root heyi-eval-agent-audit-record /usr/local/sbin/
+sudo /usr/local/sbin/heyi-eval-agent-audit-record init
+# expect: "audit schema initialised at /var/log/heyi-eval-agent/audit.sqlite"
+sudo -u heyi-eval-agent bash drills/attack_evade_audit_writes.sh
+# expect: "BLOCKED OK — INV-21 holds"
+#   4 wrapper-policy attacks (no-sudo / update / delete / drop) blocked
+#   5 INV-18 ACL attacks (cat / dd / tee / truncate / rm) blocked
+#   2 happy-path writes (begin/end via sudo wrapper) succeed
 
 # M4
 sudo install -m 0644 ../systemd/heyi-eval-agent.slice    /etc/systemd/system/
