@@ -1,26 +1,46 @@
-"""Python-native CAPABILITY stage (v10).
+"""Multi-modal CAPABILITY stage (v10, PR#15).
 
-Replaces the v9 cc-agent CAPABILITY path. Loads bundled micro-benchmark
-slices (gsm8k_mini, mmlu_mini, humaneval_mini under
-``orchestrator/capability_data/``), POSTs each to the deployed engine's
-``/v1/chat/completions`` endpoint, and writes ``runs/<run_id>/capability.json``
-matching ``sops/schemas/capability.schema.json``.
+Routes each test category to a modality-specific dispatcher
+(text-chat / vision-chat / ASR / TTS / image-gen / etc.) and a
+category-specific scorer (substring / output_validity / llm_judge).
 
-INV-2 invariant: CAPABILITY only talks to ``deploy.json::base_url`` —
-the e9-* eval container — never to heyi_engine. Tests pin this by
-checking the URL passed to ``_http_post_chat``.
+13 categories covered:
 
-Public surface:
-    execute_capability(run, cfg) -> StageResult
+    text_reasoning, code_gen, code_repair, code_complete,
+    vision, ocr, asr, video_understanding, music_understanding,
+    tts, image_gen, video_gen, music_gen
+
+Each category is gated by ``capability_tags`` read from
+``runs/<run_id>/_meta/curated.json``. A model tagged only with
+``["text"]`` runs text_reasoning + the three coding categories;
+a model tagged with ``["text", "vision"]`` additionally runs vision
+and ocr; etc.
+
+INV-2 unchanged: the eval-side API endpoint always comes from
+``deploy.json::base_url`` (never heyi_engine). The LLM-judge scorer
+DOES call heyi_engine, but only to evaluate the *artifacts produced
+by the eval engine* — never to answer test prompts directly. The two
+trust domains stay disjoint.
+
+Backward compatibility:
+    The pre-PR#15 entry point ``execute_capability(run, cfg,
+    slices=..., data_dir=...)`` is preserved. When ``slices`` is
+    given, every file is loaded as a single synthetic
+    ``custom_text`` category that uses text-chat+substring.
+    The old ``_http_post_chat`` helper at module scope is kept
+    verbatim so ``cc_agent.showcase_runner`` and the legacy test
+    suite continue to import and patch it.
 """
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -31,14 +51,117 @@ from .state_machine import Run
 log = logging.getLogger(__name__)
 
 DATA_DIR = Path(__file__).resolve().parent / "capability_data"
+FIXTURES_DIR = DATA_DIR / "fixtures"
 
-# Slice files we pick up by default. Operators can override via env or
-# by passing `slices=...` to execute_capability for unit tests.
-DEFAULT_SLICES: tuple[str, ...] = (
-    "gsm8k_mini.jsonl",
-    "mmlu_mini.jsonl",
-    "humaneval_mini.jsonl",
+# ── public types & registry ───────────────────────────────────────────────
+
+
+# Stable list of capability tags the curator emits and the registry keys.
+# Adding a new tag → bump enricher prompt AND CATEGORY_REGISTRY together.
+KNOWN_CAPABILITY_TAGS: tuple[str, ...] = (
+    "text", "code", "vision", "ocr", "asr", "tts", "audio", "video",
+    "image_gen", "video_gen", "music_gen", "embedding",
 )
+
+
+@dataclass(frozen=True)
+class CategoryConfig:
+    """How to run + score one capability category.
+
+    ``required_tags`` is the conjunction of tags the model must carry in
+    its capability_tags list to make this category applicable. e.g.
+    "ocr" needs ``("vision",)`` because OCR is read with a VLM via
+    image-url. Multiple tags here are AND-ed.
+    """
+    name: str
+    dispatcher: str        # key into _DISPATCHERS
+    scorer: str            # key into _SCORERS
+    required_tags: tuple[str, ...]
+    data_file: str         # JSONL under DATA_DIR
+    default_max_tokens: int = 256
+    notes: str = ""
+
+
+CATEGORY_REGISTRY: tuple[CategoryConfig, ...] = (
+    CategoryConfig(
+        name="text_reasoning", dispatcher="text_chat", scorer="substring",
+        required_tags=("text",), data_file="text_reasoning.jsonl",
+        default_max_tokens=384,
+        notes="GSM8K-style multi-step arithmetic / reasoning",
+    ),
+    CategoryConfig(
+        name="code_gen", dispatcher="text_chat", scorer="substring",
+        required_tags=("code",), data_file="code_gen.jsonl",
+        default_max_tokens=512,
+        notes="HumanEval-style function body generation",
+    ),
+    CategoryConfig(
+        name="code_repair", dispatcher="text_chat", scorer="substring",
+        required_tags=("code",), data_file="code_repair.jsonl",
+        default_max_tokens=512,
+        notes="QuixBugs-style bug fix",
+    ),
+    CategoryConfig(
+        name="code_complete", dispatcher="text_chat", scorer="substring",
+        required_tags=("code",), data_file="code_complete.jsonl",
+        default_max_tokens=384,
+        notes="MBPP-style code completion",
+    ),
+    CategoryConfig(
+        name="vision", dispatcher="vlm_chat", scorer="substring",
+        required_tags=("vision",), data_file="vision.jsonl",
+        default_max_tokens=128,
+        notes="MMMU-style image VQA",
+    ),
+    CategoryConfig(
+        name="ocr", dispatcher="vlm_chat", scorer="substring",
+        required_tags=("vision",), data_file="ocr.jsonl",
+        default_max_tokens=128,
+        notes="OCRBench-style text-in-image extraction",
+    ),
+    CategoryConfig(
+        name="asr", dispatcher="asr_transcribe", scorer="substring",
+        required_tags=("asr",), data_file="asr.jsonl",
+        default_max_tokens=256,
+        notes="LibriSpeech / FLEURS audio → text transcription",
+    ),
+    CategoryConfig(
+        name="video_understanding", dispatcher="video_chat", scorer="substring",
+        required_tags=("video",), data_file="video_understanding.jsonl",
+        default_max_tokens=192,
+        notes="MVBench / Video-MME style video QA",
+    ),
+    CategoryConfig(
+        name="music_understanding", dispatcher="audio_chat", scorer="substring",
+        required_tags=("audio",), data_file="music_understanding.jsonl",
+        default_max_tokens=192,
+        notes="MusicCaps Q&A; audio LLM (Qwen2-Audio style)",
+    ),
+    CategoryConfig(
+        name="tts", dispatcher="tts_speech", scorer="output_validity",
+        required_tags=("tts",), data_file="tts.jsonl",
+        notes="Text → audio file; scorer checks wav/mp3 header + duration band",
+    ),
+    CategoryConfig(
+        name="image_gen", dispatcher="image_gen", scorer="llm_judge",
+        required_tags=("image_gen",), data_file="image_gen.jsonl",
+        notes="Text → image; LLM-judge via heyi_engine VLM",
+    ),
+    CategoryConfig(
+        name="video_gen", dispatcher="video_gen", scorer="llm_judge",
+        required_tags=("video_gen",), data_file="video_gen.jsonl",
+        notes="Text → video; LLM-judge first-frame via heyi_engine VLM",
+    ),
+    CategoryConfig(
+        name="music_gen", dispatcher="music_gen", scorer="output_validity",
+        required_tags=("music_gen",), data_file="music_gen.jsonl",
+        notes="Text → music audio; scorer checks file format + duration band",
+    ),
+)
+
+
+def _registry_by_name() -> dict[str, CategoryConfig]:
+    return {c.name: c for c in CATEGORY_REGISTRY}
 
 
 # ── result struct (mirrors orchestrator.stages.StageResult) ───────────────
@@ -54,9 +177,10 @@ class StageResult:
     rc: int | None = None
     container_name: str | None = None
     error_kind: str | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
 
 
-# ── HTTP boundary (test seam) ─────────────────────────────────────────────
+# ── HTTP boundary (text-chat dispatcher; kept module-level for compat) ────
 
 
 def _http_post_chat(
@@ -68,14 +192,14 @@ def _http_post_chat(
 ) -> tuple[int, dict[str, Any] | None]:
     """POST a single chat completion. Returns (status_code, parsed_body_or_None).
 
-    Lives at module scope so tests can ``patch.object(capability,
-    "_http_post_chat", ...)`` cleanly.
+    Lives at module scope so existing tests + showcase_runner can
+    ``patch.object(capability, "_http_post_chat", ...)`` cleanly.
 
     The body shape matches vLLM / SGLang / Transformers OpenAI-compat
     response: ``{"choices": [{"message": {"content": str}}], "usage": {...}}``.
     """
     body = json.dumps({
-        "model": "evaluated",  # ignored by vllm when only one model is loaded
+        "model": "evaluated",
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "temperature": 0.0,
@@ -99,12 +223,587 @@ def _http_post_chat(
         return (0, None)
 
 
-# ── slice loader ──────────────────────────────────────────────────────────
+def _http_post_chat_with_attachments(
+    base_url: str,
+    *,
+    prompt: str,
+    attachments: list[Mapping[str, str]],
+    max_tokens: int = 256,
+    timeout_s: float = 60.0,
+) -> tuple[int, dict[str, Any] | None]:
+    """POST a chat completion with image/audio/video attachments.
+
+    ``attachments`` is a list of dicts like
+    ``{"type": "image_url", "url": "data:image/png;base64,..."}``
+    or ``{"type": "audio_url", "url": "..."}`` etc.
+    Built into OpenAI-compatible multi-content message format that
+    vLLM (Qwen2-VL, LLaVA), SGLang and others all accept.
+    """
+    content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    for att in attachments:
+        att_type = att["type"]
+        url = att["url"]
+        # OpenAI canonical naming: image_url, audio_url, video_url (vLLM extension)
+        key = att_type.replace("_url", "") + "_url"
+        content.append({"type": key, key: {"url": url}})
+    body = json.dumps({
+        "model": "evaluated",
+        "messages": [{"role": "user", "content": content}],
+        "max_tokens": max_tokens,
+        "temperature": 0.0,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        f"{base_url.rstrip('/')}/v1/chat/completions",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as r:
+            raw = r.read().decode("utf-8", errors="replace")
+            try:
+                return (r.getcode(), json.loads(raw))
+            except json.JSONDecodeError:
+                return (r.getcode(), None)
+    except urllib.error.HTTPError as e:
+        return (e.code, None)
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+        return (0, None)
 
 
-def _load_slice(path: Path) -> list[dict[str, Any]]:
-    """Read a .jsonl file and return list of items. Bad lines are skipped
-    with a warning so a single corrupt line doesn't break the whole run."""
+# ── fixture loading & encoding ────────────────────────────────────────────
+
+
+_MIME_BY_EXT = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".webp": "image/webp", ".gif": "image/gif",
+    ".wav": "audio/wav", ".mp3": "audio/mpeg", ".flac": "audio/flac",
+    ".m4a": "audio/mp4", ".ogg": "audio/ogg",
+    ".mp4": "video/mp4", ".webm": "video/webm", ".mov": "video/quicktime",
+}
+
+
+def _fixture_path(fixture_rel: str, fixtures_dir: Path = FIXTURES_DIR) -> Path:
+    """Resolve a fixture path safely (no .. escapes)."""
+    p = (fixtures_dir / fixture_rel).resolve()
+    base = fixtures_dir.resolve()
+    if base not in p.parents and p != base:
+        raise ValueError(f"fixture escapes fixtures dir: {fixture_rel!r}")
+    return p
+
+
+def _encode_data_url(path: Path) -> str:
+    """Read a fixture and return a data: URL with base64 payload.
+
+    Most local vLLM/SGLang deployments don't share a filesystem with
+    the eval pipeline, so we inline. For very large videos this may be
+    impractical — keep video fixtures small (<2MB)."""
+    mime = _MIME_BY_EXT.get(path.suffix.lower(), "application/octet-stream")
+    data = path.read_bytes()
+    return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+
+
+# ── dispatchers ───────────────────────────────────────────────────────────
+#
+# Every dispatcher signature is:
+#     (base_url, item, *, timeout_s, http_chat=None, http_chat_att=None,
+#      fixtures_dir=FIXTURES_DIR) -> dict
+#
+# The returned dict has at minimum:
+#     {"actual": str | bytes | None, "tokens_in": int, "tokens_out": int,
+#      "error": str | None}
+# Scorers consume this + the item's expected_* fields.
+
+
+DispatcherFn = Callable[..., dict[str, Any]]
+
+
+def _dispatch_text_chat(
+    base_url: str,
+    item: Mapping[str, Any],
+    *,
+    timeout_s: float,
+    http_chat: Callable[..., tuple[int, dict[str, Any] | None]] | None = None,
+    **_: Any,
+) -> dict[str, Any]:
+    """Pure text → text via /v1/chat/completions."""
+    fn = http_chat if http_chat is not None else _http_post_chat
+    status, body = fn(
+        base_url, prompt=item["prompt"],
+        max_tokens=int(item.get("max_tokens", 256)),
+        timeout_s=timeout_s,
+    )
+    return _parse_chat_response(status, body)
+
+
+def _dispatch_vlm_chat(
+    base_url: str,
+    item: Mapping[str, Any],
+    *,
+    timeout_s: float,
+    http_chat_att: Callable[..., tuple[int, dict[str, Any] | None]] | None = None,
+    fixtures_dir: Path = FIXTURES_DIR,
+    **_: Any,
+) -> dict[str, Any]:
+    """Image-as-input chat (vision / ocr)."""
+    fn = http_chat_att if http_chat_att is not None else _http_post_chat_with_attachments
+    try:
+        img_path = _fixture_path(item["fixture"], fixtures_dir)
+        url = _encode_data_url(img_path)
+    except (KeyError, ValueError, OSError) as e:
+        return {"actual": None, "tokens_in": 0, "tokens_out": 0,
+                "error": f"fixture: {type(e).__name__}: {e}"}
+    status, body = fn(
+        base_url, prompt=item["prompt"],
+        attachments=[{"type": "image_url", "url": url}],
+        max_tokens=int(item.get("max_tokens", 256)),
+        timeout_s=timeout_s,
+    )
+    return _parse_chat_response(status, body)
+
+
+def _dispatch_video_chat(
+    base_url: str,
+    item: Mapping[str, Any],
+    *,
+    timeout_s: float,
+    http_chat_att: Callable[..., tuple[int, dict[str, Any] | None]] | None = None,
+    fixtures_dir: Path = FIXTURES_DIR,
+    **_: Any,
+) -> dict[str, Any]:
+    """Video-as-input chat (video_understanding)."""
+    fn = http_chat_att if http_chat_att is not None else _http_post_chat_with_attachments
+    try:
+        vid_path = _fixture_path(item["fixture"], fixtures_dir)
+        url = _encode_data_url(vid_path)
+    except (KeyError, ValueError, OSError) as e:
+        return {"actual": None, "tokens_in": 0, "tokens_out": 0,
+                "error": f"fixture: {type(e).__name__}: {e}"}
+    status, body = fn(
+        base_url, prompt=item["prompt"],
+        attachments=[{"type": "video_url", "url": url}],
+        max_tokens=int(item.get("max_tokens", 256)),
+        timeout_s=timeout_s,
+    )
+    return _parse_chat_response(status, body)
+
+
+def _dispatch_audio_chat(
+    base_url: str,
+    item: Mapping[str, Any],
+    *,
+    timeout_s: float,
+    http_chat_att: Callable[..., tuple[int, dict[str, Any] | None]] | None = None,
+    fixtures_dir: Path = FIXTURES_DIR,
+    **_: Any,
+) -> dict[str, Any]:
+    """Audio-as-input chat (music_understanding)."""
+    fn = http_chat_att if http_chat_att is not None else _http_post_chat_with_attachments
+    try:
+        aud_path = _fixture_path(item["fixture"], fixtures_dir)
+        url = _encode_data_url(aud_path)
+    except (KeyError, ValueError, OSError) as e:
+        return {"actual": None, "tokens_in": 0, "tokens_out": 0,
+                "error": f"fixture: {type(e).__name__}: {e}"}
+    status, body = fn(
+        base_url, prompt=item["prompt"],
+        attachments=[{"type": "audio_url", "url": url}],
+        max_tokens=int(item.get("max_tokens", 256)),
+        timeout_s=timeout_s,
+    )
+    return _parse_chat_response(status, body)
+
+
+def _dispatch_asr(
+    base_url: str,
+    item: Mapping[str, Any],
+    *,
+    timeout_s: float,
+    http_transcribe: Callable[..., tuple[int, dict[str, Any] | None]] | None = None,
+    fixtures_dir: Path = FIXTURES_DIR,
+    **_: Any,
+) -> dict[str, Any]:
+    """Audio → text via /v1/audio/transcriptions (Whisper-compatible)."""
+    fn = http_transcribe if http_transcribe is not None else _http_post_transcribe
+    try:
+        aud_path = _fixture_path(item["fixture"], fixtures_dir)
+    except (KeyError, ValueError) as e:
+        return {"actual": None, "tokens_in": 0, "tokens_out": 0,
+                "error": f"fixture: {type(e).__name__}: {e}"}
+    status, body = fn(base_url, audio_path=aud_path, timeout_s=timeout_s)
+    if status == 0:
+        return {"actual": None, "tokens_in": 0, "tokens_out": 0,
+                "error": "connection refused / timeout"}
+    if status != 200 or not isinstance(body, dict):
+        return {"actual": None, "tokens_in": 0, "tokens_out": 0,
+                "error": f"http {status}"}
+    return {"actual": body.get("text") or "", "tokens_in": 0,
+            "tokens_out": 0, "error": None}
+
+
+def _dispatch_tts(
+    base_url: str,
+    item: Mapping[str, Any],
+    *,
+    timeout_s: float,
+    http_tts: Callable[..., tuple[int, bytes | None, str | None]] | None = None,
+    artifact_dir: Path | None = None,
+    **_: Any,
+) -> dict[str, Any]:
+    """Text → audio file via /v1/audio/speech (OpenAI-compatible).
+
+    Returns ``actual`` = path to the persisted audio file plus a
+    ``content_type`` so the validity scorer can verify file header.
+    """
+    fn = http_tts if http_tts is not None else _http_post_tts
+    status, audio_bytes, content_type = fn(
+        base_url, text=item["prompt"], voice=item.get("voice", "alloy"),
+        timeout_s=timeout_s,
+    )
+    if status != 200 or not audio_bytes:
+        return {"actual": None, "tokens_in": 0, "tokens_out": 0,
+                "error": f"http {status}", "content_type": content_type}
+    # Persist alongside the run so the panel/validator can listen.
+    out_dir = artifact_dir or Path(".")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    target = out_dir / f"tts_{item['id']}.bin"
+    target.write_bytes(audio_bytes)
+    return {"actual": str(target), "tokens_in": 0,
+            "tokens_out": 0, "error": None,
+            "content_type": content_type or "",
+            "byte_count": len(audio_bytes)}
+
+
+def _dispatch_image_gen(
+    base_url: str,
+    item: Mapping[str, Any],
+    *,
+    timeout_s: float,
+    http_image_gen: Callable[..., tuple[int, bytes | None, str | None]] | None = None,
+    artifact_dir: Path | None = None,
+    **_: Any,
+) -> dict[str, Any]:
+    """Text → image via /v1/images/generations (OpenAI-compatible)."""
+    fn = http_image_gen if http_image_gen is not None else _http_post_image_gen
+    status, img_bytes, content_type = fn(
+        base_url, prompt=item["prompt"],
+        size=item.get("size", "512x512"), timeout_s=timeout_s,
+    )
+    if status != 200 or not img_bytes:
+        return {"actual": None, "tokens_in": 0, "tokens_out": 0,
+                "error": f"http {status}", "content_type": content_type}
+    out_dir = artifact_dir or Path(".")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    target = out_dir / f"img_{item['id']}.bin"
+    target.write_bytes(img_bytes)
+    return {"actual": str(target), "tokens_in": 0,
+            "tokens_out": 0, "error": None,
+            "content_type": content_type or "",
+            "byte_count": len(img_bytes)}
+
+
+def _dispatch_video_gen(
+    base_url: str,
+    item: Mapping[str, Any],
+    *,
+    timeout_s: float,
+    http_video_gen: Callable[..., tuple[int, bytes | None, str | None]] | None = None,
+    artifact_dir: Path | None = None,
+    **_: Any,
+) -> dict[str, Any]:
+    """Text → video. No standard API; vLLM/SGLang don't host video-gen
+    models. A pluggable hook is exposed for the operator to inject a
+    project-specific HTTP call when bringing such a model online.
+
+    When unavailable, returns ``error="dispatcher_not_wired"`` so the
+    scorer marks the item as failed without crashing the stage.
+    """
+    if http_video_gen is None:
+        return {"actual": None, "tokens_in": 0, "tokens_out": 0,
+                "error": "dispatcher_not_wired",
+                "content_type": None}
+    status, vid_bytes, content_type = http_video_gen(
+        base_url, prompt=item["prompt"], timeout_s=timeout_s,
+    )
+    if status != 200 or not vid_bytes:
+        return {"actual": None, "tokens_in": 0, "tokens_out": 0,
+                "error": f"http {status}", "content_type": content_type}
+    out_dir = artifact_dir or Path(".")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    target = out_dir / f"vid_{item['id']}.bin"
+    target.write_bytes(vid_bytes)
+    return {"actual": str(target), "tokens_in": 0,
+            "tokens_out": 0, "error": None,
+            "content_type": content_type or "",
+            "byte_count": len(vid_bytes)}
+
+
+def _dispatch_music_gen(
+    base_url: str,
+    item: Mapping[str, Any],
+    *,
+    timeout_s: float,
+    http_music_gen: Callable[..., tuple[int, bytes | None, str | None]] | None = None,
+    artifact_dir: Path | None = None,
+    **_: Any,
+) -> dict[str, Any]:
+    """Text → music audio. Same shape as video_gen — pluggable, optional."""
+    if http_music_gen is None:
+        return {"actual": None, "tokens_in": 0, "tokens_out": 0,
+                "error": "dispatcher_not_wired",
+                "content_type": None}
+    status, aud_bytes, content_type = http_music_gen(
+        base_url, prompt=item["prompt"], timeout_s=timeout_s,
+    )
+    if status != 200 or not aud_bytes:
+        return {"actual": None, "tokens_in": 0, "tokens_out": 0,
+                "error": f"http {status}", "content_type": content_type}
+    out_dir = artifact_dir or Path(".")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    target = out_dir / f"music_{item['id']}.bin"
+    target.write_bytes(aud_bytes)
+    return {"actual": str(target), "tokens_in": 0,
+            "tokens_out": 0, "error": None,
+            "content_type": content_type or "",
+            "byte_count": len(aud_bytes)}
+
+
+# ── shared chat-response parsing ──────────────────────────────────────────
+
+
+def _parse_chat_response(
+    status: int, body: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if status == 0:
+        return {"actual": None, "tokens_in": 0, "tokens_out": 0,
+                "error": "connection refused / timeout"}
+    if status != 200 or not isinstance(body, dict):
+        return {"actual": None, "tokens_in": 0, "tokens_out": 0,
+                "error": f"http {status}"}
+    try:
+        choice = (body.get("choices") or [{}])[0]
+        actual = (choice.get("message") or {}).get("content") or ""
+        usage = body.get("usage") or {}
+        return {
+            "actual": actual,
+            "tokens_in": int(usage.get("prompt_tokens", 0) or 0),
+            "tokens_out": int(usage.get("completion_tokens", 0) or 0),
+            "finish_reason": choice.get("finish_reason"),
+            "error": None,
+        }
+    except (KeyError, IndexError, TypeError) as e:
+        return {"actual": None, "tokens_in": 0, "tokens_out": 0,
+                "error": f"response parse: {type(e).__name__}: {e}"}
+
+
+# ── ancillary HTTP helpers for non-chat modalities ────────────────────────
+
+
+def _http_post_transcribe(
+    base_url: str,
+    *,
+    audio_path: Path,
+    timeout_s: float = 60.0,
+) -> tuple[int, dict[str, Any] | None]:
+    """OpenAI /v1/audio/transcriptions — multipart/form-data."""
+    boundary = "----heyiboundary7c3fb"
+    body_parts: list[bytes] = []
+    body_parts.append(f"--{boundary}\r\n".encode())
+    body_parts.append(b'Content-Disposition: form-data; name="model"\r\n\r\n')
+    body_parts.append(b"evaluated\r\n")
+    body_parts.append(f"--{boundary}\r\n".encode())
+    body_parts.append(
+        f'Content-Disposition: form-data; name="file"; filename="{audio_path.name}"\r\n'.encode()
+    )
+    mime = _MIME_BY_EXT.get(audio_path.suffix.lower(), "application/octet-stream")
+    body_parts.append(f"Content-Type: {mime}\r\n\r\n".encode())
+    body_parts.append(audio_path.read_bytes())
+    body_parts.append(b"\r\n")
+    body_parts.append(f"--{boundary}--\r\n".encode())
+    payload = b"".join(body_parts)
+    req = urllib.request.Request(
+        f"{base_url.rstrip('/')}/v1/audio/transcriptions",
+        data=payload,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as r:
+            raw = r.read().decode("utf-8", errors="replace")
+            try:
+                return (r.getcode(), json.loads(raw))
+            except json.JSONDecodeError:
+                return (r.getcode(), {"text": raw})
+    except urllib.error.HTTPError as e:
+        return (e.code, None)
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+        return (0, None)
+
+
+def _http_post_tts(
+    base_url: str,
+    *,
+    text: str,
+    voice: str = "alloy",
+    timeout_s: float = 60.0,
+) -> tuple[int, bytes | None, str | None]:
+    """OpenAI /v1/audio/speech — returns raw audio bytes."""
+    body = json.dumps({
+        "model": "evaluated",
+        "input": text,
+        "voice": voice,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        f"{base_url.rstrip('/')}/v1/audio/speech",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as r:
+            return (r.getcode(), r.read(),
+                    r.headers.get("Content-Type"))
+    except urllib.error.HTTPError as e:
+        return (e.code, None, None)
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+        return (0, None, None)
+
+
+def _http_post_image_gen(
+    base_url: str,
+    *,
+    prompt: str,
+    size: str = "512x512",
+    timeout_s: float = 120.0,
+) -> tuple[int, bytes | None, str | None]:
+    """OpenAI /v1/images/generations — returns image bytes (b64 → raw)."""
+    body = json.dumps({
+        "model": "evaluated",
+        "prompt": prompt,
+        "n": 1,
+        "size": size,
+        "response_format": "b64_json",
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        f"{base_url.rstrip('/')}/v1/images/generations",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as r:
+            raw = r.read().decode("utf-8", errors="replace")
+            obj = json.loads(raw)
+            datum = (obj.get("data") or [{}])[0]
+            b64 = datum.get("b64_json") or ""
+            if not b64:
+                return (r.getcode(), None, None)
+            return (r.getcode(), base64.b64decode(b64), "image/png")
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError,
+            ConnectionError, OSError, json.JSONDecodeError, ValueError):
+        return (0, None, None)
+
+
+# ── dispatcher registry ───────────────────────────────────────────────────
+
+
+_DISPATCHERS: dict[str, DispatcherFn] = {
+    "text_chat": _dispatch_text_chat,
+    "vlm_chat": _dispatch_vlm_chat,
+    "video_chat": _dispatch_video_chat,
+    "audio_chat": _dispatch_audio_chat,
+    "asr_transcribe": _dispatch_asr,
+    "tts_speech": _dispatch_tts,
+    "image_gen": _dispatch_image_gen,
+    "video_gen": _dispatch_video_gen,
+    "music_gen": _dispatch_music_gen,
+}
+
+
+# ── scorers ───────────────────────────────────────────────────────────────
+
+
+ScorerFn = Callable[[Mapping[str, Any], Mapping[str, Any]], bool]
+
+
+def _score_substring(item: Mapping[str, Any], dispatched: Mapping[str, Any]) -> bool:
+    """Case-insensitive substring match against ``expected_substring``.
+
+    Empty expected → degenerate True on any non-empty actual.
+    Mirrors the v9/PR#4 behaviour so legacy text/coding items keep
+    their pass/fail semantics under the new architecture.
+    """
+    expected = str(item.get("expected_substring", "") or "")
+    actual = dispatched.get("actual")
+    if actual is None:
+        return False
+    if not isinstance(actual, str):
+        return False
+    if expected == "":
+        return bool(actual)
+    return expected.lower() in actual.lower()
+
+
+# Output validity rules per category.
+_VALID_MIME_PREFIXES: dict[str, tuple[str, ...]] = {
+    "tts": ("audio/",),
+    "music_gen": ("audio/",),
+    "image_gen": ("image/",),
+    "video_gen": ("video/",),
+}
+
+
+def _score_output_validity(
+    item: Mapping[str, Any], dispatched: Mapping[str, Any],
+) -> bool:
+    """Smoke test: file written, non-trivial size, content-type fits the
+    expected modality, byte count within expected band."""
+    if dispatched.get("error"):
+        return False
+    actual = dispatched.get("actual")
+    if not actual or not isinstance(actual, str):
+        return False
+    ct = (dispatched.get("content_type") or "").lower()
+    category = str(item.get("category", ""))
+    allowed = _VALID_MIME_PREFIXES.get(category, ())
+    if allowed and not any(ct.startswith(p) for p in allowed):
+        return False
+    byte_count = int(dispatched.get("byte_count") or 0)
+    min_bytes = int(item.get("min_bytes", 1024))
+    max_bytes = int(item.get("max_bytes", 50 * 1024 * 1024))
+    return min_bytes <= byte_count <= max_bytes
+
+
+def _score_llm_judge(
+    item: Mapping[str, Any], dispatched: Mapping[str, Any],
+) -> bool:
+    """Defer to ``llm_judge.judge_*`` populated upstream.
+
+    The judge is run in ``_run_category_items`` (which has access to the
+    judge_client) — by the time scoring runs, the dispatched dict carries
+    ``judge_pass: bool`` and ``judge_reason: str``. This scorer simply
+    reads them; the actual LLM call happened earlier so unit tests can
+    stub it cleanly.
+    """
+    if dispatched.get("error"):
+        return False
+    return bool(dispatched.get("judge_pass"))
+
+
+_SCORERS: dict[str, ScorerFn] = {
+    "substring": _score_substring,
+    "output_validity": _score_output_validity,
+    "llm_judge": _score_llm_judge,
+}
+
+
+# ── data loading ──────────────────────────────────────────────────────────
+
+
+def _load_jsonl(path: Path) -> list[dict[str, Any]]:
+    """Read a JSONL file and return well-formed item dicts."""
+    if not path.exists():
+        return []
     items: list[dict[str, Any]] = []
     for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         line = line.strip()
@@ -124,96 +823,220 @@ def _load_slice(path: Path) -> list[dict[str, Any]]:
     return items
 
 
-def _gather_items(
-    data_dir: Path = DATA_DIR,
-    slices: tuple[str, ...] = DEFAULT_SLICES,
-) -> list[dict[str, Any]]:
-    """Load all slices in order. Returns concatenated list."""
-    out: list[dict[str, Any]] = []
-    for name in slices:
-        p = data_dir / name
-        if not p.exists():
-            log.warning("capability slice missing: %s", p)
-            continue
-        out.extend(_load_slice(p))
+# ── capability tag selection ──────────────────────────────────────────────
+
+
+def _read_capability_tags(run_dir: Path) -> list[str]:
+    """Read curated.json::capability_tags (preferred) or fall back to
+    modalities. Defaults to ``["text"]`` if nothing is available.
+    """
+    meta_curated = run_dir / "_meta" / "curated.json"
+    if meta_curated.exists():
+        try:
+            obj = json.loads(meta_curated.read_text(encoding="utf-8"))
+            tags = obj.get("capability_tags")
+            if isinstance(tags, list) and all(isinstance(t, str) for t in tags):
+                return tags
+            modalities = obj.get("modalities")
+            if isinstance(modalities, list):
+                return _infer_tags_from_modalities(modalities)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return ["text"]
+
+
+def _infer_tags_from_modalities(modalities: list[str]) -> list[str]:
+    """Best-effort fallback when curator hasn't emitted capability_tags.
+
+    Defaults to ['text', 'code'] because every model HF lets you call
+    via chat/completions supports text I/O at least nominally, and the
+    coding tasks degrade gracefully on non-coder LLMs. Extra tags are
+    added for any non-textual modality the curator did note.
+    """
+    tags: list[str] = ["text", "code"]
+    norm = {str(m).lower() for m in modalities}
+    if "image" in norm or "vision" in norm:
+        tags.append("vision")
+    if "audio" in norm:
+        tags.append("audio")
+        tags.append("asr")
+    if "video" in norm:
+        tags.append("video")
+    return tags
+
+
+def _select_applicable_categories(
+    tags: list[str], registry: tuple[CategoryConfig, ...] = CATEGORY_REGISTRY,
+) -> list[CategoryConfig]:
+    """A category is applicable iff *every* required_tag is in the
+    model's capability_tags."""
+    tagset = set(tags)
+    out: list[CategoryConfig] = []
+    for cat in registry:
+        if all(t in tagset for t in cat.required_tags):
+            out.append(cat)
     return out
 
 
-# ── scoring ───────────────────────────────────────────────────────────────
+# ── per-category execution ────────────────────────────────────────────────
 
 
-def _passes(expected_substring: str, actual: str | None) -> bool:
-    """Case-insensitive substring match. Empty expected → degenerate True
-    on any non-empty response.
+@dataclass
+class CategoryRunResult:
+    name: str
+    applicable: bool
+    scorer: str
+    items: list[dict[str, Any]] = field(default_factory=list)
+    score: str = "0/0"
+    pass_rate: float = 0.0
+    reason: str | None = None
+    aborted_due_to: str | None = None
 
-    Per PR4_TEST_PLAN E2 + E3: the substring match is intentionally lenient
-    because our slice prompts ask the model to "reply with just the number/letter".
-    Strict equality would punish a model that's right but verbose; the
-    substring contract lets us reward correctness even with chatty output.
-    """
-    if actual is None:
-        return False
-    if expected_substring == "":
-        return bool(actual)
-    return expected_substring.lower() in actual.lower()
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "applicable": self.applicable,
+            "scorer": self.scorer,
+            "score": self.score,
+            "pass_rate": self.pass_rate,
+            "items": self.items,
+        }
+        if self.reason:
+            d["reason"] = self.reason
+        if self.aborted_due_to:
+            d["aborted_due_to"] = self.aborted_due_to
+        return d
 
 
-def _score_string(pass_count: int, total: int) -> str:
-    return f"{pass_count}/{total}"
-
-
-# ── one item ──────────────────────────────────────────────────────────────
-
-
-def _run_one(
-    base_url: str,
-    item: dict[str, Any],
+def _run_category_items(
+    cat: CategoryConfig,
+    items: list[dict[str, Any]],
     *,
-    timeout_s: float,
-    http: Any = None,
-) -> dict[str, Any]:
-    """Run a single item end-to-end. Always returns a result dict
-    (never raises) so the stage runner can keep going on per-item
-    failures."""
-    if http is None:
-        http = _http_post_chat
-    t0 = time.time()
-    status, body = http(base_url, prompt=item["prompt"],
-                        max_tokens=item.get("max_tokens", 256),
-                        timeout_s=timeout_s)
-    elapsed_ms = (time.time() - t0) * 1000.0
+    base_url: str,
+    deadline_s: float,
+    per_item_timeout_s: float,
+    artifact_dir: Path | None,
+    fixtures_dir: Path,
+    http_chat: Callable[..., tuple[int, dict[str, Any] | None]] | None,
+    http_chat_att: Callable[..., tuple[int, dict[str, Any] | None]] | None,
+    http_transcribe: Callable[..., tuple[int, dict[str, Any] | None]] | None,
+    http_tts: Callable[..., tuple[int, bytes | None, str | None]] | None,
+    http_image_gen: Callable[..., tuple[int, bytes | None, str | None]] | None,
+    http_video_gen: Callable[..., tuple[int, bytes | None, str | None]] | None,
+    http_music_gen: Callable[..., tuple[int, bytes | None, str | None]] | None,
+    judge_image: Callable[..., tuple[bool, str]] | None,
+    judge_video_first_frame: Callable[..., tuple[bool, str]] | None,
+) -> CategoryRunResult:
+    dispatcher = _DISPATCHERS[cat.dispatcher]
+    scorer = _SCORERS[cat.scorer]
+    res = CategoryRunResult(
+        name=cat.name, applicable=True, scorer=cat.scorer,
+    )
+    for item in items:
+        if time.time() >= deadline_s:
+            res.aborted_due_to = "timeout"
+            break
+        item_norm = dict(item)
+        item_norm.setdefault("category", cat.name)
+        item_norm.setdefault("max_tokens", cat.default_max_tokens)
+        t0 = time.time()
+        dispatched = dispatcher(
+            base_url, item_norm,
+            timeout_s=per_item_timeout_s,
+            http_chat=http_chat,
+            http_chat_att=http_chat_att,
+            http_transcribe=http_transcribe,
+            http_tts=http_tts,
+            http_image_gen=http_image_gen,
+            http_video_gen=http_video_gen,
+            http_music_gen=http_music_gen,
+            fixtures_dir=fixtures_dir,
+            artifact_dir=artifact_dir,
+        )
+        elapsed_ms = (time.time() - t0) * 1000.0
+        # LLM-judge categories need a second hop. Run it before scoring.
+        if cat.scorer == "llm_judge" and not dispatched.get("error"):
+            judge_pass, judge_reason = _judge_dispatched(
+                cat, item_norm, dispatched,
+                judge_image=judge_image,
+                judge_video_first_frame=judge_video_first_frame,
+            )
+            dispatched["judge_pass"] = judge_pass
+            dispatched["judge_reason"] = judge_reason
+        passed = scorer(item_norm, dispatched)
+        res.items.append(_build_item_record(item_norm, dispatched, passed, elapsed_ms))
+    pc = sum(1 for it in res.items if it.get("pass"))
+    total = len(res.items)
+    res.score = f"{pc}/{total}"
+    res.pass_rate = round((pc / total) if total else 0.0, 4)
+    return res
 
-    result: dict[str, Any] = {
+
+def _judge_dispatched(
+    cat: CategoryConfig,
+    item: Mapping[str, Any],
+    dispatched: Mapping[str, Any],
+    *,
+    judge_image: Callable[..., tuple[bool, str]] | None,
+    judge_video_first_frame: Callable[..., tuple[bool, str]] | None,
+) -> tuple[bool, str]:
+    """Run the LLM-judge appropriate to the category. Falls back to a
+    deterministic False+reason when the judge hook is not provided
+    (e.g. unit tests that don't stub it).
+    """
+    expected = str(item.get("expected_description") or "")
+    if not expected:
+        return False, "no expected_description on item"
+    path_s = dispatched.get("actual")
+    if not path_s or not isinstance(path_s, str):
+        return False, "dispatched produced no artifact"
+    artifact = Path(path_s)
+    if cat.name == "image_gen":
+        fn = judge_image
+        if fn is None:
+            return False, "judge_image not wired"
+        return fn(artifact_path=artifact, expected_description=expected)
+    if cat.name == "video_gen":
+        fn = judge_video_first_frame
+        if fn is None:
+            return False, "judge_video_first_frame not wired"
+        return fn(artifact_path=artifact, expected_description=expected)
+    return False, f"no judge for category {cat.name}"
+
+
+def _build_item_record(
+    item: Mapping[str, Any],
+    dispatched: Mapping[str, Any],
+    passed: bool,
+    elapsed_ms: float,
+) -> dict[str, Any]:
+    """Flatten an executed item into the schema record shape."""
+    rec: dict[str, Any] = {
         "id": item["id"],
+        "category": item.get("category", ""),
         "prompt": item["prompt"],
         "expected_substring": item.get("expected_substring", ""),
-        "actual": None,
-        "pass": False,
+        "actual": dispatched.get("actual"),
+        "pass": bool(passed),
         "latency_ms": round(elapsed_ms, 1),
+        "tokens_in": int(dispatched.get("tokens_in", 0) or 0),
+        "tokens_out": int(dispatched.get("tokens_out", 0) or 0),
     }
-
-    if status == 0:
-        result["error"] = "connection refused / timeout"
-        return result
-    if status != 200 or not isinstance(body, dict):
-        result["error"] = f"http {status}"
-        return result
-
-    try:
-        choice = (body.get("choices") or [{}])[0]
-        actual = (choice.get("message") or {}).get("content") or ""
-        usage = body.get("usage") or {}
-        result["actual"] = actual
-        result["pass"] = _passes(result["expected_substring"], actual)
-        result["tokens_in"] = int(usage.get("prompt_tokens", 0) or 0)
-        result["tokens_out"] = int(usage.get("completion_tokens", 0) or 0)
-        # finish_reason is informational; surface when present.
-        if choice.get("finish_reason"):
-            result["finish_reason"] = choice["finish_reason"]
-    except (KeyError, IndexError, TypeError) as e:
-        result["error"] = f"response parse: {type(e).__name__}: {e}"
-
-    return result
+    if dispatched.get("error"):
+        rec["error"] = dispatched["error"]
+    if dispatched.get("finish_reason"):
+        rec["finish_reason"] = dispatched["finish_reason"]
+    if "judge_pass" in dispatched:
+        rec["judge_pass"] = dispatched["judge_pass"]
+        rec["judge_reason"] = dispatched.get("judge_reason", "")
+    if "content_type" in dispatched:
+        rec["content_type"] = dispatched.get("content_type")
+    if "byte_count" in dispatched:
+        rec["byte_count"] = dispatched.get("byte_count")
+    if "fixture" in item:
+        rec["fixture"] = item["fixture"]
+    if "expected_description" in item:
+        rec["expected_description"] = item["expected_description"]
+    return rec
 
 
 # ── stage entry ───────────────────────────────────────────────────────────
@@ -223,20 +1046,32 @@ def execute_capability(
     run: Run,
     cfg: OrchestratorConfig,
     *,
-    slices: tuple[str, ...] = DEFAULT_SLICES,
+    # Legacy interface (pre-PR#15): treat as a custom text_reasoning slice.
+    slices: tuple[str, ...] | None = None,
     data_dir: Path | None = None,
     per_item_timeout_s: float = 60.0,
-    http: Any = None,
+    # PR#15 new interface:
+    capability_tags_override: list[str] | None = None,
+    fixtures_dir: Path | None = None,
+    # Test seams — override HTTP and judge boundaries.
+    http: Callable[..., tuple[int, dict[str, Any] | None]] | None = None,
+    http_chat_att: Callable[..., tuple[int, dict[str, Any] | None]] | None = None,
+    http_transcribe: Callable[..., tuple[int, dict[str, Any] | None]] | None = None,
+    http_tts: Callable[..., tuple[int, bytes | None, str | None]] | None = None,
+    http_image_gen: Callable[..., tuple[int, bytes | None, str | None]] | None = None,
+    http_video_gen: Callable[..., tuple[int, bytes | None, str | None]] | None = None,
+    http_music_gen: Callable[..., tuple[int, bytes | None, str | None]] | None = None,
+    judge_image: Callable[..., tuple[bool, str]] | None = None,
+    judge_video_first_frame: Callable[..., tuple[bool, str]] | None = None,
 ) -> StageResult:
-    """Run the bundled capability suite against the deployed engine.
+    """Run the multi-category capability suite against the deployed engine.
 
     Writes:
         runs/<run_id>/capability.json
-        runs/<run_id>/_meta/capability.json (alias for legacy validators)
+        runs/<run_id>/_meta/capability.json
 
-    Stops early when the wall-clock exceeds cfg.capability_timeout_s.
-    Partial results are still persisted with aborted_due_to="timeout"
-    so the panel/leaderboard can show partial coverage.
+    Stops early when wall-clock exceeds cfg.capability_timeout_s.
+    Partial results are still persisted with ``aborted_due_to="timeout"``.
     """
     t0 = time.time()
     rd = cfg.run_dir(run.run_id)
@@ -252,42 +1087,134 @@ def execute_capability(
     deploy = json.loads(deploy_path.read_text(encoding="utf-8"))
     base_url = deploy["base_url"]
 
-    items = _gather_items(data_dir=data_dir or DATA_DIR, slices=slices)
-    if not items:
-        return StageResult(
-            ok=False, duration_s=time.time() - t0, artifacts=[],
-            error="no capability slices available",
-            error_kind="empty_suite",
-        )
+    # Resolve fixtures dir: explicit > package default
+    fix_dir = fixtures_dir or FIXTURES_DIR
+    # Artifact dir for binary outputs (tts/image/video/music).
+    artifact_dir = rd / "_artifacts"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
 
     deadline = t0 + cfg.capability_timeout_s
-    results: list[dict[str, Any]] = []
-    aborted: str | None = None
 
-    for item in items:
-        if time.time() >= deadline:
-            aborted = "timeout"
-            break
-        results.append(_run_one(base_url, item,
-                                timeout_s=per_item_timeout_s, http=http))
+    categories_out: dict[str, dict[str, Any]] = {}
+    all_items_flat: list[dict[str, Any]] = []
+    overall_aborted: str | None = None
 
-    pass_count = sum(1 for r in results if r.get("pass"))
-    total = len(results)
+    # ── Legacy slices= path (pre-PR#15 contract) ─────────────────────────
+    if slices is not None:
+        legacy_items: list[dict[str, Any]] = []
+        legacy_dir = data_dir or DATA_DIR
+        for name in slices:
+            legacy_items.extend(_load_jsonl(legacy_dir / name))
+        if not legacy_items:
+            return StageResult(
+                ok=False, duration_s=time.time() - t0, artifacts=[],
+                error="no capability slices available",
+                error_kind="empty_suite",
+            )
+        fake_cat = CategoryConfig(
+            name="custom_text",
+            dispatcher="text_chat",
+            scorer="substring",
+            required_tags=(),
+            data_file="(legacy)",
+        )
+        cat_res = _run_category_items(
+            fake_cat, legacy_items,
+            base_url=base_url,
+            deadline_s=deadline,
+            per_item_timeout_s=per_item_timeout_s,
+            artifact_dir=artifact_dir,
+            fixtures_dir=fix_dir,
+            http_chat=http,
+            http_chat_att=http_chat_att,
+            http_transcribe=http_transcribe,
+            http_tts=http_tts,
+            http_image_gen=http_image_gen,
+            http_video_gen=http_video_gen,
+            http_music_gen=http_music_gen,
+            judge_image=judge_image,
+            judge_video_first_frame=judge_video_first_frame,
+        )
+        if cat_res.aborted_due_to:
+            overall_aborted = cat_res.aborted_due_to
+        categories_out["custom_text"] = cat_res.to_dict()
+        all_items_flat.extend(cat_res.items)
+    # ── PR#15 multimodal path ────────────────────────────────────────────
+    else:
+        tags = capability_tags_override or _read_capability_tags(rd)
+        applicable = _select_applicable_categories(tags)
+        all_categories = list(CATEGORY_REGISTRY)
+        applicable_names = {c.name for c in applicable}
+        # Record non-applicable categories with reason so the panel can
+        # show "category greyed out" instead of "missing".
+        for cat in all_categories:
+            if cat.name in applicable_names:
+                continue
+            missing = [t for t in cat.required_tags if t not in tags]
+            categories_out[cat.name] = {
+                "applicable": False,
+                "scorer": cat.scorer,
+                "score": "0/0",
+                "pass_rate": 0.0,
+                "items": [],
+                "reason": f"missing capability_tags: {','.join(missing)}",
+            }
+        # Run applicable categories.
+        for cat in applicable:
+            if time.time() >= deadline:
+                overall_aborted = "timeout"
+                break
+            items = _load_jsonl(DATA_DIR / cat.data_file)
+            if not items:
+                categories_out[cat.name] = {
+                    "applicable": True,
+                    "scorer": cat.scorer,
+                    "score": "0/0",
+                    "pass_rate": 0.0,
+                    "items": [],
+                    "reason": f"no items in {cat.data_file}",
+                }
+                continue
+            cat_res = _run_category_items(
+                cat, items,
+                base_url=base_url,
+                deadline_s=deadline,
+                per_item_timeout_s=per_item_timeout_s,
+                artifact_dir=artifact_dir,
+                fixtures_dir=fix_dir,
+                http_chat=http,
+                http_chat_att=http_chat_att,
+                http_transcribe=http_transcribe,
+                http_tts=http_tts,
+                http_image_gen=http_image_gen,
+                http_video_gen=http_video_gen,
+                http_music_gen=http_music_gen,
+                judge_image=judge_image,
+                judge_video_first_frame=judge_video_first_frame,
+            )
+            if cat_res.aborted_due_to == "timeout":
+                overall_aborted = "timeout"
+            categories_out[cat.name] = cat_res.to_dict()
+            all_items_flat.extend(cat_res.items)
+
+    pass_count = sum(1 for it in all_items_flat if it.get("pass"))
+    total = len(all_items_flat)
     pass_rate = (pass_count / total) if total else 0.0
 
     payload: dict[str, Any] = {
         "stage": "CAPABILITY",
         "run_id": run.run_id,
         "hf_id": run.hf_id,
-        "results": results,
-        "score": _score_string(pass_count, total),
+        "results": all_items_flat,
+        "categories": categories_out,
+        "score": f"{pass_count}/{total}",
         "pass_rate": round(pass_rate, 4),
         "total_duration_s": round(time.time() - t0, 3),
         "evaluated_at": datetime.now(tz=UTC).isoformat(timespec="seconds"),
         "base_url": base_url,
     }
-    if aborted:
-        payload["aborted_due_to"] = aborted
+    if overall_aborted:
+        payload["aborted_due_to"] = overall_aborted
 
     _write_artifact(rd, "capability.json", payload)
     _write_artifact(rd / "_meta", "capability.json", payload)
@@ -300,7 +1227,10 @@ def execute_capability(
             "pass_rate": payload["pass_rate"],
             "score": payload["score"],
             "items": total,
-            "aborted": aborted,
+            "aborted": overall_aborted,
+            "categories_applicable": sum(
+                1 for c in categories_out.values() if c.get("applicable")
+            ),
         },
         rc=0,
     )
@@ -312,3 +1242,20 @@ def _write_artifact(directory: Path, filename: str, payload: dict[str, Any]) -> 
         json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+
+# ── public helpers retained for backward compat with existing tests ───────
+
+
+def _passes(expected_substring: str, actual: str | None) -> bool:
+    """Legacy public helper. Kept verbatim so the older ``test_capability``
+    monkey-patch path and any external consumers continue to work."""
+    if actual is None:
+        return False
+    if expected_substring == "":
+        return bool(actual)
+    return expected_substring.lower() in actual.lower()
+
+
+def _score_string(pass_count: int, total: int) -> str:
+    return f"{pass_count}/{total}"
