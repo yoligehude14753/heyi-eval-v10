@@ -1,0 +1,3 @@
+# PR#16: no video fixtures bundled. video_understanding and
+# video_gen categories are blocked until real CC0 video samples
+# (e.g. NTU RGB+D 60 SOFT clips) are curated. See RUNBOOK §11.1.

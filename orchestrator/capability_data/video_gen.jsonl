@@ -1,0 +1,10 @@
+{"id": "vg-001", "prompt": "A cat playfully chasing a red laser dot across a hardwood floor, 3 seconds.", "expected_description": "a cat indoors, possibly chasing something"}
+{"id": "vg-002", "prompt": "Waves crashing on a rocky beach at sunset, ambient.", "expected_description": "ocean waves on a shoreline"}
+{"id": "vg-003", "prompt": "A person walking through a forest path in autumn, leaves falling.", "expected_description": "a person outdoors in a forest or wooded area"}
+{"id": "vg-004", "prompt": "Time-lapse of a city skyline at dusk with car headlights streaking.", "expected_description": "a city skyline, possibly at evening"}
+{"id": "vg-005", "prompt": "A close-up of a sunflower swaying gently in the breeze.", "expected_description": "a sunflower, close-up"}
+{"id": "vg-006", "prompt": "A cup of coffee being poured into a glass mug.", "expected_description": "coffee or a dark liquid being poured into a cup"}
+{"id": "vg-007", "prompt": "A red sports car driving along a coastal road.", "expected_description": "a car on a road, possibly red"}
+{"id": "vg-008", "prompt": "A child blowing soap bubbles in a sunny park.", "expected_description": "a child outdoors, soap bubbles visible"}
+{"id": "vg-009", "prompt": "A drone shot of a wheat field on a windy day.", "expected_description": "a field of wheat or tall grass, aerial view"}
+{"id": "vg-010", "prompt": "A golden retriever puppy running across green grass toward the camera.", "expected_description": "a dog running on grass"}
