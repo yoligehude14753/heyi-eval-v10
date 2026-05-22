@@ -122,10 +122,11 @@ class OrchestratorConfig:
     docker_socket: str = os.environ.get("HEYI_EVAL_DOCKER_SOCK", "/var/run/docker.sock")
 
     # stage timeouts (wall-clock seconds)
-    deploy_timeout_s: int = int(os.environ.get("HEYI_EVAL_DEPLOY_TIMEOUT", "600"))           # 10 min
-    capability_timeout_s: int = int(os.environ.get("HEYI_EVAL_CAPABILITY_TIMEOUT", "900"))   # 15 min
-    showcase_timeout_s: int = int(os.environ.get("HEYI_EVAL_SHOWCASE_TIMEOUT", "3600"))      # 60 min
-    cleanup_timeout_s: int = int(os.environ.get("HEYI_EVAL_CLEANUP_TIMEOUT", "300"))         #  5 min
+    deploy_timeout_s: int = int(os.environ.get("HEYI_EVAL_DEPLOY_TIMEOUT", "600"))              # 10 min
+    capability_timeout_s: int = int(os.environ.get("HEYI_EVAL_CAPABILITY_TIMEOUT", "900"))      # 15 min
+    perf_bench_timeout_s: int = int(os.environ.get("HEYI_EVAL_PERF_BENCH_TIMEOUT", "300"))      #  5 min
+    showcase_timeout_s: int = int(os.environ.get("HEYI_EVAL_SHOWCASE_TIMEOUT", "3600"))         # 60 min
+    cleanup_timeout_s: int = int(os.environ.get("HEYI_EVAL_CLEANUP_TIMEOUT", "300"))            #  5 min
 
     @property
     def runs_dir(self) -> Path:
@@ -149,6 +150,7 @@ class OrchestratorConfig:
         return {
             "DEPLOY": self.deploy_timeout_s,
             "CAPABILITY": self.capability_timeout_s,
+            "PERF_BENCH": self.perf_bench_timeout_s,
             "SHOWCASE": self.showcase_timeout_s,
             "CLEANUP": self.cleanup_timeout_s,
         }.get(stage_name, 600)
