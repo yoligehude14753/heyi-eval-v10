@@ -73,9 +73,30 @@ require_cmd() {
   log "$1: $(command -v "$1")"
 }
 require_cmd docker
-require_cmd python3.11
 require_cmd nvidia-smi
 require_cmd systemctl
+
+# Pick the highest available python3 binary whose version is >= 3.11.
+# Tried in descending preference; first to satisfy the version gate wins.
+# Populates the global PYTHON_BIN consumed by the venv step.
+find_python_311_plus() {
+  local cand ver
+  for cand in python3.14 python3.13 python3.12 python3.11 python3; do
+    if ! command -v "$cand" >/dev/null 2>&1; then continue; fi
+    ver="$("$cand" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || true)"
+    case "$ver" in
+      3.11|3.12|3.13|3.14|3.15)
+        PYTHON_BIN="$cand"
+        log "python: $cand (version $ver) at $(command -v "$cand")"
+        return 0
+        ;;
+    esac
+  done
+  echo "no python3.11+ found; tried python3.14/13/12/11/3. Install python3.11 or newer." >&2
+  exit 1
+}
+PYTHON_BIN=""
+find_python_311_plus
 
 # user must be 'ai' (services run as ai)
 who="$(id -un)"
@@ -124,8 +145,8 @@ fi
 # ── 3. python venv ──────────────────────────────────────────────────────────
 step "python venv"
 if [[ ! -x "${VENV}/bin/python" ]]; then
-  log "creating venv at ${VENV}"
-  run "python3.11 -m venv '${VENV}'"
+  log "creating venv at ${VENV} (using ${PYTHON_BIN})"
+  run "${PYTHON_BIN} -m venv '${VENV}'"
 fi
 run "'${VENV}/bin/pip' install --upgrade pip"
 run "'${VENV}/bin/pip' install -e '${REPO_ROOT}'"
@@ -185,6 +206,7 @@ log "repo:    ${REPO_ROOT}"
 log "data:    ${DATA_ROOT}"
 log "backups: ${BACKUPS_ROOT}"
 log "env:     ${ENV_FILE}"
+log "python:  ${PYTHON_BIN}"
 log "panel:   http://$(hostname -I | awk '{print $1}'):8090"
 log "units:   $(IFS=,; echo "${UNITS_TO_ENABLE[*]}")"
 log "next:    journalctl -u heyi-eval-orchestrator.service -f"
