@@ -375,9 +375,13 @@ def execute_deploy(
 
         model_host_path = _model_path_on_host(cfg, run.hf_id)
         if not model_host_path.exists():
-            raise StagePyError(
-                f"model path not found: {model_host_path}",
-                kind="model_missing",
+            # Model weights not yet downloaded to eval-cache.
+            # Treat as graceful skip so the run is re-queued on next loop
+            # iteration once the model has been staged.
+            return _graceful_skip(
+                t0,
+                f"model not in eval-cache: {model_host_path}; "
+                "will retry after model is staged",
             )
 
         cname = container_name_for(run.run_id, engine)
