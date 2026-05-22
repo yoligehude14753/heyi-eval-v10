@@ -25,7 +25,7 @@ stages have consistent observability.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from . import notify
@@ -43,6 +43,12 @@ class StageResult:
     payload: dict[str, Any] | None = None       # parsed artifact for downstream
     rc: int | None = None
     container_name: str | None = None
+    # PR#11: structured error metadata. ``error_kind`` is a stable string
+    # consumable by the panel ("insufficient_gpu", "docker_down", ...);
+    # ``extra`` carries free-form details. The main loop reads
+    # ``extra.aborted`` to decide between SKIPPED (graceful) and FAILED.
+    error_kind: str | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
 
 
 # ── stub stages ────────────────────────────────────────────────────────────
@@ -456,10 +462,9 @@ _NATIVE_STAGES = {
 
 
 def _adapt_native(native_result: Any) -> StageResult:
-    """stages_py / capability return their own StageResult dataclass with
-    extra fields (error_kind, extra). Pack the common subset back into
-    the dispatcher's StageResult so existing call sites keep working
-    unchanged."""
+    """stages_py / capability return their own StageResult dataclass.
+    Forward all fields including PR#11's error_kind / extra so the
+    main loop can read extra.aborted to route to SKIPPED vs FAILED."""
     return StageResult(
         ok=native_result.ok,
         duration_s=native_result.duration_s,
@@ -468,6 +473,8 @@ def _adapt_native(native_result: Any) -> StageResult:
         payload=native_result.payload,
         rc=native_result.rc,
         container_name=native_result.container_name,
+        error_kind=getattr(native_result, "error_kind", None),
+        extra=getattr(native_result, "extra", None) or {},
     )
 
 
