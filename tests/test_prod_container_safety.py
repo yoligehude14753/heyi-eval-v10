@@ -24,6 +24,7 @@ import logging
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -60,9 +61,12 @@ PRODUCTION_SOURCE_DIRS = (
 
 
 class _FakeContainer:
-    def __init__(self, name: str, labels: dict | None = None):
+    def __init__(self, name: str, labels: dict[str, str] | None = None):
         self.name = name
-        self.attrs = {"Config": {"Labels": labels or {}}, "Name": f"/{name}"}
+        self.attrs: dict[str, Any] = {
+            "Config": {"Labels": labels or {}},
+            "Name": f"/{name}",
+        }
         self.remove_calls = 0
 
     def remove(self, force: bool = False, v: bool = False) -> None:
@@ -71,11 +75,12 @@ class _FakeContainer:
 
 def _fake_docker(labeled: list[_FakeContainer],
                  unlabeled: list[_FakeContainer] | None = None,
-                 filter_seen: list[dict] | None = None) -> MagicMock:
+                 filter_seen: list[dict[str, Any]] | None = None) -> MagicMock:
     client = MagicMock()
     client.ping.return_value = True
 
-    def _list(all=False, filters=None):
+    def _list(all: bool = False,
+              filters: dict[str, Any] | None = None) -> list[_FakeContainer]:
         if filter_seen is not None and filters is not None:
             filter_seen.append(filters)
         if filters and "label" in filters:
@@ -294,7 +299,7 @@ class CleanupFilterInvariantTests(unittest.TestCase):
             cfg = _make_cfg(tmp)
             run = _make_run("p6_run")
             cfg.run_dir(run.run_id).mkdir(parents=True, exist_ok=True)
-            seen: list[dict] = []
+            seen: list[dict[str, Any]] = []
             with patch.object(stages_py, "docker",
                               _fake_docker([], filter_seen=seen)):
                 stages_py.execute_cleanup(run, cfg)

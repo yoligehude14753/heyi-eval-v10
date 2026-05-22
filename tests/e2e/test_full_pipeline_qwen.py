@@ -20,6 +20,7 @@ import json
 import subprocess
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -62,21 +63,23 @@ def _run_one(repo: Path, *, timeout_s: int = 60 * 60) -> int:
     return proc.returncode
 
 
-def _load_state(run_dir: Path) -> dict:
+def _load_state(run_dir: Path) -> dict[str, Any]:
     sp = run_dir / "state.json"
     assert sp.exists(), f"state.json missing for run {run_dir}"
-    return json.loads(sp.read_text(encoding="utf-8"))
+    payload: dict[str, Any] = json.loads(sp.read_text(encoding="utf-8"))
+    return payload
 
 
 # ── tests ──────────────────────────────────────────────────────────────────
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def fresh_qwen_run(heyi_eval_repo: Path, heyi_eval_data: Path,
-                   prod_container_snapshot) -> dict:
+                   prod_container_snapshot: Any) -> dict[str, Any]:
     """Single fixture that runs the whole pipeline once and returns a
-    dict of references the per-test assertions need. We do NOT run the
-    pipeline once per test — it's ~20 min on Qwen-0.5B."""
+    dict of references the per-test assertions need. Module-scoped so
+    all e2e tests share one ~20 min pipeline run on Qwen-0.5B
+    (function scope would re-run for each test = 5 × 20 min)."""
     snap_now, assert_unchanged = prod_container_snapshot
     before = snap_now()
 
@@ -95,7 +98,7 @@ def fresh_qwen_run(heyi_eval_repo: Path, heyi_eval_data: Path,
     }
 
 
-def test_e1_full_pipeline_succeeds(fresh_qwen_run: dict) -> None:
+def test_e1_full_pipeline_succeeds(fresh_qwen_run: dict[str, Any]) -> None:
     """All 9 stages must finish ok."""
     assert fresh_qwen_run["rc"] == 0, (
         f"orchestrator run exited non-zero ({fresh_qwen_run['rc']})"
@@ -108,7 +111,7 @@ def test_e1_full_pipeline_succeeds(fresh_qwen_run: dict) -> None:
     assert not failed, f"stages not ok: {failed}; full state: {state}"
 
 
-def test_e2_capability_score_in_range(fresh_qwen_run: dict) -> None:
+def test_e2_capability_score_in_range(fresh_qwen_run: dict[str, Any]) -> None:
     cap_path = fresh_qwen_run["run_dir"] / "capability.json"
     assert cap_path.exists(), "capability.json missing"
     cap = json.loads(cap_path.read_text(encoding="utf-8"))
@@ -117,7 +120,7 @@ def test_e2_capability_score_in_range(fresh_qwen_run: dict) -> None:
     assert 0.0 <= float(score) <= 1.0, f"capability score out of range: {score}"
 
 
-def test_e3_showcase_artifacts_present(fresh_qwen_run: dict) -> None:
+def test_e3_showcase_artifacts_present(fresh_qwen_run: dict[str, Any]) -> None:
     sp = fresh_qwen_run["run_dir"] / "showcase.json"
     assert sp.exists(), "showcase.json missing"
     showcase = json.loads(sp.read_text(encoding="utf-8"))
@@ -133,7 +136,7 @@ def test_e3_showcase_artifacts_present(fresh_qwen_run: dict) -> None:
         )
 
 
-def test_e4_cleanup_removed_only_e9(fresh_qwen_run: dict) -> None:
+def test_e4_cleanup_removed_only_e9(fresh_qwen_run: dict[str, Any]) -> None:
     out = subprocess.check_output(
         ["docker", "ps", "-a", "--filter", "name=e9-",
          "--format", "{{.Names}}"],
@@ -151,7 +154,7 @@ def test_e4_cleanup_removed_only_e9(fresh_qwen_run: dict) -> None:
     assert (fresh_qwen_run["run_dir"] / "showcase.json").exists()
 
 
-def test_e5_no_prod_container_touched(fresh_qwen_run: dict) -> None:
+def test_e5_no_prod_container_touched(fresh_qwen_run: dict[str, Any]) -> None:
     """The hard guarantee: minimax / xrouter / glm-* / kimi-* / voipmonitor
     must be byte-for-byte identical (name, id, state, created) before
     and after the eval run."""

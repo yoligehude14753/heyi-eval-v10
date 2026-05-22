@@ -261,7 +261,7 @@ def test_backup_timer_has_randomized_delay(
 # ── U-10 + B-1 bootstrap script sanity ─────────────────────────────────────
 
 
-def test_u10_bootstrap_script_shape():
+def test_u10_bootstrap_script_shape() -> None:
     assert BOOTSTRAP.is_file(), f"missing {BOOTSTRAP}"
     text = BOOTSTRAP.read_text(encoding="utf-8")
     lines = text.splitlines()
@@ -272,7 +272,7 @@ def test_u10_bootstrap_script_shape():
         "bootstrap script must enable strict mode (set -euo pipefail)"
 
 
-def test_b1_bootstrap_script_passes_bash_n():
+def test_b1_bootstrap_script_passes_bash_n() -> None:
     """Static syntax check via `bash -n` — doesn't execute anything."""
     cp = subprocess.run(
         ["bash", "-n", str(BOOTSTRAP)],
@@ -282,7 +282,7 @@ def test_b1_bootstrap_script_passes_bash_n():
         f"bash -n failed: {cp.stderr}"
 
 
-def test_b2_bootstrap_supports_force_flag():
+def test_b2_bootstrap_supports_force_flag() -> None:
     """--force is required so the script can be re-run on a clone with a
     hostname that doesn't contain 'nv8' (e.g. when restoring from a
     backup mac to a new node)."""
@@ -290,7 +290,7 @@ def test_b2_bootstrap_supports_force_flag():
     assert "--force" in text, "bootstrap must accept --force"
 
 
-def test_b3_bootstrap_has_no_v9_residue_paths():
+def test_b3_bootstrap_has_no_v9_residue_paths() -> None:
     """No legacy paths from v9 (/var/lib/heyi-eval, /opt/heyi-eval, etc.)
     should appear in the v10 deployment surface."""
     text = BOOTSTRAP.read_text(encoding="utf-8")
@@ -299,7 +299,7 @@ def test_b3_bootstrap_has_no_v9_residue_paths():
             f"bootstrap contains v9-era path/name: {forbidden!r}"
 
 
-def test_b4_bootstrap_uses_safe_rm_prefix_only():
+def test_b4_bootstrap_uses_safe_rm_prefix_only() -> None:
     """Sanity: the script must never `rm -rf` outside /home/ai/heyi-eval-*.
     Today it does NOT rm anything; this test pins that property so a
     future edit doesn't quietly start nuking /home/ai/."""

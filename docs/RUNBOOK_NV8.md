@@ -10,7 +10,9 @@
 sudo -iu ai
 cd /home/ai/heyi-eval-v10
 git fetch origin
-git log -1 --oneline       # 期望: PR#7b 合并后的 main commit
+git log -1 --oneline       # 期望: PR#8 (本 runbook 所属 PR) 合并后的 main commit
+                           # 即包含 tests/test_e2e_pipeline.py / tests/test_inv_production_isolation.py /
+                           # docs/INVARIANTS.md / 本文件本身
 ```
 
 **保留快照**: 在动手前留一个产线 snapshot,以便事后对比 INV-1/INV-2:
