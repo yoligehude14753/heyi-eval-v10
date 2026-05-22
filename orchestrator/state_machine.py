@@ -112,6 +112,17 @@ class StageInfo:
             self.duration_s = round(self.ended_at - self.started_at, 2)
         self.error = error[:500]
 
+    def mark_skipped(self, reason: str) -> None:
+        """Graceful-skip: the stage decided in advance that it can't run
+        in the current environment (insufficient GPU, eval pool overlaps
+        production, etc.) and there's no point retrying. Distinct from
+        mark_failed (which signals retry-worthy failure)."""
+        self.status = StageStatus.SKIPPED
+        self.ended_at = time.time()
+        if self.started_at is not None:
+            self.duration_s = round(self.ended_at - self.started_at, 2)
+        self.error = reason[:500]
+
 
 @dataclass
 class Run:

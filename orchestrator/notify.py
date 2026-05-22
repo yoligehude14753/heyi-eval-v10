@@ -154,6 +154,32 @@ def run_failed(
     )
 
 
+def run_aborted(
+    outbox_path: Path,
+    *,
+    run_id: str,
+    hf_id: str,
+    stage: str,
+    reason: str,
+) -> None:
+    """Graceful-skip: the run could not be executed under current conditions
+    (e.g. insufficient eval GPU, model too large for the eval pool). Logged
+    as a WARN-level event distinct from run_failed so dashboards can group
+    "operator should look" (FAILED) separately from "expected and recorded"
+    (ABORTED)."""
+    write_event(
+        outbox_path,
+        event_type="run_aborted",
+        title=f"⏭️ eval run SKIPPED · {hf_id}",
+        body=f"stage={stage}\nreason={reason[:1000]}",
+        level="warn",
+        priority="normal",
+        run_id=run_id,
+        hf_id=hf_id,
+        stage=stage,
+    )
+
+
 def incident(outbox_path: Path, *, what: str, detail: str, run_id: str | None = None) -> None:
     write_event(
         outbox_path,

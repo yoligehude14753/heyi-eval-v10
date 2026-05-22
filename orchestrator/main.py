@@ -179,6 +179,17 @@ def execute_stage_stub(run: Run, stage: StageName, store: Store) -> None:
     store.save_run(run)
 
 
+class GracefulSkip(Exception):
+    """The current stage decided in advance it can't run (insufficient
+    GPU, eval pool empty, prod transient overlap). Caller marks the run
+    ABORTED rather than FAILED; not a retry-worthy condition."""
+
+    def __init__(self, stage: StageName, reason: str) -> None:
+        super().__init__(reason)
+        self.stage = stage
+        self.reason = reason
+
+
 def _execute_stage_real(
     run: Run, stage: StageName, store: Store, cfg: OrchestratorConfig
 ) -> None:
@@ -194,6 +205,16 @@ def _execute_stage_real(
         store.save_run(run)
         raise
     if not result.ok:
+        # graceful-skip path: the executor returned aborted=True in extra
+        # (PR#11). The stage is marked SKIPPED (not FAILED) and the
+        # pipeline-level handler should turn the run into ABORTED.
+        extra = getattr(result, "extra", None) or {}
+        if extra.get("aborted"):
+            reason = extra.get("reason") or result.error or "aborted"
+            info.mark_skipped(reason)
+            store.save_run(run)
+            print(f"  [{stage.value}] SKIPPED (graceful): {reason}")
+            raise GracefulSkip(stage, reason)
         info.mark_failed(result.error or "executor returned ok=False")
         store.save_run(run)
         raise ValidationError(result.error or "stage failed")
@@ -270,6 +291,33 @@ def run_pipeline(
 
         try:
             _exec(stage)
+        except GracefulSkip as gs:
+            # Aborted, not failed: the run cannot proceed under current
+            # conditions but the situation doesn't warrant retry. Mark
+            # the run ABORTED, best-effort CLEANUP, return without
+            # touching failure counters or run_failed notifications.
+            run.status = RunStatus.ABORTED
+            run.failure_reason = f"aborted at {gs.stage.value}: {gs.reason}"
+            run.ended_at = time.time()
+            store.save_run(run)
+            try:
+                cinfo = run.get_stage(StageName.CLEANUP)
+                if cinfo.status not in (StageStatus.OK, StageStatus.SKIPPED) \
+                        and gs.stage != StageName.CLEANUP:
+                    _exec(StageName.CLEANUP)
+            except Exception as ce:
+                print(f"[run] cleanup-on-abort also failed: {ce}")
+            try:
+                notify.run_aborted(
+                    store.outbox_path,
+                    run_id=run.run_id,
+                    hf_id=run.hf_id,
+                    stage=gs.stage.value,
+                    reason=gs.reason,
+                )
+            except Exception as ne:
+                print(f"[run] notify.run_aborted failed: {ne}")
+            return
         except ValidationError as ve:
             # mark_failed already done inside _execute_stage_real
             if info.status != StageStatus.FAILED:

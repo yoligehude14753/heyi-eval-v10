@@ -27,10 +27,11 @@ import json
 import logging
 import os
 import re
+import subprocess
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -238,6 +239,112 @@ def _http_get_json(url: str, *, timeout: float = 5.0) -> tuple[int, dict[str, An
         return (0, None)
 
 
+# ── GPU isolation (PR#11) ─────────────────────────────────────────────────
+
+# nvidia-smi memory.used threshold below which we consider a GPU "idle
+# enough" for the eval pipeline to grab it. 1 GiB tolerates driver-reserved
+# memory and small monitoring tools, but flags any real workload.
+_EVAL_GPU_IDLE_THRESHOLD_MIB = 1024
+
+
+def _nvidia_smi_used_mib() -> dict[int, int]:
+    """Query each GPU's memory.used in MiB via nvidia-smi.
+
+    Returns {gpu_index: mib}. Raises FileNotFoundError if nvidia-smi is
+    missing (caller treats as graceful skip), TimeoutError on hang, or
+    RuntimeError on parser failure.
+    """
+    out = subprocess.run(
+        ["nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,noheader,nounits"],
+        capture_output=True, text=True, timeout=5, check=False,
+    )
+    if out.returncode != 0:
+        raise RuntimeError(
+            f"nvidia-smi exit {out.returncode}: {out.stderr.strip()[:200]}"
+        )
+    result: dict[int, int] = {}
+    for line in out.stdout.strip().splitlines():
+        try:
+            idx_s, mem_s = line.split(",")
+            result[int(idx_s.strip())] = int(mem_s.strip())
+        except ValueError as e:
+            raise RuntimeError(f"nvidia-smi parse failure on {line!r}: {e}") from e
+    return result
+
+
+SmiQuery = Callable[[], dict[int, int]]
+
+
+def _select_eval_gpus(
+    cfg: OrchestratorConfig,
+    tp_size: int,
+    *,
+    smi_query: SmiQuery | None = None,
+) -> tuple[list[int] | None, str | None]:
+    """Decide which physical GPUs the eval container should bind to.
+
+    Returns either:
+        (selected_gpus, None)  → safe to spawn the container
+        (None, reason)         → graceful skip, do not spawn
+
+    Skip reasons cover:
+      - tp_size > len(cfg.eval_gpus)             (model too wide)
+      - cfg.eval_gpus is ()                       (operator drained the pool)
+      - cfg.eval_gpus overlaps prod_engine_gpus   (transient prod takeover)
+      - nvidia-smi shows an eval GPU non-idle    (operator-run squatter)
+      - nvidia-smi missing/timed-out             (can't verify → skip)
+    """
+    if not cfg.eval_gpus:
+        return None, "eval pool is empty (cfg.eval_gpus is ()); operator must drain prod first"
+
+    overlap = sorted(set(cfg.eval_gpus) & set(cfg.prod_engine_gpus))
+    if overlap:
+        return None, (
+            f"eval pool {list(cfg.eval_gpus)} overlaps prod_engine_gpus "
+            f"{list(cfg.prod_engine_gpus)} on {overlap}; production is "
+            f"transiently using eval GPUs (e.g. TP=8 mode)"
+        )
+
+    if tp_size > len(cfg.eval_gpus):
+        return None, (
+            f"model needs tensor_parallel_size={tp_size} but eval "
+            f"pool has {len(cfg.eval_gpus)} GPUs ({list(cfg.eval_gpus)}); "
+            f"too large for this machine"
+        )
+
+    smi_call = smi_query or _nvidia_smi_used_mib
+    try:
+        smi = smi_call()
+    except (FileNotFoundError, TimeoutError, OSError, RuntimeError) as e:
+        return None, f"nvidia-smi unavailable: {type(e).__name__}: {e}"
+
+    busy: list[tuple[int, int]] = []
+    for gpu in cfg.eval_gpus:
+        mem = smi.get(gpu, 0)
+        if mem > _EVAL_GPU_IDLE_THRESHOLD_MIB:
+            busy.append((gpu, mem))
+    if busy:
+        details = ", ".join(f"GPU {g}={m}MiB" for g, m in busy)
+        return None, (
+            f"eval pool not idle (threshold {_EVAL_GPU_IDLE_THRESHOLD_MIB} MiB): {details}; "
+            f"another workload is using the eval GPUs"
+        )
+
+    return list(cfg.eval_gpus[:tp_size]), None
+
+
+def _graceful_skip(t0: float, reason: str) -> StageResult:
+    """Wrap a graceful-skip reason into the canonical StageResult shape."""
+    return StageResult(
+        ok=False,
+        duration_s=time.time() - t0,
+        artifacts=[],
+        error=f"insufficient_gpu: {reason}",
+        error_kind="insufficient_gpu",
+        extra={"aborted": True, "reason": reason},
+    )
+
+
 # ── DEPLOY ────────────────────────────────────────────────────────────────
 
 
@@ -278,11 +385,25 @@ def execute_deploy(
         port = cfg.vllm_port  # one port for now; future PRs may multiplex
         model_in_container = "/model"
 
+        vllm_args = plan.get("vllm_args") or {}
+        tp_size = int(vllm_args.get("tensor_parallel_size", 1) or 1)
+
+        # GPU isolation gate (PR#11): pick the eval-pool GPUs we'll bind
+        # to, or graceful-skip if the eval pool is unavailable / too small
+        # / overlapping production. Done BEFORE any docker call so we
+        # don't even ping the daemon if we know we can't run.
+        if engine in ("vllm", "sglang", "transformers"):
+            selected_gpus, skip_reason = _select_eval_gpus(cfg, tp_size)
+            if selected_gpus is None:
+                assert skip_reason is not None
+                return _graceful_skip(t0, skip_reason)
+        else:
+            selected_gpus = []  # non-GPU engines (none today, but keep shape)
+
         client = _docker_client()
 
         _reuse_or_recreate(client, cname, run.run_id, engine)
 
-        vllm_args = plan.get("vllm_args") or {}
         if engine == "vllm":
             command = _vllm_command(model_in_container, vllm_args, port)
         elif engine == "sglang":
@@ -295,6 +416,16 @@ def execute_deploy(
             LABEL_STAGE: StageName.DEPLOY.value,
             LABEL_ENGINE: engine,
         }
+        device_requests = (
+            [
+                docker.types.DeviceRequest(
+                    device_ids=[str(i) for i in selected_gpus],
+                    capabilities=[["gpu"]],
+                )
+            ]
+            if selected_gpus
+            else []
+        )
         try:
             container = client.containers.run(
                 image,
@@ -309,12 +440,7 @@ def execute_deploy(
                 volumes={
                     str(model_host_path): {"bind": model_in_container, "mode": "ro"},
                 },
-                device_requests=[
-                    docker.types.DeviceRequest(
-                        count=int(vllm_args.get("tensor_parallel_size", 1) or 1),
-                        capabilities=[["gpu"]],
-                    )
-                ] if engine in ("vllm", "sglang") else [],
+                device_requests=device_requests,
             )
         except ImageNotFound as e:
             raise StagePyError(f"image not found: {image}: {e}",
