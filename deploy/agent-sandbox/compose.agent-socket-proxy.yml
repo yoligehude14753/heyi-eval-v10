@@ -1,0 +1,107 @@
+# heyi-eval-agent-socket-proxy — read-only Docker API surface for the
+# sandboxed agent (INV-17).
+#
+# Bound to 127.0.0.1:2377 (the orchestrator's own socket-proxy uses 2375
+# under a separate, more permissive policy — DO NOT MERGE THEM).
+#
+# Policy: agent can OBSERVE (containers/list/inspect/logs/events) but
+# cannot mutate anything. POST=0 makes the proxy reject every mutating
+# Docker API verb at HTTP layer with 405; in addition every individual
+# write toggle is set to 0 to defense-in-depth against future tecnativa
+# policy changes.
+#
+# Why this is read-only and not "agent can spawn e9-* containers":
+# tecnativa/docker-socket-proxy filters by HTTP verb, not by container
+# name, so granting POST/EXEC would re-open the v9 attack surface
+# (`exec into minimax`). PR#22a deliberately stays read-only; if PR#22b
+# proves the agent needs to start its own e9-* containers, the
+# whitelist will be widened together with an application-side
+# container-name prefix guard (extending INV-3).
+#
+# Install on nv8:
+#   sudo docker compose -f compose.agent-socket-proxy.yml up -d
+# Verify:
+#   curl --unix-socket /var/run/docker.sock http://x/_ping     # baseline
+#   curl http://127.0.0.1:2377/_ping                            # via proxy
+#   curl -X POST http://127.0.0.1:2377/v1.45/containers/minimax/stop
+#       # ↑ MUST return 403 — drill 2 verifies this end-to-end.
+
+services:
+  heyi-eval-agent-socket-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    container_name: heyi-eval-agent-socket-proxy
+    restart: unless-stopped
+    # ── trust boundary: bind to loopback only — never publish outward.
+    ports:
+      - "127.0.0.1:2377:2375"
+    volumes:
+      # docker.sock is a bidirectional unix-domain socket; mounting it
+      # `:ro` would block haproxy's connect() from sending the HTTP
+      # request bytes to the docker daemon (the FD becomes read-only and
+      # write() returns EBADF). tecnativa's safety guarantees instead
+      # come from the verb filter (POST=0 / EXEC=0 / DELETE=0 / ...),
+      # NOT from the socket mode. Keep this rw.
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      # ── allowed surface (read-only) ─────────────────────────────
+      CONTAINERS: 1          # GET /containers/json + /inspect + /logs
+      INFO: 1                # GET /info
+      PING: 1
+      VERSION: 1
+      EVENTS: 1              # docker-py events() stream
+      # ── BLOCKED ─────────────────────────────────────────────────
+      # The proxy rejects POST entirely when POST=0; the per-resource
+      # flags below add belt-and-braces in case tecnativa changes the
+      # default for any individual verb.
+      POST: 0
+      EXEC: 0                # v9 exec-into-minimax killed (drill 2)
+      IMAGES: 0
+      VOLUMES: 0
+      NETWORKS: 0
+      BUILD: 0
+      DELETE: 0
+      COMMIT: 0
+      ALLOW_START: 0
+      ALLOW_STOP: 0
+      ALLOW_RESTARTS: 0
+      # ── secrets / cluster surfaces always 0 ─────────────────────
+      AUTH: 0
+      SECRETS: 0
+      CONFIGS: 0
+      SERVICES: 0
+      TASKS: 0
+      NODES: 0
+      SWARM: 0
+      PLUGINS: 0
+      SESSION: 0
+      DISTRIBUTION: 0
+      GRPC: 0
+      SYSTEM: 0
+      LOG_LEVEL: info
+    # The proxy itself must be a low-privilege container.
+    # read_only:true blocks the entrypoint from writing /tmp/haproxy.cfg, so
+    # we pair it with a small tmpfs (size-capped to defeat fork-bombs filling
+    # the host RAM via the proxy).
+    read_only: true
+    tmpfs:
+      # tecnativa's entrypoint writes /tmp/haproxy.cfg; haproxy itself
+      # writes /run/haproxy.pid. Both are tmpfs + size-capped to defeat
+      # host-RAM DoS via the proxy.
+      - /tmp:size=8m,mode=1777
+      - /run:size=4m,mode=0755
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 64m
+    # pids_limit=64 starved haproxy's own worker forks (fork rc=EAGAIN),
+    # so the proxy never finished bootstrapping. 256 is enough headroom
+    # for haproxy v3 master+worker+connections while still slamming a
+    # fork-bomb well before host PIDs are exhausted.
+    pids_limit: 256
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:2375/_ping || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s

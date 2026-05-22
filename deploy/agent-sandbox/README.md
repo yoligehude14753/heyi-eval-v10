@@ -33,8 +33,12 @@ sudo ./acl_install.sh
 sudo install -m 0440 sudoers.d/heyi-eval-agent /etc/sudoers.d/heyi-eval-agent
 sudo visudo -c -f /etc/sudoers.d/heyi-eval-agent   # syntax gate
 
-# M2 (next milestone)
+# M2
 sudo docker compose -f compose.agent-socket-proxy.yml up -d
+# expect: container "heyi-eval-agent-socket-proxy" Up (healthy)
+# bind: 127.0.0.1:2377 → container 2375 (loopback only)
+sudo -u heyi-eval-agent bash drills/attack_exec_prod.sh
+# expect: "BLOCKED OK — INV-17 holds" (4 reads → 200, 7 writes → 403)
 
 # M3, M4 — handled by their respective install scripts
 ```
