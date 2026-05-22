@@ -15,6 +15,7 @@ EnvironmentFile=-/etc/heyi-eval-v10/env
 # heyi_engine readiness is gated INSIDE the loop (_engine_preflight_gate);
 # don't tie systemd start order to it — the engine is user-managed and may
 # bounce independently.
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/home/ai/heyi-eval-v10/.venv/bin/python -m orchestrator loop
 Restart=on-failure
 RestartSec=10s

@@ -12,6 +12,7 @@ User=ai
 Group=ai
 WorkingDirectory=/home/ai/heyi-eval-v10
 EnvironmentFile=-/etc/heyi-eval-v10/env
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/home/ai/heyi-eval-v10/.venv/bin/python -m discover loop
 Restart=on-failure
 RestartSec=30s
