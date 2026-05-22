@@ -1,0 +1,12 @@
+# Per-file provenance & license
+
+o01_digit_7.png	CC0/synthetic	Synthetic bitmap-font rendering of '7'
+o02_digit_42.png	CC0/synthetic	Synthetic bitmap-font rendering of '42'
+o03_digit_2026.png	CC0/synthetic	Synthetic bitmap-font rendering of '2026'
+o04_digit_3141.png	CC0/synthetic	Synthetic bitmap-font rendering of '3141'
+o05_word_open.png	CC0/synthetic	Synthetic bitmap-font rendering of 'OPEN'
+o06_word_stop.png	CC0/synthetic	Synthetic bitmap-font rendering of 'STOP'
+o07_word_exit.png	CC0/synthetic	Synthetic bitmap-font rendering of 'EXIT'
+o08_word_help.png	CC0/synthetic	Synthetic bitmap-font rendering of 'HELP'
+o09_phrase_go.png	CC0/synthetic	Synthetic bitmap-font rendering of 'GO LEFT'
+o10_phrase_yes.png	CC0/synthetic	Synthetic bitmap-font rendering of 'YES OR NO'

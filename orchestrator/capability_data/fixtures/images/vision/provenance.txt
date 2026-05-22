@@ -1,0 +1,12 @@
+# Per-file provenance & license
+
+v01_solid_red.png	CC0/synthetic	Synthetic — solid red 128x128
+v02_solid_blue.png	CC0/synthetic	Synthetic — solid blue 128x128
+v03_solid_green.png	CC0/synthetic	Synthetic — solid green 128x128
+v04_solid_yellow.png	CC0/synthetic	Synthetic — solid yellow 128x128
+v05_solid_black.png	CC0/synthetic	Synthetic — solid black 128x128
+v06_one_circle.png	CC0/synthetic	Synthetic — one black circle on white
+v07_three_circles.png	CC0/synthetic	Synthetic — three black circles on white
+v08_five_circles.png	CC0/synthetic	Synthetic — five black circles on white
+v09_mixed_shapes.png	CC0/synthetic	Synthetic — 2 red rectangles + 3 blue circles
+v10_checkerboard.png	CC0/synthetic	Synthetic — 8x8 black/white checkerboard

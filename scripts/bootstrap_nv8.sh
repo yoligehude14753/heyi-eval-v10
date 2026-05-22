@@ -166,12 +166,62 @@ for u in "${UNITS_SERVICES[@]}" "${UNITS_TIMERS[@]}"; do
     run "sudo install -m 0644 '${src}' '${dst}'"
   fi
 done
+# PR#22a agent sandbox slice + template unit. Installed but NOT enabled
+# — `heyi-eval-agent.slice` activates lazily, `heyi-eval-agent@%i` is
+# template-only (started by the orchestrator per run). See
+# docs/RUNBOOK_NV8.md §13.
+for u in heyi-eval-agent.slice "heyi-eval-agent@.service"; do
+  src="${REPO_ROOT}/deploy/systemd/${u}"
+  dst="${SYSTEMD_DIR}/${u}"
+  if [[ ! -f "$src" ]]; then
+    log "skip ${u} (source missing — sandbox PR not yet applied)"
+    continue
+  fi
+  if [[ -f "$dst" ]] && cmp -s "$src" "$dst" 2>/dev/null; then
+    log "${u} (unchanged)"
+  else
+    log "${u} (installing — sandbox)"
+    run "sudo install -m 0644 '${src}' '${dst}'"
+  fi
+done
 run "sudo systemctl daemon-reload"
 
 for u in "${UNITS_TO_ENABLE[@]}"; do
   log "enable+start ${u}"
   run "sudo systemctl enable --now '${u}'"
 done
+
+# ── 4b. agent sandbox (PR#22a) ──────────────────────────────────────────────
+step "agent sandbox (PR#22a)"
+SANDBOX_DIR="${REPO_ROOT}/deploy/agent-sandbox"
+if [[ -d "$SANDBOX_DIR" ]]; then
+  # setup_agent_user.sh + acl_install.sh are idempotent; sudoers install
+  # is a no-op when the file is byte-identical.
+  run "sudo bash '${SANDBOX_DIR}/setup_agent_user.sh'"
+  run "sudo bash '${SANDBOX_DIR}/acl_install.sh'"
+  if ! cmp -s "${SANDBOX_DIR}/sudoers.d/heyi-eval-agent" \
+              /etc/sudoers.d/heyi-eval-agent 2>/dev/null; then
+    log "installing sudoers.d/heyi-eval-agent"
+    run "sudo install -m 0440 '${SANDBOX_DIR}/sudoers.d/heyi-eval-agent' /etc/sudoers.d/heyi-eval-agent"
+    run "sudo visudo -c -f /etc/sudoers.d/heyi-eval-agent"
+  else
+    log "sudoers.d/heyi-eval-agent (unchanged)"
+  fi
+  # Agent-side docker-socket-proxy. We use the orchestrator's docker
+  # daemon (the user is in `docker`), but the agent will reach it via
+  # 127.0.0.1:2377 read-only — see INV-17.
+  run "cd '${SANDBOX_DIR}' && sudo docker compose -f compose.agent-socket-proxy.yml up -d"
+  if [[ "$DRY_RUN" != "1" ]]; then
+    sleep 4
+    if ! curl -sf --max-time 3 http://127.0.0.1:2377/_ping >/dev/null; then
+      echo "bootstrap exit 1: heyi-eval-agent-socket-proxy did not become healthy" >&2
+      exit 1
+    fi
+    log "agent-socket-proxy: 127.0.0.1:2377 healthy"
+  fi
+else
+  log "skip agent sandbox (deploy/agent-sandbox missing — not yet on this branch)"
+fi
 
 # ── 5. health check ─────────────────────────────────────────────────────────
 step "health check"
@@ -209,5 +259,7 @@ log "env:     ${ENV_FILE}"
 log "python:  ${PYTHON_BIN}"
 log "panel:   http://$(hostname -I | awk '{print $1}'):8090"
 log "units:   $(IFS=,; echo "${UNITS_TO_ENABLE[*]}")"
+log "sandbox: $(systemctl list-unit-files heyi-eval-agent@.service 2>/dev/null | tail -1 || echo 'not installed')"
 log "next:    journalctl -u heyi-eval-orchestrator.service -f"
+log "verify:  sudo bash deploy/agent-sandbox/drills/run_all.sh   # all 5 sandbox drills"
 echo "bootstrap_nv8 done."

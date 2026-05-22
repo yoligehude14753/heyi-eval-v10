@@ -1,0 +1,10 @@
+{"id": "vi-001", "fixture": "images/vision/v01_solid_red.png", "prompt": "What is the dominant color of this image? Reply with one word.", "expected_substring": "red"}
+{"id": "vi-002", "fixture": "images/vision/v02_solid_blue.png", "prompt": "What is the dominant color of this image? Reply with one word.", "expected_substring": "blue"}
+{"id": "vi-003", "fixture": "images/vision/v03_solid_green.png", "prompt": "What is the dominant color of this image? Reply with one word.", "expected_substring": "green"}
+{"id": "vi-004", "fixture": "images/vision/v04_solid_yellow.png", "prompt": "What is the dominant color of this image? Reply with one word.", "expected_substring": "yellow"}
+{"id": "vi-005", "fixture": "images/vision/v05_solid_black.png", "prompt": "What is the dominant color of this image? Reply with one word.", "expected_substring": "black"}
+{"id": "vi-006", "fixture": "images/vision/v06_one_circle.png", "prompt": "How many black circles do you see in this image? Reply with a single digit.", "expected_substring": "1"}
+{"id": "vi-007", "fixture": "images/vision/v07_three_circles.png", "prompt": "How many black circles do you see in this image? Reply with a single digit.", "expected_substring": "3"}
+{"id": "vi-008", "fixture": "images/vision/v08_five_circles.png", "prompt": "How many black circles do you see in this image? Reply with a single digit.", "expected_substring": "5"}
+{"id": "vi-009", "fixture": "images/vision/v09_mixed_shapes.png", "prompt": "This image has red shapes and blue shapes. How many blue shapes are there? Reply with a single digit.", "expected_substring": "3"}
+{"id": "vi-010", "fixture": "images/vision/v10_checkerboard.png", "prompt": "Is this image a checkerboard pattern? Reply with yes or no.", "expected_substring": "yes"}

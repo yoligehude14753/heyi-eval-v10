@@ -1,9 +1,9 @@
 """
-9-stage state machine with mixed checkpoint policy.
+10-stage state machine with mixed checkpoint policy.
 
 Stage list (in order):
-    DISCOVER  CURATE  METADATA  ENGINE_SELECT          <- run-level checkpoint
-    DEPLOY  READY_WAIT  CAPABILITY  SHOWCASE  CLEANUP  <- stage-level checkpoint
+    DISCOVER  CURATE  METADATA  ENGINE_SELECT               <- run-level checkpoint
+    DEPLOY  READY_WAIT  CAPABILITY  PERF_BENCH  SHOWCASE  CLEANUP  <- stage-level checkpoint
 
 Checkpoint semantics:
 - run-level stages: if any fails, restart the whole run from DISCOVER on retry
@@ -32,6 +32,7 @@ class StageName(str, Enum):
     DEPLOY = "DEPLOY"
     READY_WAIT = "READY_WAIT"
     CAPABILITY = "CAPABILITY"
+    PERF_BENCH = "PERF_BENCH"
     SHOWCASE = "SHOWCASE"
     CLEANUP = "CLEANUP"
 
@@ -44,6 +45,7 @@ STAGES_IN_ORDER: list[StageName] = [
     StageName.DEPLOY,
     StageName.READY_WAIT,
     StageName.CAPABILITY,
+    StageName.PERF_BENCH,
     StageName.SHOWCASE,
     StageName.CLEANUP,
 ]
@@ -59,6 +61,7 @@ STAGE_LEVEL_STAGES: set[StageName] = {
     StageName.DEPLOY,
     StageName.READY_WAIT,
     StageName.CAPABILITY,
+    StageName.PERF_BENCH,
     StageName.SHOWCASE,
     StageName.CLEANUP,
 }

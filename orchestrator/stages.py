@@ -401,18 +401,18 @@ def _pick_engine(modality: str, pipeline_tag: str,
     # Speech in/out — transformers is the safe path
     if pipeline_tag in ("automatic-speech-recognition", "audio-classification",
                         "text-to-speech"):
-        return ("transformers", "heyi-eval/transformers-runner:v9",
+        return ("transformers", "heyi-eval/transformers-runner:v10",
                 f"audio pipeline_tag={pipeline_tag}", None)
 
     # Image/Video generation — diffusers via transformers runner
     if pipeline_tag in ("text-to-image", "image-to-image", "inpainting",
                         "text-to-video", "image-to-video"):
-        return ("transformers", "heyi-eval/transformers-runner:v9",
+        return ("transformers", "heyi-eval/transformers-runner:v10",
                 f"diffusion pipeline_tag={pipeline_tag}", None)
 
     # library_name hints
     if (library_name or "").lower() in ("diffusers", "sentence-transformers"):
-        return ("transformers", "heyi-eval/transformers-runner:v9",
+        return ("transformers", "heyi-eval/transformers-runner:v10",
                 f"library={library_name}", None)
 
     # default: vllm with transformers fallback (handbook decides the actual command)
@@ -456,7 +456,7 @@ _PY_STAGES = {StageName.CURATE, StageName.METADATA, StageName.ENGINE_SELECT}
 # spawn anywhere.
 _NATIVE_STAGES = {
     StageName.DEPLOY, StageName.READY_WAIT,
-    StageName.CAPABILITY, StageName.CLEANUP,
+    StageName.CAPABILITY, StageName.PERF_BENCH, StageName.CLEANUP,
     StageName.SHOWCASE,
 }
 
@@ -500,6 +500,7 @@ def execute_stage(
         from cc_agent import showcase_runner as sc_mod  # PR#5
 
         from . import capability as cap_mod
+        from . import perf_bench as pb_mod  # PR#14
         from . import stages_py
         if stage == StageName.DEPLOY:
             return _adapt_native(stages_py.execute_deploy(run, cfg))
@@ -507,6 +508,8 @@ def execute_stage(
             return _adapt_native(stages_py.execute_ready_wait(run, cfg))
         if stage == StageName.CAPABILITY:
             return _adapt_native(cap_mod.execute_capability(run, cfg))
+        if stage == StageName.PERF_BENCH:
+            return _adapt_native(pb_mod.execute_perf_bench(run, cfg))
         if stage == StageName.CLEANUP:
             return _adapt_native(stages_py.execute_cleanup(run, cfg))
         if stage == StageName.SHOWCASE:

@@ -54,8 +54,16 @@ CURATED_SCHEMA_FIELDS = {
     "training_data",
     "interesting_points",
     "first_impression_tag",
+    "capability_tags",
     "_llm_meta",
 }
+
+# PR#15: stable closed vocabulary the curator LLM picks from. CAPABILITY
+# stage gates each category on a conjunction of these.
+KNOWN_CAPABILITY_TAGS: tuple[str, ...] = (
+    "text", "code", "vision", "ocr", "asr", "tts", "audio", "video",
+    "image_gen", "video_gen", "music_gen", "embedding",
+)
 
 
 # ── HF model card fetch ────────────────────────────────────────────────────
@@ -127,9 +135,23 @@ the JSON object specified below. Do not include any prose before or after the JS
   "param_count": "<e.g. '0.5B', '70B-A22B', '8x7B' — exact string from card or null>",
   "training_data": "<one paragraph or null>",
   "interesting_points": ["<what makes this card stand out, max 4 bullets — what would a curious engineer want to know that the strengths/innovations list above doesn't already cover?>"],
-  "first_impression_tag": "<one short tag, e.g. 'small-and-precise', 'long-context-specialist', 'multilingual-asr', 'image-generation-distilled', 'reasoning-coder', etc.>"
+  "first_impression_tag": "<one short tag, e.g. 'small-and-precise', 'long-context-specialist', 'multilingual-asr', 'image-generation-distilled', 'reasoning-coder', etc.>",
+  "capability_tags": ["<closed vocabulary; pick zero or more of: text, code, vision, ocr, asr, tts, audio, video, image_gen, video_gen, music_gen, embedding>"]
 }}
 ```
+
+## capability_tags hard rules:
+- Use EXACTLY the closed vocabulary above; do not invent new tags.
+- "text" → the model takes text input and produces text output (almost every LLM).
+- "code" → trained / fine-tuned on code OR claims competitive coding scores.
+- "vision" → can take an image as part of the input (VLM / multimodal LLM).
+- "ocr" → claims explicit OCR/text-in-image capability; usually implies "vision" as well.
+- "asr" → speech-to-text (Whisper-style); usually implies "audio".
+- "tts" → text-to-speech; output is audio. Distinct from "asr".
+- "audio" → general audio understanding (music, sounds, NOT just ASR).
+- "video" → video understanding input (video → text).
+- "image_gen", "video_gen", "music_gen" → generative output modalities.
+- "embedding" → an embedding model (BGE/E5/MTEB-style); usually no chat.
 
 ## Hard rules:
 - Output ONLY the JSON. No code fences, no explanatory text.
@@ -215,6 +237,7 @@ _DEFAULT_VALUES: dict[str, Any] = {
     "training_data": None,
     "interesting_points": [],
     "first_impression_tag": None,
+    "capability_tags": ["text"],
 }
 
 
@@ -225,13 +248,36 @@ def normalize_curated(parsed: dict[str, Any] | None) -> dict[str, Any]:
     src = parsed or {}
     for k, default in _DEFAULT_VALUES.items():
         val = src.get(k, default)
-        # Some LLMs return strings where we expected arrays
         if isinstance(default, list) and not isinstance(val, list):
             val = [val] if val not in (None, "") else []
         if isinstance(default, dict) and not isinstance(val, dict):
             val = default
         out[k] = val
+    out["capability_tags"] = _sanitize_capability_tags(out.get("capability_tags"))
     return out
+
+
+def _sanitize_capability_tags(raw: Any) -> list[str]:
+    """Filter LLM output to the closed vocabulary; default to ['text'].
+
+    Real LLMs sometimes:
+    - Return None / not-a-list → fall back to ['text']
+    - Return synonyms ('image' instead of 'vision') → drop unknown
+    - Return duplicates → dedup
+    - Return empty list → fall back to ['text']
+    """
+    if not isinstance(raw, list):
+        return ["text"]
+    seen: set[str] = set()
+    out: list[str] = []
+    for t in raw:
+        if not isinstance(t, str):
+            continue
+        norm = t.strip().lower()
+        if norm in KNOWN_CAPABILITY_TAGS and norm not in seen:
+            seen.add(norm)
+            out.append(norm)
+    return out or ["text"]
 
 
 # ── public API ─────────────────────────────────────────────────────────────

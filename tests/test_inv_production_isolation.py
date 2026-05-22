@@ -48,6 +48,17 @@ INV_DOC_ALLOWLIST: set[str] = {
     "docs/PR3_TEST_PLAN.md",
     "docs/PR8_TEST_PLAN.md",
     "docs/PR10_TEST_PLAN.md",
+    # PR#22a sandbox attack drills — these scripts *deliberately* invoke
+    # the forbidden production verbs as the sandboxed agent user, then
+    # ASSERT the call gets rejected. The strings here are evidence that
+    # INV-19/20 actively defends against the forbidden surface, not a
+    # violation of INV-4.
+    "deploy/agent-sandbox/drills/attack_sudo_escalate.sh",
+    "deploy/agent-sandbox/drills/attack_exec_prod.sh",
+    "deploy/agent-sandbox/sudoers.d/heyi-eval-agent",
+    "deploy/agent-sandbox/README.md",
+    "docs/RUNBOOK_NV8.md",
+    "tests/test_inv16_19_agent_sandbox_static.py",
     "docs/RUNBOOK_NV8.md",
     "docs/ARCHITECTURE.md",
     "docs/INVARIANTS.md",
@@ -331,5 +342,6 @@ class TestInvariantsDocExists:
         assert doc.exists(), "docs/INVARIANTS.md must exist"
         text = doc.read_text(encoding="utf-8")
         for label in ("INV-1", "INV-2", "INV-3", "INV-4",
-                      "INV-9", "INV-11", "INV-12", "INV-13"):
+                      "INV-9", "INV-11", "INV-12", "INV-13",
+                      "INV-14", "INV-15"):
             assert label in text, f"{label} missing from docs/INVARIANTS.md"

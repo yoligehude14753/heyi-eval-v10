@@ -1,0 +1,10 @@
+{"id": "ocr-001", "fixture": "images/ocr/o01_digit_7.png", "prompt": "What digit is shown in this image? Reply with just the digit.", "expected_substring": "7"}
+{"id": "ocr-002", "fixture": "images/ocr/o02_digit_42.png", "prompt": "What number is shown in this image? Reply with just the number.", "expected_substring": "42"}
+{"id": "ocr-003", "fixture": "images/ocr/o03_digit_2026.png", "prompt": "What number is shown in this image? Reply with just the number.", "expected_substring": "2026"}
+{"id": "ocr-004", "fixture": "images/ocr/o04_digit_3141.png", "prompt": "What number is shown in this image? Reply with just the number.", "expected_substring": "3141"}
+{"id": "ocr-005", "fixture": "images/ocr/o05_word_open.png", "prompt": "What word is shown in this image? Reply with just the word in uppercase.", "expected_substring": "OPEN"}
+{"id": "ocr-006", "fixture": "images/ocr/o06_word_stop.png", "prompt": "What word is shown in this image? Reply with just the word in uppercase.", "expected_substring": "STOP"}
+{"id": "ocr-007", "fixture": "images/ocr/o07_word_exit.png", "prompt": "What word is shown in this image? Reply with just the word in uppercase.", "expected_substring": "EXIT"}
+{"id": "ocr-008", "fixture": "images/ocr/o08_word_help.png", "prompt": "What word is shown in this image? Reply with just the word in uppercase.", "expected_substring": "HELP"}
+{"id": "ocr-009", "fixture": "images/ocr/o09_phrase_go.png", "prompt": "What two words are shown in this image? Reply in uppercase.", "expected_substring": "GO LEFT"}
+{"id": "ocr-010", "fixture": "images/ocr/o10_phrase_yes.png", "prompt": "What phrase is shown in this image? Reply in uppercase.", "expected_substring": "YES OR NO"}

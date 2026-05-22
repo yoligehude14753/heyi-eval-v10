@@ -122,10 +122,52 @@ def _strengths_blob(curated: dict[str, Any]) -> str:
     return "\n".join(parts) if parts else "(no curated strengths available)"
 
 
+# Reasoning models (DeepSeek-R1, Qwen3-Thinking, MiniMax-M2.7, Claude
+# thinking-tagged variants, etc.) emit an internal chain wrapped in
+# ``<think>...</think>`` (or the synonym ``<thinking>...</thinking>``)
+# before producing the user-facing answer. If we hand that raw text
+# to the grader LLM and pre-truncate to 600 chars, the truncation
+# usually lops off the actual answer and shows only reasoning, which
+# both confuses the grader and biases the summary toward "the model
+# struggled". ``_strip_think`` removes those blocks before grading.
+#
+# Behavior:
+#   * Matched <think>X</think> / <thinking>X</thinking> blocks are removed,
+#     case-insensitive, multi-block, DOTALL.
+#   * Unmatched trailing <think> with no closing tag (typically caused
+#     by completion_tokens cap mid-reasoning) is removed from the
+#     opening tag through end-of-string — there is no actual answer
+#     in that case.
+#   * Leading / trailing whitespace cleaned up.
+#
+# This is deliberately local to showcase_runner: PR#17 scope is
+# SHOWCASE grading only. CAPABILITY substring scoring will get the
+# same treatment in a follow-up PR.
+
+_THINK_BLOCK_RE = re.compile(
+    r"<\s*think(?:ing)?\s*>.*?<\s*/\s*think(?:ing)?\s*>",
+    flags=re.DOTALL | re.IGNORECASE,
+)
+
+_THINK_UNMATCHED_TAIL_RE = re.compile(
+    r"<\s*think(?:ing)?\s*>.*\Z",
+    flags=re.DOTALL | re.IGNORECASE,
+)
+
+
+def _strip_think(text: str) -> str:
+    """Return ``text`` with reasoning-model <think>...</think> chains removed."""
+    if not text:
+        return ""
+    out = _THINK_BLOCK_RE.sub("", text)
+    out = _THINK_UNMATCHED_TAIL_RE.sub("", out)
+    return out.strip()
+
+
 def _render_items_for_grading(items: list[dict[str, Any]]) -> str:
     out: list[str] = []
     for i, it in enumerate(items, 1):
-        actual = (it.get("actual") or "")[:600]
+        actual = _strip_think(it.get("actual") or "")[:600]
         out.append(
             f"### Item {i}: {it['id']}\n"
             f"Rationale: {it['rationale']}\n"

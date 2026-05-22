@@ -1,0 +1,103 @@
+[Unit]
+Description=heyi-eval-v10 sandboxed Claude Code agent run (run_id=%i)
+Documentation=https://github.com/yoligehude14753/heyi-eval-v10/blob/main/docs/INVARIANTS.md
+After=heyi-eval-orchestrator.service heyi-eval-agent-socket-proxy.service
+Wants=heyi-eval-orchestrator.service
+# We do NOT Wants/Requires the orchestrator socket-proxy — failure to
+# start the proxy must surface as the agent crashing on the first
+# `docker ps`, not as a silent fallthrough.
+
+[Service]
+Type=simple
+User=heyi-eval-agent
+Group=heyi-eval-agent
+
+Slice=heyi-eval-agent.slice
+
+# Working dir is the per-run dir; orchestrator creates it BEFORE
+# starting this service. The path layout is fixed by Store (see
+# orchestrator/store.py): DATA_ROOT/runs/<run_id>/.
+WorkingDirectory=/home/ai/heyi-eval-data/runs/%i
+
+# PR#22a ships a *placeholder* ExecStart so the unit is parseable and
+# fork-bomb / RuntimeMaxSec drills have something to start. PR#22b
+# replaces this with `/usr/local/bin/heyi-eval-agent-run %i` which
+# launches Claude Code with the constrained prompt + MCP config.
+ExecStart=/usr/bin/sleep 60
+
+# Hard wall-clock budget per agent run. 30 min covers a generous
+# DISCOVER→CURATE→DEPLOY→CAPABILITY→PERF_BENCH→SHOWCASE→CLEANUP cycle
+# for one model and stops any infinite-prompt-loop in its tracks.
+RuntimeMaxSec=1800
+
+# Lower priority than prod traffic.
+Nice=15
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+# ─── resource budget (per-instance) ────────────────────────────────
+MemoryMax=4G
+MemoryHigh=3G
+CPUQuota=200%
+TasksMax=128
+
+# ─── docker access goes through agent-socket-proxy (INV-17) ─────────
+# Any direct attempt to talk to /var/run/docker.sock will fail because
+# `heyi-eval-agent` is not in the `docker` group (INV-20). We still
+# point DOCKER_HOST at the proxy to make the happy path explicit.
+Environment=DOCKER_HOST=tcp://127.0.0.1:2377
+Environment=HEYI_EVAL_RUN_ID=%i
+Environment=HEYI_EVAL_AGENT_RUN_DIR=/home/ai/heyi-eval-data/runs/%i
+Environment=PYTHONUNBUFFERED=1
+Environment=HF_ENDPOINT=https://hf-mirror.com
+
+# ─── systemd security hardening ─────────────────────────────────────
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+SystemCallArchitectures=native
+# Allow only the syscall sets a normal Python process needs. The agent
+# does not need module loading, raw IO, or namespace ops.
+SystemCallFilter=@system-service @network-io
+SystemCallFilter=~@privileged @resources @mount @cpu-emulation @debug @raw-io @reboot @swap @module @obsolete @clock
+
+# Empty cap sets — the agent inherits zero capabilities.
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Read-only access to source tree + per-run scratch dir + audit dir
+# (which it can list-only-via-deny-acl... i.e. not at all, INV-18).
+ReadOnlyPaths=/home/ai/heyi-eval-v10
+ReadWritePaths=/home/ai/heyi-eval-data/runs/%i
+ReadWritePaths=/var/lib/heyi-eval-agent
+InaccessiblePaths=/var/log/heyi-eval-agent
+
+# ─── lifecycle ──────────────────────────────────────────────────────
+TimeoutStopSec=30s
+# Do NOT auto-restart — if an agent crashes, we want the orchestrator
+# to learn from it, not have systemd silently re-spawn the same fault.
+Restart=no
+
+# Logs to journal under the per-instance unit name.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=heyi-eval-agent@%i
+
+# No [Install] section — template units are started on-demand by the
+# orchestrator via `systemctl start heyi-eval-agent@<run_id>`, never
+# enabled at boot.
