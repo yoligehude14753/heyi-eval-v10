@@ -105,6 +105,7 @@ def list_runs() -> list[dict]:
 
         cap = _read_json(run_dir / "capability.json") or {}
         show = _read_json(run_dir / "showcase.json") or {}
+        perf = _read_json(run_dir / "perf_bench.json") or {}  # PR#14
         eng = _read_json(run_dir / "_meta" / "engine.json") or {}
         meta = _read_json(run_dir / "_meta" / "metadata.json") or {}
         curated = _read_json(run_dir / "_meta" / "curated.json") or {}
@@ -124,6 +125,27 @@ def list_runs() -> list[dict]:
         else:
             modality_str = None
 
+        # PR#18: surface per-category counts so the leaderboard can hint
+        # which modalities were actually tested. ``categories`` is the
+        # PR#15 dict; older artifacts only have ``results`` and fall
+        # back to a single-bucket figure.
+        cap_categories = cap.get("categories") or {}
+        applicable_cats = sorted(
+            name for name, info in cap_categories.items()
+            if isinstance(info, dict) and info.get("applicable")
+        )
+
+        # PR#18: PERF_BENCH p50 highlights for the leaderboard.
+        ttft_p50 = None
+        tps_p50 = None
+        if isinstance(perf, dict):
+            ttft_obj = perf.get("ttft_ms") or {}
+            tps_obj = perf.get("tps_single") or {}
+            if isinstance(ttft_obj, dict):
+                ttft_p50 = ttft_obj.get("p50")
+            if isinstance(tps_obj, dict):
+                tps_p50 = tps_obj.get("p50")
+
         summaries.append({
             "run_id": state.get("run_id") or run_dir.name,
             "hf_id": state.get("hf_id"),
@@ -136,9 +158,15 @@ def list_runs() -> list[dict]:
             "duration_s": (ended - started) if (started and ended) else None,
             "capability_score": cap.get("score"),
             "capability_pass_rate": cap.get("pass_rate"),
+            "capability_categories": applicable_cats,
             "showcase_items": len(show.get("items") or []),
             "first_impression": show.get("model_first_impression"),
             "summary_preview": summary_text[:140] if summary_text else None,
+            "ttft_ms_p50": ttft_p50,
+            "tps_p50": tps_p50,
+            "perf_applicable": (
+                perf.get("applicable") if isinstance(perf, dict) else None
+            ),
             "engine": eng.get("engine"),
             "engine_image": eng.get("engine_image"),
             "params_b": curated.get("param_count") or meta.get("param_count"),
@@ -156,7 +184,6 @@ def results_leaderboard() -> dict:
     for r in list_runs():
         if r["status"] == "no-state":
             continue
-        # include all runs (success and failure) so partial results are visible
         rows.append({
             "run_id": r["run_id"],
             "hf_id": r["hf_id"],
@@ -168,6 +195,10 @@ def results_leaderboard() -> dict:
             "engine": r.get("engine"),
             "capability": r.get("capability_score"),
             "pass_rate": r.get("capability_pass_rate"),
+            "categories": r.get("capability_categories") or [],
+            "ttft_ms_p50": r.get("ttft_ms_p50"),
+            "tps_p50": r.get("tps_p50"),
+            "perf_applicable": r.get("perf_applicable"),
             "showcase_items": r.get("showcase_items") or 0,
             "first_impression": r.get("first_impression"),
             "summary": r.get("summary_preview"),
@@ -201,6 +232,7 @@ def run_detail(run_id: str) -> dict | None:
         "state": _read_json(run_dir / "state.json"),
         "ready": _read_json(run_dir / "ready.json"),
         "capability": _read_json(run_dir / "capability.json"),
+        "perf_bench": _read_json(run_dir / "perf_bench.json"),  # PR#14 / PR#18
         "showcase": _read_json(run_dir / "showcase.json"),
         "curated": _read_json(run_dir / "_meta" / "curated.json"),
         "metadata": _read_json(run_dir / "_meta" / "metadata.json"),
@@ -438,6 +470,7 @@ INDEX_HTML = """<!doctype html>
     <table id="results-table"><thead><tr>
       <th>hf_id</th><th>状态</th><th>modality</th><th>engine</th>
       <th>能力得分</th><th>pass rate</th>
+      <th>TTFT</th><th>TPS</th>
       <th>首印象</th><th>评价摘要</th><th>耗时</th>
     </tr></thead><tbody></tbody></table>
   </section>
@@ -565,6 +598,8 @@ async function refresh() {
     const cap = r.capability ? `<span class="pill ok">${r.capability}</span>` : '<span class="muted">-</span>';
     const fi  = r.first_impression ? `<span class="pill">${r.first_impression}</span>` : '<span class="muted">-</span>';
     const sm  = r.summary ? `<span class="muted" style="font-size:11px">${r.summary}…</span>` : (r.failure_reason ? `<span class="err" style="font-size:11px">✗ ${r.failure_reason}</span>` : '<span class="muted">-</span>');
+    const ttft = (typeof r.ttft_ms_p50 === 'number') ? `${r.ttft_ms_p50.toFixed(0)}ms` : (r.perf_applicable === false ? '<span class="muted">N/A</span>' : '<span class="muted">-</span>');
+    const tps  = (typeof r.tps_p50 === 'number') ? `${r.tps_p50.toFixed(1)} tok/s` : (r.perf_applicable === false ? '<span class="muted">N/A</span>' : '<span class="muted">-</span>');
     return `<tr>
       <td><a href="/run/${encodeURIComponent(r.run_id)}"><strong>${r.hf_id||'-'}</strong></a>
         <div class="muted" style="font-size:11px">${r.publisher||''}</div></td>
@@ -573,11 +608,13 @@ async function refresh() {
       <td>${r.engine||'<span class="muted">-</span>'}</td>
       <td>${cap}</td>
       <td>${pr}</td>
+      <td>${ttft}</td>
+      <td>${tps}</td>
       <td>${fi}</td>
       <td style="max-width:380px">${sm}</td>
       <td>${formatDuration(r.duration_s)}</td>
     </tr>`;
-  }).join('') || '<tr><td colspan="9" class="muted">无评测结果</td></tr>';
+  }).join('') || '<tr><td colspan="11" class="muted">无评测结果</td></tr>';
 
   // detailed stage table
   const runs = await getJSON('/api/runs');
@@ -655,14 +692,40 @@ def render_results_page() -> str:
         fail = html.escape(r.get("failure_reason") or "")
         showcase_n = r.get("showcase_items") or 0
 
+        # PR#18 perf columns
+        ttft_p50 = r.get("ttft_ms_p50")
+        tps_p50 = r.get("tps_p50")
+        if isinstance(ttft_p50, (int, float)):
+            ttft_cell = f"{ttft_p50:.0f}ms"
+        elif r.get("perf_applicable") is False:
+            ttft_cell = "<span class='muted'>N/A</span>"
+        else:
+            ttft_cell = "<span class='muted'>-</span>"
+        if isinstance(tps_p50, (int, float)):
+            tps_cell = f"{tps_p50:.1f} tok/s"
+        elif r.get("perf_applicable") is False:
+            tps_cell = "<span class='muted'>N/A</span>"
+        else:
+            tps_cell = "<span class='muted'>-</span>"
+
+        # PR#18 categories pill row (compact)
+        cats = r.get("categories") or []
+        cats_html = (
+            " ".join(
+                f"<span class='pill' style='font-size:10px'>{html.escape(c)}</span>"
+                for c in cats[:8]
+            ) if cats else "<span class='muted'>-</span>"
+        )
+
         rows_html.append(
             f"<tr><td><a href='/run/{html.escape(r.get('run_id', ''))}'><strong>{hf}</strong></a>"
             f"<div class='muted' style='font-size:11px'>{pub}</div></td>"
             f"<td><span class='pill {status_cls}'>{html.escape(status)}</span></td>"
             f"<td>{modality}</td><td>{params}</td><td>{license_}</td>"
             f"<td>{engine}</td>"
-            f"<td><span class='pill'>{cap}</span></td>"
+            f"<td><span class='pill'>{cap}</span><div style='margin-top:3px'>{cats_html}</div></td>"
             f"<td class='{pr_cls}'><strong>{pr_pct}</strong></td>"
+            f"<td>{ttft_cell}</td><td>{tps_cell}</td>"
             f"<td>{showcase_n} 条</td>"
             f"<td><span class='pill'>{fi}</span></td>"
             f"<td style='max-width:380px;font-size:12px;color:#b8b8c4'>{summary}"
@@ -670,7 +733,7 @@ def render_results_page() -> str:
             f"<td>{dur_s}</td></tr>"
         )
 
-    table_body = "".join(rows_html) or '<tr><td colspan="12" class="muted">无评测结果</td></tr>'
+    table_body = "".join(rows_html) or '<tr><td colspan="14" class="muted">无评测结果</td></tr>'
 
     return f"""<!doctype html>
 <html lang="zh"><head><meta charset="utf-8"><title>heyi-eval-v9 · 评测结果</title>
@@ -708,11 +771,150 @@ a{{color:#6ec0ff;text-decoration:none}} a:hover{{text-decoration:underline}}
 <section><table>
 <thead><tr>
   <th>hf_id / publisher</th><th>状态</th><th>modality</th><th>params</th><th>license</th>
-  <th>engine</th><th>能力得分</th><th>pass rate</th><th>showcase</th>
+  <th>engine</th><th>能力得分 / categories</th><th>pass rate</th>
+  <th>TTFT (p50)</th><th>TPS (p50)</th><th>showcase</th>
   <th>首印象</th><th>评价摘要 / 失败原因</th><th>耗时</th>
 </tr></thead><tbody>{table_body}</tbody>
 </table></section>
 </main></body></html>"""
+
+
+# ── PR#18: CAPABILITY (multimodal) + PERF_BENCH renderers ─────────────────
+
+
+def _render_item_row(r: dict) -> str:
+    """Render a single capability item row. Used by both the per-category
+    table and the legacy flat-results fallback."""
+    cls = "ok" if r.get("pass") else "err"
+    return (
+        f"<tr><td>{html.escape(r.get('id',''))}</td>"
+        f"<td><code>{html.escape((r.get('prompt') or '')[:80])}</code></td>"
+        f"<td class='{cls}'>{'PASS' if r.get('pass') else 'FAIL'}</td>"
+        f"<td>{r.get('latency_ms')}ms</td>"
+        f"<td><code>{html.escape((r.get('actual') or '')[:80])}</code></td></tr>"
+    )
+
+
+def _render_capability_html(cap: dict) -> str:
+    """Render the CAPABILITY section.
+
+    PR#15+: ``cap.categories`` is a dict
+        { category_name: {applicable, scorer, score, pass_rate, items, reason?} }
+    Each category renders as a collapsible <details> block with its own
+    pass-rate banner + items table.
+
+    Legacy artifacts (pre-PR#15) only have ``cap.results``: rendered as a
+    single flat table for back-compat.
+    """
+    if not cap:
+        return ""
+
+    overall = (
+        f"<p>score: <strong>{html.escape(cap.get('score') or '?')}</strong> · "
+        f"pass_rate: {cap.get('pass_rate')}</p>"
+    )
+
+    categories = cap.get("categories") or {}
+    if categories:
+        blocks: list[str] = []
+        for cat_name in sorted(categories):
+            info = categories[cat_name] or {}
+            applicable = bool(info.get("applicable"))
+            score = info.get("score") or "0/0"
+            pass_rate = info.get("pass_rate")
+            scorer = info.get("scorer") or ""
+            reason = info.get("reason") or ""
+
+            if not applicable:
+                blocks.append(
+                    f"<details><summary class='muted'>"
+                    f"{html.escape(cat_name)} — "
+                    f"<span class='pill'>N/A</span> "
+                    f"{html.escape(reason)}</summary></details>"
+                )
+                continue
+
+            items = info.get("items") or []
+            pass_pct = (
+                f"{pass_rate*100:.0f}%"
+                if isinstance(pass_rate, (int, float)) else "?"
+            )
+            pass_cls = (
+                "ok" if isinstance(pass_rate, (int, float)) and pass_rate >= 0.8
+                else "warn" if isinstance(pass_rate, (int, float)) and pass_rate >= 0.5
+                else "err"
+            )
+            rows = "".join(_render_item_row(r) for r in items)
+            blocks.append(
+                f"<details {'open' if pass_rate not in (1, 1.0) and items else ''}>"
+                f"<summary><strong>{html.escape(cat_name)}</strong> "
+                f"<span class='pill {pass_cls}'>{score}</span> "
+                f"<span class='muted'>({pass_pct} pass · scorer={html.escape(scorer)})</span>"
+                f"</summary>"
+                "<table><thead><tr><th>id</th><th>prompt</th><th>result</th>"
+                "<th>latency</th><th>actual</th></tr></thead>"
+                f"<tbody>{rows}</tbody></table></details>"
+            )
+        return overall + "".join(blocks)
+
+    if cap.get("results"):
+        rows = "".join(_render_item_row(r) for r in cap["results"])
+        return (
+            overall
+            + "<table><thead><tr><th>id</th><th>prompt</th><th>result</th>"
+            "<th>latency</th><th>actual</th></tr></thead>"
+            f"<tbody>{rows}</tbody></table>"
+        )
+
+    return ""
+
+
+def _fmt(v, *, suffix: str = "", places: int = 1) -> str:
+    if v is None:
+        return "<span class='muted'>—</span>"
+    if isinstance(v, (int, float)):
+        return f"{v:.{places}f}{suffix}"
+    return html.escape(str(v))
+
+
+def _render_perf_bench_html(perf: dict) -> str:
+    """Render the PERF_BENCH section. PR#14 artifact shape (perf_bench.json)."""
+    if not perf:
+        return ""
+    if not perf.get("applicable"):
+        reason = perf.get("reason") or ""
+        return (
+            f"<p><span class='pill'>N/A</span> "
+            f"<span class='muted'>{html.escape(reason)}</span></p>"
+        )
+
+    ttft = perf.get("ttft_ms") or {}
+    tps = perf.get("tps_single") or {}
+    conc = perf.get("concurrent") or {}
+    vram = perf.get("vram_mib")
+    warnings_list = perf.get("warnings") or []
+
+    cards = (
+        "<div class='grid' style='grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px'>"
+        "<div class='stat'><div class='label'>TTFT (p50)</div>"
+        f"<div class='value'>{_fmt(ttft.get('p50'), suffix=' ms')}</div></div>"
+        "<div class='stat'><div class='label'>TTFT (p95)</div>"
+        f"<div class='value'>{_fmt(ttft.get('p95'), suffix=' ms')}</div></div>"
+        "<div class='stat'><div class='label'>TPS single (p50)</div>"
+        f"<div class='value'>{_fmt(tps.get('p50'), suffix=' tok/s')}</div></div>"
+        f"<div class='stat'><div class='label'>TPS concurrent (×{conc.get('n','?')})</div>"
+        f"<div class='value'>{_fmt(conc.get('aggregate_tps'), suffix=' tok/s')}</div></div>"
+        "<div class='stat'><div class='label'>VRAM total</div>"
+        f"<div class='value'>{_fmt(vram.get('total') if isinstance(vram, dict) else None, suffix=' MiB', places=0)}</div></div>"
+        "</div>"
+    )
+
+    warn_html = ""
+    if warnings_list:
+        items = "".join(f"<li>{html.escape(str(w))}</li>" for w in warnings_list)
+        warn_html = f"<div class='muted' style='margin-top:8px;font-size:12px'><strong>warnings</strong><ul>{items}</ul></div>"
+
+    return cards + warn_html
 
 
 def render_run_detail(run_id: str) -> str:
@@ -730,24 +932,8 @@ def render_run_detail(run_id: str) -> str:
     def esc(s):
         return html.escape(json.dumps(s, ensure_ascii=False, indent=2)) if s else ""
 
-    cap_html = ""
-    if cap.get("results"):
-        rows = []
-        for r in cap["results"]:
-            cls = "ok" if r.get("pass") else "err"
-            rows.append(
-                f"<tr><td>{html.escape(r.get('id',''))}</td>"
-                f"<td><code>{html.escape((r.get('prompt') or '')[:80])}</code></td>"
-                f"<td class='{cls}'>{'PASS' if r.get('pass') else 'FAIL'}</td>"
-                f"<td>{r.get('latency_ms')}ms</td>"
-                f"<td><code>{html.escape((r.get('actual') or '')[:80])}</code></td></tr>"
-            )
-        cap_html = (
-            f"<p>score: <strong>{html.escape(cap.get('score','?'))}</strong> · "
-            f"pass_rate: {cap.get('pass_rate')}</p>"
-            "<table><thead><tr><th>id</th><th>prompt</th><th>result</th><th>latency</th><th>actual</th></tr></thead><tbody>"
-            + "".join(rows) + "</tbody></table>"
-        )
+    cap_html = _render_capability_html(cap)
+    perf_html = _render_perf_bench_html(detail.get("perf_bench") or {})
 
     show_html = ""
     if show.get("items"):
@@ -794,7 +980,8 @@ a{{color:#6ec0ff;text-decoration:none}} a:hover{{text-decoration:underline}}
 <section><h2>metadata（HF + curator 合并）</h2><pre>{esc(meta)}</pre></section>
 <section><h2>curated（LLM 解读）</h2><pre>{esc(cur)}</pre></section>
 <section><h2>ready</h2><pre>{esc(ready)}</pre></section>
-<section><h2>capability（5/5 固定题）</h2>{cap_html or '<div class="muted">无</div>'}</section>
+<section><h2>capability（多模态分轨）</h2>{cap_html or '<div class="muted">无</div>'}</section>
+<section><h2>perf_bench（TTFT / TPS / 并发 / VRAM）</h2>{perf_html or '<div class="muted">无</div>'}</section>
 <section><h2>showcase（claude 自主设计的 8 题）</h2>{show_html or '<div class="muted">无</div>'}</section>
 </main></body></html>"""
 
