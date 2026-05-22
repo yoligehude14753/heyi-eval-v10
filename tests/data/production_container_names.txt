@@ -1,14 +1,25 @@
-# Production heyi_engine container names that the eval pipeline must NEVER
-# reference, import, mount, exec into, or include in any kind of probe/list/
-# control loop. INV-1.
+# Production container names that the eval pipeline must NEVER docker-control
+# (rm/stop/exec/run/restart). INV-1 static guard list.
 #
-# Source of truth: hand-maintained by the operator from `docker ps` on nv8.
-# Lines starting with '#' are comments. Blank lines ignored.
+# IMPORTANT — this file is the *static scan boundary list*, NOT the runtime
+# configuration:
+#
+#   - At RUNTIME the production LLM container name is set by
+#     OrchestratorConfig.prod_engine_container (defaults to "minimax",
+#     overridden by HEYI_EVAL_PROD_ENGINE_CONTAINER env var). The user
+#     switches that value every few months (M2.7 ↔ K2.6 ↔ ...).
+#   - This file lists the *historical and currently-known* production
+#     container substrings so the INV-1 static scan can flag any code line
+#     that mutates a container with one of these names. Updating this list
+#     is a one-way ratchet — new names get added, but existing names stay
+#     even after ops retires them, because old shell scripts mentioning
+#     them are still a hazard.
 #
 # Format: one container name per line. Substring match (case-sensitive).
+# Lines starting with '#' are comments. Blank lines ignored.
 #
-# Update when production set changes. CI runs tests/test_inv_production_isolation.py
-# which greps the codebase for any of these strings outside of allowed-path docs.
+# CI: tests/test_inv_production_isolation.py greps the codebase for any of
+# these substrings outside of allowed-path docs.
 minimax-m2.7
 glm-5.1
 kimi-k2.6

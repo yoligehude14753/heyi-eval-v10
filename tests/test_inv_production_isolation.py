@@ -12,10 +12,13 @@ heyi_engine stack. The defense is layered:
           audit and easy to rate-limit
 
 Read-only inspection is explicitly permitted — orchestrator/validator.py
-calls `docker inspect minimax` to assert INV-2 (production container
-still alive), which is the right thing to do. The runtime CLEANUP code
-(orchestrator/stages_py.execute_cleanup) does the *mutating* side with
-container_name.startswith('e9-') as defense-in-depth.
+calls ``docker inspect <prod_engine_container>`` (the container name
+comes from ``OrchestratorConfig.prod_engine_container``, defaults to
+``minimax`` but configurable since PR#10) to assert INV-2 (production
+container still alive), which is the right thing to do. The runtime
+CLEANUP code (orchestrator/stages_py.execute_cleanup) does the
+*mutating* side with container_name.startswith('e9-') as defense-in-
+depth.
 
 This file owns the static side. See docs/INVARIANTS.md for the canonical
 list and runtime owners.
@@ -39,10 +42,12 @@ INV_DOC_ALLOWLIST: set[str] = {
     "tests/data/production_container_names.txt",
     "tests/test_prod_container_safety.py",
     "tests/test_stages_py_cleanup.py",
+    "tests/test_pr10_concept_split.py",
     "tests/e2e/conftest.py",
     "tests/e2e/test_full_pipeline_qwen.py",
     "docs/PR3_TEST_PLAN.md",
     "docs/PR8_TEST_PLAN.md",
+    "docs/PR10_TEST_PLAN.md",
     "docs/RUNBOOK_NV8.md",
     "docs/ARCHITECTURE.md",
     "docs/INVARIANTS.md",
@@ -50,12 +55,16 @@ INV_DOC_ALLOWLIST: set[str] = {
     "docs/PLAN.md",
     "sops/invariants.md",
     "README.md",
-    # validator.py validates INV-2 ("minimax stays up") — it must name
-    # the production container to inspect it.
+    # validator.py validates INV-2 ("the configured production LLM stays up")
+    # — it must reference the container name to inspect it. Post-PR#10 the
+    # name comes from a parameter rather than the literal "minimax".
     "orchestrator/validator.py",
     # heyi_engine/client.py module docstring describes what it does NOT
     # talk to (xrouter); that's anti-coupling documentation, not control.
     "heyi_engine/client.py",
+    # config.py docstring references the production model history for
+    # context; not control.
+    "orchestrator/config.py",
 }
 
 # Directories we never scan.

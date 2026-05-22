@@ -1,11 +1,14 @@
 """HeyiEngineClient — talks to local vLLM/SGLang at :10814 with auto model discovery.
 
 Why "heyi_engine"? In v9 we found the term covers multiple things:
-the xrouter routing layer (:8081), individual vLLM containers
-(minimax / glm-51 / kimi-k26 on :10814), and even the kaopuapi-based
+the xrouter routing layer on :8081, the production vLLM container that
+ops currently has loaded on :10814 (specifically: the container named
+by ``OrchestratorConfig.prod_engine_container`` — the "production LLM"
+— defaults to ``minimax`` but is configurable, since the user switches
+the underlying model every few months), and even the kaopuapi-based
 cloud Claude. v10 narrows the scope: this client talks ONLY to the
-LLM HTTP endpoint the user has currently loaded on :10814. The
-xrouter on :8081 is left untouched (PROD trust domain).
+production LLM HTTP endpoint the user has currently loaded on :10814.
+The xrouter on :8081 is left untouched (PROD trust domain).
 
 Contract (see docs/PR2_TEST_PLAN.md for full happy/sad/edge matrix):
 
