@@ -1,0 +1,52 @@
+# heyi-eval-agent sudoers whitelist (INV-19 / INV-20)
+#
+# Install with:
+#   sudo install -m 0440 \
+#     deploy/agent-sandbox/sudoers.d/heyi-eval-agent \
+#     /etc/sudoers.d/heyi-eval-agent
+#   sudo visudo -c -f /etc/sudoers.d/heyi-eval-agent
+#
+# Whitelist is intentionally minimal. The agent NEVER needs:
+#   - to restart heyi-engine / minimax / xrouter (production trust domain)
+#   - to manage networks / images / volumes (docker-socket-proxy handles it)
+#   - to install packages (sandboxed; rebuild image instead)
+#   - generic file ops (covered by ACLs)
+#
+# Whitelist below: only `systemctl <verb> heyi-eval-orchestrator.service`
+# for non-destructive verbs that let the agent bounce its OWN supervisor
+# after deploying a code change. Everything else is denied.
+
+Cmnd_Alias HEYI_EVAL_ORCH_BOUNCE = \
+    /bin/systemctl restart heyi-eval-orchestrator.service, \
+    /bin/systemctl status  heyi-eval-orchestrator.service, \
+    /usr/bin/systemctl restart heyi-eval-orchestrator.service, \
+    /usr/bin/systemctl status  heyi-eval-orchestrator.service
+
+# Explicit DENY list — keeps any future inheritance from breaking the
+# trust boundary even if a parent rule changes.
+Cmnd_Alias HEYI_EVAL_FORBIDDEN = \
+    /bin/systemctl * heyi-engine*, \
+    /bin/systemctl * minimax*, \
+    /usr/bin/systemctl * heyi-engine*, \
+    /usr/bin/systemctl * minimax*, \
+    /bin/systemctl * docker*, \
+    /usr/bin/systemctl * docker*, \
+    /usr/sbin/visudo, \
+    /usr/sbin/useradd, \
+    /usr/sbin/userdel, \
+    /usr/sbin/usermod, \
+    /bin/su, \
+    /bin/su -, \
+    /usr/bin/passwd, \
+    /usr/bin/chsh
+
+heyi-eval-agent ALL=(root) NOPASSWD: HEYI_EVAL_ORCH_BOUNCE
+heyi-eval-agent ALL=(ALL)       !HEYI_EVAL_FORBIDDEN
+
+# Hard ceiling on env vars the agent can inherit through sudo.
+Defaults:heyi-eval-agent !env_reset
+Defaults:heyi-eval-agent env_keep -= "*"
+Defaults:heyi-eval-agent env_keep += "HEYI_EVAL_RUN_ID HEYI_EVAL_AGENT_RUN_DIR"
+Defaults:heyi-eval-agent secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Defaults:heyi-eval-agent log_input,log_output
+Defaults:heyi-eval-agent iolog_dir="/var/log/sudo-io/heyi-eval-agent"

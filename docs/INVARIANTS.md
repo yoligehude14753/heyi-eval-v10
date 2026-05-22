@@ -36,6 +36,9 @@ v10 同一台机器上同时存在**两类**完全不同的 LLM 容器。把它�
 | **INV-13** | 卫生 | `scripts/*.sh` 不得对产线容器名出现 mutating docker verb | `tests/test_inv_production_isolation.py::TestINV13*` | — |
 | **INV-14** | 隔离 | LLM-judge 单向跨域：CAPABILITY 可把 EVAL 产物字节发 PROD VLM 评分,但绝不把测试 prompt 文本 / expected_substring 发 PROD | `tests/test_inv14_llm_judge_boundary.py` | `orchestrator/llm_judge.py` 仅使用 `_JUDGE_PROMPT` 模板 |
 | **INV-15** | 隔离 | transformers-runner 镜像源码(`transformers_runner/`)不得引用任何 PROD 配置(`heyi_engine` 容器名 / `OrchestratorConfig` / `prod_engine_*`),只服务 `--model-path` 指向的本地目录 | `tests/test_inv15_transformers_runner_isolation.py`(静态扫描) | Dockerfile `HF_HUB_OFFLINE=1` 阻断意外的 HF Hub 拉取 |
+| **INV-16** | 沙箱·FS | 沙箱 agent 用户 `heyi-eval-agent` 对 `store/*`、`runs/`(父目录)、源码树仅有 `r-x`;`/home/ai` 仅有 `--x` (traverse,不可 ls);store/ 任何写/删/截断均必须 EACCES | `tests/test_inv16_19_agent_sandbox_static.py::TestInv16AclScript` | `deploy/agent-sandbox/acl_install.sh` 安装 POSIX ACL + `drills/attack_delete_store.sh` 真机演练 |
+| **INV-19** | 沙箱·sudo | 沙箱 agent 用户的 sudoers 白名单只包含 `systemctl restart/status heyi-eval-orchestrator.service`;`heyi-engine` / `minimax` / `docker.service` / `visudo` / `passwd` / `su` 等必须落入 `HEYI_EVAL_FORBIDDEN` 别名 | `tests/test_inv16_19_agent_sandbox_static.py::TestInv19Sudoers` | `deploy/agent-sandbox/sudoers.d/heyi-eval-agent` (visudo -c 校验) + `drills/attack_sudo_escalate.sh` 真机演练 |
+| **INV-20** | 沙箱·身份 | 沙箱 agent 用户**不得**属于 `docker`、`sudo`、`wheel`、`adm` 组;登录 shell 必须为 `/usr/sbin/nologin`;只能由 `sudo -u heyi-eval-agent` 触发 | `tests/test_inv16_19_agent_sandbox_static.py::TestInv16SetupScriptForbiddenGroups` | `deploy/agent-sandbox/setup_agent_user.sh` 安装期 post-check + 同一 drill 3 |
 
 ## 为什么这些是红线
 
