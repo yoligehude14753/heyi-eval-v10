@@ -190,27 +190,58 @@ def validate_cleanup(run_dir: Path, *, ephemeral_container: str) -> None:
 
 def assert_invariants(
     *,
-    expected_minimax_gpu_min_mib: int = 80_000,
-    minimax_gpus: tuple[int, ...] = (0, 1, 2, 3),
+    prod_engine_container: str = "minimax",
+    prod_engine_gpus: tuple[int, ...] = (0, 1, 2, 3),
+    expected_prod_gpu_min_mib: int = 80_000,
+    # Deprecated since PR#10. Kept for backward compatibility with any
+    # caller that hasn't migrated yet — emits DeprecationWarning.
+    minimax_gpus: tuple[int, ...] | None = None,
+    expected_minimax_gpu_min_mib: int | None = None,
 ) -> None:
     """
-    Snapshot check:
-    - INV-1: minimax still owns GPU 0-3 (kv occupancy > 80 GB each)
-    - INV-2: minimax container still up
-    - INV-3 is enforced by docker-socket-proxy (separate)
+    Snapshot check between eval pipeline stages.
+
+    - INV-1: production LLM still owns ``prod_engine_gpus`` (KV occupancy
+             ≥ ``expected_prod_gpu_min_mib`` per GPU).
+    - INV-2: ``prod_engine_container`` still running.
+    - INV-3 is enforced by docker-socket-proxy (separate).
+
+    The "production LLM" is whatever vLLM container heyi_engine talks to on
+    :10814 — defaults to ``minimax`` (MiniMax-M2.7 TP=4 on GPU 0-3), but the
+    user transiently switches to Kimi-K2.6 TP=8 etc.; callers should pass
+    the live values from ``OrchestratorConfig.prod_engine_container`` /
+    ``OrchestratorConfig.prod_engine_gpus``.
     """
-    # INV-2: container up
+    if minimax_gpus is not None:
+        import warnings as _w
+        _w.warn(
+            "assert_invariants(minimax_gpus=...) is deprecated since PR#10; "
+            "use prod_engine_gpus=... instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        prod_engine_gpus = minimax_gpus
+    if expected_minimax_gpu_min_mib is not None:
+        import warnings as _w
+        _w.warn(
+            "assert_invariants(expected_minimax_gpu_min_mib=...) is deprecated "
+            "since PR#10; use expected_prod_gpu_min_mib=... instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        expected_prod_gpu_min_mib = expected_minimax_gpu_min_mib
+
     out = subprocess.run(
-        ["docker", "inspect", "-f", "{{.State.Status}}", "minimax"],
+        ["docker", "inspect", "-f", "{{.State.Status}}", prod_engine_container],
         capture_output=True, text=True, timeout=5, check=False,
     )
     status = out.stdout.strip()
     if status != "running":
         raise ValidationError(
-            f"INV-2 violation: minimax container status={status!r} (expected 'running')"
+            f"INV-2 violation: {prod_engine_container!r} container "
+            f"status={status!r} (expected 'running')"
         )
 
-    # INV-1: GPU 0-3 kv occupancy
     out = subprocess.run(
         ["nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,noheader,nounits"],
         capture_output=True, text=True, timeout=5, check=False,
@@ -222,8 +253,10 @@ def assert_invariants(
             mem = int(mem_s.strip())
         except ValueError:
             continue
-        if idx in minimax_gpus and mem < expected_minimax_gpu_min_mib:
+        if idx in prod_engine_gpus and mem < expected_prod_gpu_min_mib:
             raise ValidationError(
-                f"INV-1 violation: GPU {idx} mem={mem} MiB < {expected_minimax_gpu_min_mib} MiB; "
-                f"minimax may have been killed or swapped out"
+                f"INV-1 violation: GPU {idx} mem={mem} MiB "
+                f"< {expected_prod_gpu_min_mib} MiB; "
+                f"production container {prod_engine_container!r} may have been "
+                f"killed or swapped out"
             )
