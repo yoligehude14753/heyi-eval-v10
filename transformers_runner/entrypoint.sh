@@ -7,9 +7,21 @@
 # operator can `docker run ... bash` for debugging without surprises.
 set -euo pipefail
 
+# Resolve a Python interpreter: prefer `python` if present (older base
+# images), fall back to `python3` which is what the current vllm-based
+# base ships. Both must accept `-m transformers_runner serve …`.
+if command -v python >/dev/null 2>&1; then
+    PY=python
+elif command -v python3 >/dev/null 2>&1; then
+    PY=python3
+else
+    echo "transformers-runner-entrypoint: no python interpreter on PATH" >&2
+    exit 127
+fi
+
 if [[ "${1:-}" == "serve" ]]; then
     shift
-    exec python -m transformers_runner serve "$@"
+    exec "$PY" -m transformers_runner serve "$@"
 fi
 
 exec "$@"

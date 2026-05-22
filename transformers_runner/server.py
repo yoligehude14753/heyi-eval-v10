@@ -183,18 +183,30 @@ def _build_asr_pipeline(model_path: str) -> Any:
     from transformers import pipeline as hf_pipeline  # noqa: PLC0415
     import torch  # noqa: PLC0415
 
+    # Blackwell (sm_120) prefers bf16 over fp16 for cuBLAS Lt heuristics;
+    # fp16 occasionally trips CUBLAS_STATUS_NOT_INITIALIZED on the
+    # Whisper encoder matmuls. Use bf16 when CUDA is available, fall
+    # back to fp32 on CPU so a non-GPU smoke environment still works.
+    if torch.cuda.is_available():
+        dtype = torch.bfloat16
+        device = 0
+    else:
+        dtype = torch.float32
+        device = -1
     return hf_pipeline(
         "automatic-speech-recognition",
         model=model_path,
-        torch_dtype=torch.float16,
-        device_map="auto",
+        torch_dtype=dtype,
+        device=device,
     )
 
 
 def _build_tts_pipeline(model_path: str) -> Any:
     from transformers import pipeline as hf_pipeline  # noqa: PLC0415
+    import torch  # noqa: PLC0415
 
-    return hf_pipeline("text-to-speech", model=model_path, device_map="auto")
+    device = 0 if torch.cuda.is_available() else -1
+    return hf_pipeline("text-to-speech", model=model_path, device=device)
 
 
 def _build_image_gen_pipeline(model_path: str) -> Any:

@@ -1,25 +1,15 @@
-# transformers-runner runtime deps — pinned (rules §06 framework eval).
+# transformers-runner additional deps layered on
+# voipmonitor/llm-pytorch-blackwell:nightly. That base ships
+# torch / transformers / numpy / Pillow / accelerate / safetensors,
+# so we only add what's actually missing.
 #
-# Torch matches CUDA 12.4 (nvidia/cuda:12.4.1-* base image).
 # Bumping a major version requires re-running the smoke matrix from
 # RUNBOOK_NV8.md §12 (whisper-small / SD1.5 / SpeechT5 / Qwen2-VL-2B).
---extra-index-url https://download.pytorch.org/whl/cu124
-torch==2.5.1
-torchaudio==2.5.1
-torchvision==0.20.1
 
-transformers==4.46.3
-diffusers==0.31.0
-accelerate==1.1.1
-safetensors==0.4.5
+# Diffusion pipelines — used by /v1/images/generations (and PR#22+
+# video_gen). Pinned to a version compatible with transformers 5.x.
+diffusers>=0.32,<0.36
 
-# Audio I/O and resampling — needed by Whisper + SpeechT5 + MusicGen
-soundfile==0.12.1
-librosa==0.10.2.post1
-numpy==1.26.4
-
-# Image I/O for diffusers result handling
-Pillow==10.4.0
-
-# Used only by tests / curl smoke checks — keeps image self-contained
-# so the healthcheck `curl` is already installed via apt above.
+# Audio I/O + resampling — needed by Whisper + SpeechT5 + MusicGen
+soundfile>=0.12,<0.14
+librosa>=0.10,<0.12

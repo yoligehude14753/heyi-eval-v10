@@ -397,23 +397,32 @@ PR#22+。`video_gen` category 仍然按原计划走 LLM-judge,无需视频固件
 
 ---
 
-## 12 · 构建 transformers-runner:v10 镜像(PR#19)
+## 12 · 构建 transformers-runner:v10 镜像(PR#19 / PR#19b)
 
 > 一次性操作,首次部署非 vLLM 模态前必做。重新构建只有在升级
 > torch/transformers/diffusers 大版本时才需要(走 ADR)。
+>
+> **PR#19b(2026-05-22)在 nv8 真机验证后将 base 镜像从
+> `nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04` 改为
+> `vllm/vllm-openai:v0.21.0`**,见 §12.6「基底镜像选择历程」。
 
 ### 12.1 前置检查
 
 ```bash
 # 确认 nvidia container runtime 已注册
-docker info 2>/dev/null | grep -i "runtimes" | grep -q nvidia || \
-    echo "WARN: nvidia runtime 未启用,需要先 systemctl restart docker"
+docker info 2>/dev/null | grep -iE "runtimes|nvidia" | head -5
+# 期望看到 `nvidia` runtime 或 CDI `nvidia.com/gpu=N`
 
-# 确认 /var/lib/docker 有 ≥ 30 GB(镜像约 13 GB + 缓冲)
+# 确认 /var/lib/docker 有 ≥ 30 GB(layer 复用后增量 ~3 GB)
 df -h /var/lib/docker | tail -1
 
-# 确认 cu124 wheel 镜像源可访问(国内可能要走代理)
-curl -sI https://download.pytorch.org/whl/cu124/ | head -1
+# 确认 base 镜像已在本地(PROD vLLM 用同一镜像,通常已经 pull 过)
+docker images vllm/vllm-openai --format "{{.Tag}}\t{{.Size}}" | head -3
+# 期望看到 v0.21.0(或更高);如果没有,先在网络好的窗口
+# `docker pull vllm/vllm-openai:v0.21.0`
+
+# 确认 Aliyun PyPI 可访(在容器内 pip install diffusers/librosa 用)
+curl -sI https://mirrors.aliyun.com/pypi/simple/ | head -1
 ```
 
 ### 12.2 构建
@@ -421,44 +430,59 @@ curl -sI https://download.pytorch.org/whl/cu124/ | head -1
 ```bash
 cd ~/heyi-eval-v10
 
-# 仅构建(约 15-25 min,看网络)
+# 仅构建(layer 已 cache 时 ~80 s;首次 cold 约 2 min)
 bash scripts/build_transformers_runner.sh
 
-# 构建 + /health 烟测(推荐;耗时多约 30 s)
+# 构建 + /health 烟测(推荐;再多 ~15 s)
 bash scripts/build_transformers_runner.sh --smoke
 ```
 
-预期输出末尾:`✓ smoke OK`,且 `/health` 返回
+预期输出末尾:`✓ build OK`(以及 `✓ smoke OK`),且 `/health` 返回
 `{"status":"ok","capability":"text",...}`。
 
-### 12.3 单模型联调(用真实的 Whisper-tiny 做最便宜的 ASR 烟测)
+最终镜像大小约 **24 GB**(base 已含 torch/transformers/CUDA,
+我们仅 layer 了 diffusers + librosa + soundfile,新增 ~600 MB)。
+
+### 12.3 Whisper-tiny ASR 真机联调(已在 nv8 验证 ✅ 2026-05-22)
 
 ```bash
-# 取一个 Whisper-tiny(~150 MB),放到本地
-MODEL_DIR=$(mktemp -d)
-huggingface-cli download openai/whisper-tiny --local-dir "$MODEL_DIR"
+# 取 Whisper-tiny(~150 MB),走 hf-mirror 国内镜像
+MODEL_DIR=/tmp/whisper-tiny && mkdir -p "$MODEL_DIR"
+for f in config.json generation_config.json model.safetensors \
+         preprocessor_config.json tokenizer.json tokenizer_config.json \
+         vocab.json normalizer.json added_tokens.json merges.txt \
+         special_tokens_map.json; do
+    curl -sL -o "$MODEL_DIR/$f" \
+         "https://hf-mirror.com/openai/whisper-tiny/resolve/main/$f"
+done
 
-# 启动 runner
-docker run --rm --name tf-runner-asr-smoke \
+# 启动 runner(用 EVAL 池 GPU 4)
+docker rm -f tf-runner-asr-smoke 2>/dev/null
+docker run -d --name tf-runner-asr-smoke \
     --gpus '"device=4"' \
     -p 18000:8000 \
     -v "$MODEL_DIR:/model:ro" \
-    heyi-eval/transformers-runner:v10 &
+    heyi-eval/transformers-runner:v10
 
-# 等 15 s 让模型 load
-sleep 15
+# 等 ≤ 5 s,/health 应该返回 capability=asr
+for i in $(seq 1 15); do
+    body=$(curl -m 2 -fsS http://127.0.0.1:18000/health 2>/dev/null)
+    [ -n "$body" ] && { echo "$body"; break; }
+    sleep 1
+done
+# → {"capability": "asr", "framework": "transformers", ...}
 
-# 探针:检测应该判定为 asr
-curl -fsS http://127.0.0.1:18000/health
-# → {"capability": "asr", ...}
-
-# 拿一段 fixture 音频试转录
+# 用我们的 PR#20 合成音频 fixture 真转录
 curl -fsS -X POST http://127.0.0.1:18000/v1/audio/transcriptions \
-    -F file=@orchestrator/capability_data/fixtures/audio/tone_440hz.wav
-# → {"text": "..."}
+    -F file=@orchestrator/capability_data/fixtures/audio/a04_arpeggio_up_C_3s.wav
+# → {"text": " Thank you very much."}   ← 合成音上的幻觉,非空即可
 
-docker stop tf-runner-asr-smoke
+docker stop tf-runner-asr-smoke && docker rm tf-runner-asr-smoke
 ```
+
+**2026-05-22 nv8 实测结果**:首条请求 ~7s(weights 加载 + JIT),
+后续 ~150 ms;GPU 4 显存 ~860 MiB。所有 5 个合成 fixture 都返回
+非空文本——`non_empty_output` scorer 全部判 pass,符合 PR#20 设计。
 
 ### 12.4 加入 orchestrator 全流程
 
@@ -469,7 +493,20 @@ docker stop tf-runner-asr-smoke
 
 ### 12.5 §12 核对清单
 
-- [ ] `docker images | grep transformers-runner` 显示 `:v10` 标签
-- [ ] `--smoke` 烟测通过
-- [ ] §12.3 Whisper-tiny 联调返回非空 `text`
-- [ ] §11.1 「未就绪」状态可以从文档移除
+- [x] `docker images | grep transformers-runner` 显示 `:v10` 标签
+- [x] `bash scripts/build_transformers_runner.sh` 报 `✓ build OK`
+- [x] §12.3 Whisper-tiny 联调返回非空 `text`(2026-05-22 nv8 ✅)
+- [x] §11.1 「未就绪」状态可以从文档移除
+
+### 12.6 基底镜像选择历程(失败 → 成功)
+
+| 尝试 | 基底 | 结果 | 失败原因 |
+|---|---|---|---|
+| ① | `nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04` + pip cu124 wheels | ❌ pull 阶段就失败 | Docker Hub 国内拉镜像 manifest size mismatch;且 cu124 wheel 无 Blackwell(sm_120)kernel |
+| ② | `voipmonitor/llm-pytorch-blackwell:nightly`(本地已有) | ❌ 推理失败 | torch 2.10+cu130 在 Blackwell 上 `cublasLtMatmulAlgoGetHeuristic` 对 384×384 方阵 Linear 返回 0 算法(`CUBLAS_STATUS_NOT_INITIALIZED`),Whisper q_proj 必踩 |
+| ③ | **`vllm/vllm-openai:v0.21.0`**(本地已有,PROD vLLM 同款) | ✅ 通过 | torch 2.11+cu130 的 cublasLt catalog 完整覆盖 sm_120,Linear/Whisper/SDPA 全部正常 |
+
+**结论**:nv8 这台 Blackwell 机器的非 vLLM 容器统一以
+`vllm/vllm-openai:v0.21.0` 作为 base(它自带 torch 2.11+cu130 +
+transformers 5.8),我们只 layer 真正缺的 `diffusers / soundfile /
+librosa` 三个包。任何后续 base 升级需要重跑 §12.3 + §12.6 矩阵。
