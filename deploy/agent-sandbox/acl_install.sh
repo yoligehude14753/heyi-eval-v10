@@ -68,18 +68,50 @@ setfacl -d -m "u:$AGENT_USER:rx" "$DATA_ROOT/runs"
 # the agent from even reading them by default (no ACL grant). We do NOT add
 # any rule here on purpose — absence of grant = no access.
 
-# ── 5. verify post-state ───────────────────────────────────────────────
+# ── 5. audit log dir: NO-ACCESS to agent (INV-18) ───────────────────────
+# /var/log/heyi-eval-agent/ stores the append-only audit DB written by
+# agent_audit.py (lands in PR#22b). The agent MUST NOT read, list, write,
+# or delete anything under it — otherwise it can erase its own audit
+# trail after a misuse. We use an EXPLICIT deny ACL entry so the access
+# rule survives even if /var/log/ inherits permissive defaults from
+# /etc/profile or future install scripts.
+AUDIT_DIR="/var/log/heyi-eval-agent"
+install -d -o root -g adm -m 0750 "$AUDIT_DIR"
+log "denying all access on $AUDIT_DIR to $AGENT_USER (INV-18)"
+setfacl -m "u:$AGENT_USER:---" "$AUDIT_DIR"
+setfacl -d -m "u:$AGENT_USER:---" "$AUDIT_DIR"
+
+# Touch a placeholder audit DB so drill 4 has a target even before
+# PR#22b lands the real schema. PR#22b will replace this with the real
+# sqlite via `python -m orchestrator.agent_audit init`.
+audit_db="$AUDIT_DIR/audit.sqlite"
+if [[ ! -f "$audit_db" ]]; then
+  : >"$audit_db"
+  chown root:adm "$audit_db"
+  chmod 0640 "$audit_db"
+fi
+
+# ── 6. verify post-state ───────────────────────────────────────────────
 acl_dump() { getfacl -p "$1" 2>/dev/null | grep -E "^(user|default:user):$AGENT_USER:" || echo "(none)"; }
 log "ACL on $DATA_ROOT/store:"
 acl_dump "$DATA_ROOT/store" | sed 's/^/  /'
 log "ACL on $DATA_ROOT/runs:"
 acl_dump "$DATA_ROOT/runs" | sed 's/^/  /'
+log "ACL on $AUDIT_DIR (deny-all):"
+acl_dump "$AUDIT_DIR" | sed 's/^/  /'
 
 # negative test: ensure no `w` mask in store
 acl_str=$(getfacl -p "$DATA_ROOT/store" 2>/dev/null \
   | grep -E "^user:$AGENT_USER:" | awk -F: '{print $3}' | head -1)
 if [[ "$acl_str" == *w* ]]; then
   die "FATAL: store still writable to $AGENT_USER (acl=$acl_str)"
+fi
+
+# audit dir: agent must have NO bits (---).
+audit_str=$(getfacl -p "$AUDIT_DIR" 2>/dev/null \
+  | grep -E "^user:$AGENT_USER:" | awk -F: '{print $3}' | head -1)
+if [[ "$audit_str" != "---" ]]; then
+  die "FATAL: $AUDIT_DIR still accessible to $AGENT_USER (acl=$audit_str)"
 fi
 
 log "OK"

@@ -47,7 +47,8 @@ class TestShellSyntax(unittest.TestCase):
 
 
 class TestInv16AclScript(unittest.TestCase):
-    """INV-16: ACL install script must encode the negative invariants."""
+    """INV-16 + INV-18: ACL install script must encode the negative
+    invariants for both store/ (read-only) and audit dir (no-access)."""
 
     def setUp(self) -> None:
         self.acl = (SANDBOX_DIR / "acl_install.sh").read_text(encoding="utf-8")
@@ -75,6 +76,21 @@ class TestInv16AclScript(unittest.TestCase):
             "FATAL: store still writable",
             self.acl,
             "acl_install.sh must hard-fail when post-state still allows write on store/",
+        )
+
+    def test_audit_dir_acl_is_deny_all(self) -> None:
+        # INV-18 prerequisite: the agent must have ZERO bits on the
+        # audit dir. The ACL command must spell `:---`.
+        self.assertRegex(
+            self.acl,
+            r'setfacl[^\n]*"u:\$AGENT_USER:---"\s+"\$AUDIT_DIR"',
+            "acl_install.sh must install `u:agent:---` deny ACL on audit dir",
+        )
+        # And the post-check must hard-fail if ACL drifts.
+        self.assertIn(
+            "FATAL: $AUDIT_DIR still accessible",
+            self.acl,
+            "acl_install.sh must verify audit dir is `---` for agent",
         )
 
 

@@ -13,7 +13,7 @@ and `drills/` contains the adversarial verification scripts.
 |------------------------|-----------|--------------------------------------|
 | filesystem ACL         | INV-16    | `drills/attack_delete_store.sh`      |
 | docker access (proxy)  | INV-17    | `drills/attack_exec_prod.sh`         |
-| audit log (write-once) | INV-18    | `drills/attack_evade_audit.sh`       |
+| audit log no-access    | INV-18    | `drills/attack_evade_audit.sh`       |
 | cgroup budget          | INV-19    | `drills/attack_fork_bomb.sh` (M4)    |
 | sudoers whitelist      | INV-20    | `drills/attack_sudo_escalate.sh`     |
 
@@ -39,6 +39,10 @@ sudo docker compose -f compose.agent-socket-proxy.yml up -d
 # bind: 127.0.0.1:2377 → container 2375 (loopback only)
 sudo -u heyi-eval-agent bash drills/attack_exec_prod.sh
 # expect: "BLOCKED OK — INV-17 holds" (4 reads → 200, 7 writes → 403)
+
+# M3a — audit dir is part of acl_install.sh §5; re-running it is fine
+sudo -u heyi-eval-agent bash drills/attack_evade_audit.sh
+# expect: "BLOCKED OK — INV-18 holds" (6/6 access attempts EACCES)
 
 # M3, M4 — handled by their respective install scripts
 ```
