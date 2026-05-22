@@ -790,10 +790,34 @@ def _score_llm_judge(
     return bool(dispatched.get("judge_pass"))
 
 
+def _score_non_empty_output(
+    item: Mapping[str, Any], dispatched: Mapping[str, Any],
+) -> bool:
+    """Pass iff the dispatcher produced any non-trivial output string.
+
+    Useful for modalities where we can't author a deterministic
+    ``expected_substring`` (e.g. ASR on synthetic non-speech audio
+    fixtures, music_understanding chats whose answer is open-ended).
+
+    The bar is intentionally low — we're verifying the end-to-end
+    plumbing (server → model → response → dispatcher → record), not
+    semantic correctness. Use this scorer only when no stronger one
+    fits and document the rationale in the JSONL item's ``notes``.
+    """
+    if dispatched.get("error"):
+        return False
+    actual = dispatched.get("actual")
+    if not isinstance(actual, str):
+        return False
+    min_chars = int(item.get("min_chars", 2))
+    return len(actual.strip()) >= min_chars
+
+
 _SCORERS: dict[str, ScorerFn] = {
     "substring": _score_substring,
     "output_validity": _score_output_validity,
     "llm_judge": _score_llm_judge,
+    "non_empty_output": _score_non_empty_output,
 }
 
 
@@ -927,7 +951,6 @@ def _run_category_items(
     judge_video_first_frame: Callable[..., tuple[bool, str]] | None,
 ) -> CategoryRunResult:
     dispatcher = _DISPATCHERS[cat.dispatcher]
-    scorer = _SCORERS[cat.scorer]
     res = CategoryRunResult(
         name=cat.name, applicable=True, scorer=cat.scorer,
     )
@@ -938,6 +961,14 @@ def _run_category_items(
         item_norm = dict(item)
         item_norm.setdefault("category", cat.name)
         item_norm.setdefault("max_tokens", cat.default_max_tokens)
+        # PR#20: per-item scorer override. JSONL items may opt into a
+        # different scorer than the category default (e.g. ASR items
+        # using synthetic audio set ``scorer_override="non_empty_output"``).
+        item_scorer_name = str(item_norm.get("scorer_override") or cat.scorer)
+        if item_scorer_name not in _SCORERS:
+            item_scorer_name = cat.scorer
+        scorer = _SCORERS[item_scorer_name]
+        item_norm["_effective_scorer"] = item_scorer_name
         t0 = time.time()
         dispatched = dispatcher(
             base_url, item_norm,
@@ -954,7 +985,7 @@ def _run_category_items(
         )
         elapsed_ms = (time.time() - t0) * 1000.0
         # LLM-judge categories need a second hop. Run it before scoring.
-        if cat.scorer == "llm_judge" and not dispatched.get("error"):
+        if item_scorer_name == "llm_judge" and not dispatched.get("error"):
             judge_pass, judge_reason = _judge_dispatched(
                 cat, item_norm, dispatched,
                 judge_image=judge_image,
@@ -1036,6 +1067,11 @@ def _build_item_record(
         rec["fixture"] = item["fixture"]
     if "expected_description" in item:
         rec["expected_description"] = item["expected_description"]
+    # PR#20: persist the effective scorer so the panel + audit trail
+    # can distinguish category-default vs per-item override.
+    eff = item.get("_effective_scorer")
+    if eff:
+        rec["scorer_used"] = eff
     return rec
 
 

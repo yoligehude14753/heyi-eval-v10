@@ -31,7 +31,7 @@
       "required": ["applicable", "scorer", "score", "pass_rate", "items"],
       "properties": {
         "applicable": { "type": "boolean" },
-        "scorer": { "enum": ["substring", "output_validity", "llm_judge"] },
+        "scorer": { "enum": ["substring", "output_validity", "llm_judge", "non_empty_output"] },
         "score": { "type": "string", "pattern": "^[0-9]+/[0-9]+$" },
         "pass_rate": { "type": "number", "minimum": 0, "maximum": 1 },
         "items": {
@@ -63,7 +63,8 @@
         "judge_pass": { "type": "boolean" },
         "judge_reason": { "type": "string" },
         "error": { "type": "string" },
-        "finish_reason": { "type": "string" }
+        "finish_reason": { "type": "string" },
+        "scorer_used": { "enum": ["substring", "output_validity", "llm_judge", "non_empty_output"] }
       },
       "additionalProperties": true
     }

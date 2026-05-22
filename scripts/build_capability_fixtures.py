@@ -204,6 +204,34 @@ def write_wav_chord(
         wf.writeframes(bytes(frames))
 
 
+def write_wav_sequence(
+    path: Path, *,
+    freqs_hz: list[float], note_duration_s: float = 0.5,
+    sample_rate: int = 16000, amplitude: float = 0.5,
+    gap_s: float = 0.05,
+) -> None:
+    """Write a sequence of consecutive sine tones (mono 16-bit PCM).
+
+    Each entry in ``freqs_hz`` is played for ``note_duration_s`` followed
+    by a short ``gap_s`` of silence. Useful for music_understanding
+    prompts about pitch direction (ascending vs descending arpeggio).
+    """
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        frames = bytearray()
+        amp = int(amplitude * 32767)
+        n_note = int(note_duration_s * sample_rate)
+        n_gap = int(gap_s * sample_rate)
+        for f in freqs_hz:
+            for i in range(n_note):
+                v = int(amp * math.sin(2 * math.pi * f * i / sample_rate))
+                frames.extend(struct.pack("<h", max(-32768, min(32767, v))))
+            frames.extend(b"\x00\x00" * n_gap)
+        wf.writeframes(bytes(frames))
+
+
 # ── Image fixtures ──────────────────────────────────────────────────────────
 
 # Each entry: (filename, build_callable). build_callable(path) → None.
@@ -303,9 +331,10 @@ IMAGE_FIXTURES: list[tuple[str, callable, str]] = [  # type: ignore[type-arg]
 # ── Audio fixtures (placeholder; real CC0 speech audio TBD) ────────────────
 
 AUDIO_FIXTURES: list[tuple[str, callable, str]] = [  # type: ignore[type-arg]
-    # Pure tones — useful for music_understanding "what frequency / pitch"
-    # type prompts once a music-audio LLM is available. Marked placeholder
-    # because they are NOT real CC0 musical excerpts.
+    # Pure tones / chords / sequences. NOT real CC0 musical excerpts;
+    # purpose is to exercise the audio pipeline end-to-end and let
+    # non_empty_output scorers verify the model returns *something*
+    # coherent. Real CC0 speech / music corpora are deferred to PR#21+.
     ("audio/a01_tone_440hz_1s.wav",
      lambda p: write_wav_tone(p, freq_hz=440.0, duration_s=1.0),
      "Synthetic 440Hz sine, 1s mono 16kHz"),
@@ -316,6 +345,20 @@ AUDIO_FIXTURES: list[tuple[str, callable, str]] = [  # type: ignore[type-arg]
      lambda p: write_wav_chord(p, freqs_hz=[261.63, 329.63, 392.00],
                                 duration_s=2.0),
      "Synthetic C-major chord (C4 E4 G4), 2s mono 16kHz"),
+    ("audio/a04_arpeggio_up_C_3s.wav",
+     lambda p: write_wav_sequence(
+         p,
+         freqs_hz=[261.63, 329.63, 392.00, 523.25],
+         note_duration_s=0.6,
+     ),
+     "Synthetic ascending C-major arpeggio (C4 E4 G4 C5), ~2.6s mono 16kHz"),
+    ("audio/a05_arpeggio_down_C_3s.wav",
+     lambda p: write_wav_sequence(
+         p,
+         freqs_hz=[523.25, 392.00, 329.63, 261.63],
+         note_duration_s=0.6,
+     ),
+     "Synthetic descending C-major arpeggio (C5 G4 E4 C4), ~2.6s mono 16kHz"),
 ]
 
 

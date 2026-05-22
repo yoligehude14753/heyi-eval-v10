@@ -36,9 +36,13 @@ _EXPECTED_COUNTS: dict[str, int] = {
     "code_complete":       5,
     "vision":             10,
     "ocr":                10,
-    "asr":                 0,   # blocked: real CC0 LibriSpeech TBD
-    "video_understanding": 0,   # blocked: real CC0 video TBD
-    "music_understanding": 0,   # blocked: real CC0 music TBD
+    # PR#20: 5 plumbing-only items per audio category, using synthetic
+    # CC0 fixtures + non_empty_output scorer override. Upgraded to
+    # substring-scored corpora once real CC0 LibriSpeech/MusicCaps
+    # samples land (PR#21+).
+    "asr":                 5,
+    "music_understanding": 5,
+    "video_understanding": 0,   # blocked: real CC0 video TBD (PR#21+)
     "tts":                10,
     "image_gen":          10,
     "video_gen":          10,
@@ -124,13 +128,25 @@ class ScorerSpecificFields(unittest.TestCase):
     """Each scorer needs different fields on items. Enforce them."""
 
     def test_substring_scored_items_have_expected_substring(self):
-        # Categories using scorer=substring (per CATEGORY_REGISTRY)
+        # Categories using scorer=substring (per CATEGORY_REGISTRY).
+        # PR#20: items may opt-out via scorer_override; only items that
+        # actually score with substring need expected_substring.
         substring_cats = [
             c.name for c in capability.CATEGORY_REGISTRY
             if c.scorer == "substring"
         ]
         for cat in substring_cats:
             for item in _load_items(cat):
+                override = item.get("scorer_override")
+                if override and override != "substring":
+                    # Item declares it's scored by something else.
+                    # PR#20: every override must point to a real scorer.
+                    self.assertIn(
+                        override, capability._SCORERS,
+                        f"{cat}/{item['id']}: unknown scorer_override "
+                        f"{override!r}",
+                    )
+                    continue
                 self.assertIn(
                     "expected_substring", item,
                     f"{cat}/{item['id']} (substring-scored) missing "

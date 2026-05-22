@@ -3,3 +3,5 @@
 a01_tone_440hz_1s.wav	CC0/synthetic	Synthetic 440Hz sine, 1s mono 16kHz
 a02_tone_880hz_1s.wav	CC0/synthetic	Synthetic 880Hz sine, 1s mono 16kHz
 a03_chord_C_major_2s.wav	CC0/synthetic	Synthetic C-major chord (C4 E4 G4), 2s mono 16kHz
+a04_arpeggio_up_C_3s.wav	CC0/synthetic	Synthetic ascending C-major arpeggio (C4 E4 G4 C5), ~2.6s mono 16kHz
+a05_arpeggio_down_C_3s.wav	CC0/synthetic	Synthetic descending C-major arpeggio (C5 G4 E4 C4), ~2.6s mono 16kHz

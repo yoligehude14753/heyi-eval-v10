@@ -324,7 +324,10 @@ sudo systemctl restart heyi-eval-orchestrator
 
 ## 11 · 已知限制(PR#15 多模态架构落地后,2026-05)
 
-### 11.1 transformers-runner 镜像 (PR#19 引入,需在 nv8 上构建)
+### 11.1 (历史) transformers-runner 镜像 → 见 §12
+
+> PR#19 已交付源码 + 构建脚本;首次部署见 §12。本节保留为"何时彻底完工"
+> 的 checkbox。下面是 PR#19 实际状态:
 
 `orchestrator/stages_py.py::_ENGINE_IMAGES["transformers"]` 指向
 `heyi-eval/transformers-runner:v10`,PR#19 已经把镜像源码落地在
@@ -357,6 +360,27 @@ PR#15 的 tts / image_gen / video_gen / music_gen dispatcher 会把
 长期会在 `~/heyi-eval-data/runs/*/` 下累积。
 
 **何时解除**:PR#18 面板会展示这些 artifact;到时考虑 14 天后自动归档/删除。
+
+### 11.3 (PR#20) audio category 仅作 plumbing 烟测
+
+PR#20 把 `asr.jsonl` / `music_understanding.jsonl` 从空文件填充到 5+5 个
+items,但所有 items 都用合成正弦波 WAV 作 fixture(`a01_tone_440hz...`、
+`a04_arpeggio_up...` 等),内容非真实语音/音乐。
+
+为此,这 10 个 items 都通过 **新增的 `scorer_override="non_empty_output"`**
+机制把默认 substring 评分换成"模型只要返回非空字符串即视为通过"。
+这等于把这一波 audio category 当作**端到端管道烟测**——它能验证:
+
+- DEPLOY 阶段是否拉起了 ASR/音频 LLM 容器
+- dispatcher → HTTP → model → response 整条链路是否闭环
+- 是否生成了合规的 CategoryRunResult
+
+它**无法**验证模型的 ASR / 音乐理解准确度。真正的精度评估需要在
+PR#21+ 接入 CC0 LibriSpeech / MusicCaps 样本后,把 `scorer_override`
+去掉,改回 `substring`。
+
+`video_understanding` 仍然 N/A(无 stdlib 生成 MP4 的路径,真 CC0
+视频还在 PR#21+ 排期)。
 
 ---
 
