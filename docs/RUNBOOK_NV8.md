@@ -216,3 +216,106 @@ sudo systemctl daemon-reload
 - [ ] 演练全程不影响产线 LLM 流量(用 panel 或外部探活验证)
 
 任何一项 ✗ → 写一段 incident 记录到 `docs/INCIDENTS.md`,标记 RCA-required,再重跑相关 step。
+
+---
+
+## 10 · 产线临时切到 TP=8 时,验证 graceful skip(PR#11 引入)
+
+> 仅在运维真把产线切到 K2.6 TP=8(占满 GPU 0-7)时跑这一节。常态(M2.7 TP=4 占 0-3)不需要做。
+> 目的:确认评估管道**自动避让**而不抢卡,run 标 `ABORTED` 而非 `FAILED`。
+
+### 10.1 准备:确认产线确实占满了
+
+```bash
+docker inspect minimax 2>/dev/null | jq '.[0].HostConfig.DeviceRequests' || \
+    docker inspect kimi-k26 | jq '.[0].HostConfig.DeviceRequests'
+
+nvidia-smi --query-gpu=index,memory.used --format=csv,noheader
+```
+
+通过标准:GPU 0-7 全部 memory.used > 50 GiB(产线分摊占用)。
+失败时:运维还没切完,等切完再跑;或者根本没切,跳过本节。
+
+### 10.2 告诉评估管道"产线在 TP=8 临时态"
+
+```bash
+sudo tee -a /etc/heyi-eval-v10/env > /dev/null <<EOF
+# 临时:产线切到 K2.6 TP=8,占满 0-7
+HEYI_EVAL_PROD_ENGINE_CONTAINER=kimi-k26
+HEYI_EVAL_PROD_ENGINE_GPUS=0,1,2,3,4,5,6,7
+EOF
+
+sudo systemctl restart heyi-eval-orchestrator
+```
+
+通过标准:`systemctl status heyi-eval-orchestrator` 显示 `Active: active (running)`。
+失败时:env 文件语法错或 systemctl 拉不起来 → `journalctl -u heyi-eval-orchestrator -n 50`。
+
+### 10.3 enqueue 一个真模型,观察 graceful skip
+
+```bash
+cd /home/ai/heyi-eval-v10
+.venv/bin/python -m orchestrator enqueue Qwen/Qwen2.5-0.5B-Instruct
+.venv/bin/python -m orchestrator run --once 2>&1 | tee /tmp/k28_drill.log
+```
+
+期望日志关键节点:
+- `[DISCOVER] OK` → `[CURATE] OK` → `[METADATA] OK` → `[ENGINE_SELECT] OK`
+- `[DEPLOY] starting` → `[DEPLOY] SKIPPED (graceful): eval pool ... overlaps prod_engine_gpus ...`
+- `[run] <run_id> aborted at DEPLOY: ...`
+- 没有 docker run 调用 (容器列表中无新 `e9-*`)
+
+通过标准:
+```bash
+grep -E "SKIPPED \(graceful\)|aborted at DEPLOY" /tmp/k28_drill.log
+docker ps --format '{{.Names}}' | grep '^e9-' || echo "no e9-* spawned (correct)"
+```
+
+应输出 graceful 提示行,且**无** `e9-*` 容器。
+
+### 10.4 outbox 应该写了 run_aborted 事件(不是 run_failed)
+
+```bash
+tail -1 /home/ai/heyi-eval-data/notify_outbox.jsonl | jq '{event_type, level, body}'
+```
+
+通过标准:
+```json
+{
+  "event_type": "run_aborted",
+  "level": "warn",
+  "body": "stage=DEPLOY\nreason=eval pool ... overlaps prod_engine_gpus ..."
+}
+```
+
+`level=warn` 而非 `error`,`event_type=run_aborted` 而非 `run_failed` — 这是 PR#11 的核心契约,防止运维一看到告警就以为产线坏了。
+
+### 10.5 验证产线没受任何影响
+
+```bash
+docker inspect "${HEYI_EVAL_PROD_ENGINE_CONTAINER:-kimi-k26}" \
+    --format '{{.State.Status}}'
+nvidia-smi --query-gpu=index,memory.used --format=csv,noheader
+```
+
+通过标准:产线容器仍 `running`,GPU 占用与 10.1 snapshot 一致(±1 GiB 容差)。
+
+### 10.6 产线切回 M2.7 后,清理 env override 并验恢复
+
+运维把产线切回稳态后:
+
+```bash
+sudo sed -i '/^HEYI_EVAL_PROD_ENGINE_CONTAINER=kimi-k26$/d' /etc/heyi-eval-v10/env
+sudo sed -i '/^HEYI_EVAL_PROD_ENGINE_GPUS=0,1,2,3,4,5,6,7$/d' /etc/heyi-eval-v10/env
+sudo systemctl restart heyi-eval-orchestrator
+```
+
+重新 enqueue 同一个模型,这次应该走完整 9 stage(回到 §2 通过标准)。
+
+### 10.7 §10 核对清单
+
+- [ ] 10.3 日志含 `SKIPPED (graceful)` + `aborted at DEPLOY`
+- [ ] 10.3 没有任何 `e9-*` 容器被 spawn
+- [ ] 10.4 outbox 有 `event_type=run_aborted` `level=warn`
+- [ ] 10.5 产线容器和 GPU 占用未变化
+- [ ] 10.6 切回稳态后能正常跑 9 stage
