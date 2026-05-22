@@ -9,13 +9,13 @@ The agent runs as a dedicated Linux user `heyi-eval-agent` whose effective
 privileges are constrained by four mechanisms; INV-16~20 each pins one of them
 and `drills/` contains the adversarial verification scripts.
 
-| Layer                  | Pinned by  | Drill                                |
-|------------------------|-----------|--------------------------------------|
-| filesystem ACL         | INV-16    | `drills/attack_delete_store.sh`      |
-| docker access (proxy)  | INV-17    | `drills/attack_exec_prod.sh`         |
-| audit log no-access    | INV-18    | `drills/attack_evade_audit.sh`       |
-| cgroup budget          | INV-19    | `drills/attack_fork_bomb.sh` (M4)    |
-| sudoers whitelist      | INV-20    | `drills/attack_sudo_escalate.sh`     |
+| Layer                  | Pinned by  | Drill                                  |
+|------------------------|-----------|----------------------------------------|
+| filesystem ACL         | INV-16    | `drills/attack_delete_store.sh`        |
+| docker access (proxy)  | INV-17    | `drills/attack_exec_prod.sh`           |
+| audit log no-access    | INV-18    | `drills/attack_evade_audit.sh`         |
+| cgroup + watchdog      | INV-19    | `drills/attack_resource_budget.sh`     |
+| sudoers + identity     | INV-20    | `drills/attack_sudo_escalate.sh`       |
 
 All `drills/*.sh` MUST run as `heyi-eval-agent` (use `sudo -u heyi-eval-agent`)
 and MUST exit non-zero when the protection works (i.e. the attack is blocked).
@@ -43,6 +43,16 @@ sudo -u heyi-eval-agent bash drills/attack_exec_prod.sh
 # M3a — audit dir is part of acl_install.sh §5; re-running it is fine
 sudo -u heyi-eval-agent bash drills/attack_evade_audit.sh
 # expect: "BLOCKED OK — INV-18 holds" (6/6 access attempts EACCES)
+
+# M4
+sudo install -m 0644 ../systemd/heyi-eval-agent.slice    /etc/systemd/system/
+sudo install -m 0644 ../systemd/heyi-eval-agent@.service /etc/systemd/system/
+sudo systemd-analyze verify /etc/systemd/system/heyi-eval-agent@.service /etc/systemd/system/heyi-eval-agent.slice
+sudo systemctl daemon-reload
+sudo bash drills/attack_resource_budget.sh
+# expect: "BLOCKED OK — INV-19 holds"
+#   5a: kernel cgroup-pids events ≥ 1
+#   5b: RuntimeMaxSec watchdog kills sleep-300 in ≤ 15s
 
 # M3, M4 — handled by their respective install scripts
 ```
