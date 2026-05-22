@@ -389,7 +389,9 @@ def execute_deploy(
         port = cfg.vllm_port  # one port for now; future PRs may multiplex
         model_in_container = "/model"
 
-        vllm_args = plan.get("vllm_args") or {}
+        vllm_args = dict(plan.get("vllm_args") or {})
+        # Always serve under a fixed name so capability.py can hardcode "evaluated".
+        vllm_args.setdefault("served_model_name", "evaluated")
         tp_size = int(vllm_args.get("tensor_parallel_size", 1) or 1)
 
         # GPU isolation gate (PR#11): pick the eval-pool GPUs we'll bind
