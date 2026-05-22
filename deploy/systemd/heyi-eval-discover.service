@@ -3,6 +3,8 @@ Description=heyi-eval-v10 HF model discovery tracker (loop mode)
 Documentation=https://github.com/yoligehude14753/heyi-eval-v10/blob/main/docs/PR7b_TEST_PLAN.md
 After=network-online.target
 Wants=network-online.target
+StartLimitBurst=5
+StartLimitIntervalSec=600s
 
 [Service]
 Type=simple
@@ -13,8 +15,6 @@ EnvironmentFile=-/etc/heyi-eval-v10/env
 ExecStart=/home/ai/heyi-eval-v10/.venv/bin/python -m discover loop
 Restart=on-failure
 RestartSec=30s
-StartLimitBurst=5
-StartLimitIntervalSec=600s
 # discover is HF-Hub-bound, lower priority than orchestrator main loop.
 Nice=15
 IOSchedulingClass=best-effort

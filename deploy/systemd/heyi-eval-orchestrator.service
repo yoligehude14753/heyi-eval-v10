@@ -3,6 +3,8 @@ Description=heyi-eval-v10 orchestrator main loop (DISCOVER → CURATE → ... �
 Documentation=https://github.com/yoligehude14753/heyi-eval-v10/blob/main/docs/PR7b_TEST_PLAN.md
 After=network-online.target
 Wants=network-online.target
+StartLimitBurst=5
+StartLimitIntervalSec=300s
 
 [Service]
 Type=simple
@@ -16,8 +18,6 @@ EnvironmentFile=-/etc/heyi-eval-v10/env
 ExecStart=/home/ai/heyi-eval-v10/.venv/bin/python -m orchestrator loop
 Restart=on-failure
 RestartSec=10s
-StartLimitBurst=5
-StartLimitIntervalSec=300s
 # Yield to heyi_engine production traffic (INV-1).
 Nice=10
 IOSchedulingClass=best-effort
