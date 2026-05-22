@@ -1,0 +1,16 @@
+# Production heyi_engine container names that the eval pipeline must NEVER
+# reference, import, mount, exec into, or include in any kind of probe/list/
+# control loop. INV-1.
+#
+# Source of truth: hand-maintained by the operator from `docker ps` on nv8.
+# Lines starting with '#' are comments. Blank lines ignored.
+#
+# Format: one container name per line. Substring match (case-sensitive).
+#
+# Update when production set changes. CI runs tests/test_inv_production_isolation.py
+# which greps the codebase for any of these strings outside of allowed-path docs.
+minimax-m2.7
+glm-5.1
+kimi-k2.6
+voipmonitor
+xrouter

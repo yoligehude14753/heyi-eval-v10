@@ -17,6 +17,9 @@ venv/
 data/
 runs/
 heyi-eval-data/
+# but the tests/data/ test fixtures directory IS tracked (small text fixtures).
+!tests/data/
+!tests/data/**
 *.sqlite
 *.db
 *.jsonl

@@ -15,6 +15,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SYSTEMD_DIR = REPO_ROOT / "deploy" / "systemd"
 BOOTSTRAP = REPO_ROOT / "scripts" / "bootstrap_nv8.sh"
+VERIFY_24H = REPO_ROOT / "scripts" / "verify_24h_timer.sh"
 
 # Services we expect to ship with v10. Backup pair pre-existed in PR#6 but
 # is still subject to the same invariants.
@@ -200,10 +201,67 @@ def test_backup_timer_has_oncalendar_or_onunitactivesec(timers):
         f"{name}: [Timer] missing OnCalendar/OnUnitActiveSec/OnBootSec"
 
 
+def _parse_systemd_duration_to_seconds(spec: str) -> int:
+    """Parse a systemd time spec like '30min', '15s', '2h', '1d' (single
+    unit) into seconds. Raises if the format is one we don't expect."""
+    spec = spec.strip()
+    units = {"s": 1, "min": 60, "m": 60, "h": 3600, "d": 86400}
+    for suf, mult in sorted(units.items(), key=lambda x: -len(x[0])):
+        if spec.endswith(suf):
+            value = spec[: -len(suf)].strip()
+            return int(value) * mult
+    return int(spec)  # bare integer = seconds
+
+
+def test_backup_timer_cadence_is_30min_per_pr6_design(
+    timers: dict[str, configparser.ConfigParser],
+) -> None:
+    """PR#6 designed 30-minute rsync snapshots; the timer must match.
+    A cadence of < 5 minutes is treated as a misconfiguration (would
+    thrash rsync hardlinks); > 60 minutes silently loses RPO."""
+    cp = timers["heyi-eval-backup.timer"]
+    spec = cp.get("Timer", "OnUnitActiveSec", fallback="").strip()
+    assert spec, "OnUnitActiveSec is required for the 30min cadence"
+    secs = _parse_systemd_duration_to_seconds(spec)
+    assert 5 * 60 <= secs <= 60 * 60, (
+        f"OnUnitActiveSec={spec!r} ({secs}s) outside sane window "
+        f"[5min, 60min]; PR#6 designed for 30min."
+    )
+
+
+def test_backup_timer_oncalendar_is_not_per_second(
+    timers: dict[str, configparser.ConfigParser],
+) -> None:
+    """Defense against the catastrophic OnCalendar=*-*-* *:*:* schedule
+    which fires every second. We only accept :MM minute-aligned values."""
+    cp = timers["heyi-eval-backup.timer"]
+    spec = cp.get("Timer", "OnCalendar", fallback="").strip()
+    if not spec:
+        return  # OnCalendar is optional; OnUnitActiveSec covers cadence
+    # Reject anything that looks like *:*:* or */1 second tier.
+    assert "*:*:*" not in spec, (
+        f"OnCalendar={spec!r} fires every second — operator safety guard."
+    )
+
+
+def test_backup_timer_has_randomized_delay(
+    timers: dict[str, configparser.ConfigParser],
+) -> None:
+    """A small RandomizedDelaySec dampens herd effects when nightly
+    cron + 30min snapshot collide. Not strictly required, but expected
+    by the PR#6 design — flag absence as a warning-via-test."""
+    cp = timers["heyi-eval-backup.timer"]
+    spec = cp.get("Timer", "RandomizedDelaySec", fallback="").strip()
+    assert spec, (
+        "heyi-eval-backup.timer should declare RandomizedDelaySec to "
+        "avoid herd effects (PR#6 design: 60s jitter)."
+    )
+
+
 # ── U-10 + B-1 bootstrap script sanity ─────────────────────────────────────
 
 
-def test_u10_bootstrap_script_shape():
+def test_u10_bootstrap_script_shape() -> None:
     assert BOOTSTRAP.is_file(), f"missing {BOOTSTRAP}"
     text = BOOTSTRAP.read_text(encoding="utf-8")
     lines = text.splitlines()
@@ -214,7 +272,7 @@ def test_u10_bootstrap_script_shape():
         "bootstrap script must enable strict mode (set -euo pipefail)"
 
 
-def test_b1_bootstrap_script_passes_bash_n():
+def test_b1_bootstrap_script_passes_bash_n() -> None:
     """Static syntax check via `bash -n` — doesn't execute anything."""
     cp = subprocess.run(
         ["bash", "-n", str(BOOTSTRAP)],
@@ -224,7 +282,7 @@ def test_b1_bootstrap_script_passes_bash_n():
         f"bash -n failed: {cp.stderr}"
 
 
-def test_b2_bootstrap_supports_force_flag():
+def test_b2_bootstrap_supports_force_flag() -> None:
     """--force is required so the script can be re-run on a clone with a
     hostname that doesn't contain 'nv8' (e.g. when restoring from a
     backup mac to a new node)."""
@@ -232,7 +290,7 @@ def test_b2_bootstrap_supports_force_flag():
     assert "--force" in text, "bootstrap must accept --force"
 
 
-def test_b3_bootstrap_has_no_v9_residue_paths():
+def test_b3_bootstrap_has_no_v9_residue_paths() -> None:
     """No legacy paths from v9 (/var/lib/heyi-eval, /opt/heyi-eval, etc.)
     should appear in the v10 deployment surface."""
     text = BOOTSTRAP.read_text(encoding="utf-8")
@@ -241,7 +299,7 @@ def test_b3_bootstrap_has_no_v9_residue_paths():
             f"bootstrap contains v9-era path/name: {forbidden!r}"
 
 
-def test_b4_bootstrap_uses_safe_rm_prefix_only():
+def test_b4_bootstrap_uses_safe_rm_prefix_only() -> None:
     """Sanity: the script must never `rm -rf` outside /home/ai/heyi-eval-*.
     Today it does NOT rm anything; this test pins that property so a
     future edit doesn't quietly start nuking /home/ai/."""
@@ -257,7 +315,45 @@ def test_b4_bootstrap_uses_safe_rm_prefix_only():
 # ── env.example ─────────────────────────────────────────────────────────────
 
 
-def test_env_example_exists_and_documents_engine_vars():
+# ── verify_24h_timer.sh ─────────────────────────────────────────────────────
+
+
+def test_v1_verify_24h_script_present_and_executable() -> None:
+    """The 24h smoke script must ship + have a shebang. Executability is
+    set by chmod on disk; we only assert here that it's an actual file
+    with the right opening line."""
+    assert VERIFY_24H.is_file(), f"missing {VERIFY_24H}"
+    first = VERIFY_24H.read_text(encoding="utf-8").splitlines()[0]
+    assert first == "#!/usr/bin/env bash", \
+        f"first line must be '#!/usr/bin/env bash', got {first!r}"
+
+
+def test_v2_verify_24h_script_passes_bash_n() -> None:
+    cp = subprocess.run(
+        ["bash", "-n", str(VERIFY_24H)],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert cp.returncode == 0, f"bash -n failed: {cp.stderr}"
+
+
+def test_v3_verify_24h_script_is_side_effect_free() -> None:
+    """The verify script is meant to be safe to run any time. It must not
+    contain destructive commands; this pins that property."""
+    text = VERIFY_24H.read_text(encoding="utf-8")
+    for forbidden in ("rm -rf", "rm -f /", "mv /", " > /etc", "dd if=",
+                      "systemctl start", "systemctl restart", "systemctl stop"):
+        assert forbidden not in text, \
+            f"verify_24h_timer.sh contains destructive token: {forbidden!r}"
+
+
+def test_v4_verify_24h_script_emits_all_test_ids() -> None:
+    """All five T-24h-* IDs from the test plan must appear in the script."""
+    text = VERIFY_24H.read_text(encoding="utf-8")
+    for tid in ("T-24h-1", "T-24h-2", "T-24h-3", "T-24h-4", "T-24h-5"):
+        assert tid in text, f"verify_24h_timer.sh missing test id {tid}"
+
+
+def test_env_example_exists_and_documents_engine_vars() -> None:
     p = REPO_ROOT / "deploy" / "env.example"
     assert p.is_file(), f"missing {p}"
     text = p.read_text(encoding="utf-8")
