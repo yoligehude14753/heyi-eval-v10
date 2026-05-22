@@ -510,3 +510,81 @@ docker stop tf-runner-asr-smoke && docker rm tf-runner-asr-smoke
 `vllm/vllm-openai:v0.21.0` 作为 base(它自带 torch 2.11+cu130 +
 transformers 5.8),我们只 layer 真正缺的 `diffusers / soundfile /
 librosa` 三个包。任何后续 base 升级需要重跑 §12.3 + §12.6 矩阵。
+
+## 13 · Agent sandbox 部署(PR#22a)
+
+PR#22a 在 nv8 上落地了一个用来跑 Claude Code agent 的隔离沙箱(详见
+`docs/INVARIANTS.md` §INV-16~20 与 `deploy/agent-sandbox/README.md`)。
+v9 时代 agent 直接以 `ai` 用户跑——而 `ai` 在 `docker` + `sudo` 组,
+导致 `docker exec minimax bash -c 'rm -rf /'` 等事故可以一行命令发起。
+v10 的 PR#22a 把 agent 钉死在 `heyi-eval-agent` 这个无 docker / 无
+sudo / 无登录的系统账号下,Docker API 走只读 socket-proxy,cgroup +
+RuntimeMaxSec 守住资源,五层防御彼此独立。
+
+### 13.1 一次性部署
+
+`scripts/bootstrap_nv8.sh` 第 4b 阶段会跑 §13 全部步骤,首次部署
+直接:
+
+```bash
+sudo -u ai bash /home/ai/heyi-eval-v10/scripts/bootstrap_nv8.sh
+```
+
+如果仅升级 sandbox 部分(没动 orchestrator),可以只手跑:
+
+```bash
+cd /home/ai/heyi-eval-v10/deploy/agent-sandbox
+sudo bash setup_agent_user.sh
+sudo bash acl_install.sh
+sudo install -m 0440 sudoers.d/heyi-eval-agent /etc/sudoers.d/heyi-eval-agent
+sudo visudo -c -f /etc/sudoers.d/heyi-eval-agent
+sudo docker compose -f compose.agent-socket-proxy.yml up -d
+sudo install -m 0644 ../systemd/heyi-eval-agent.slice    /etc/systemd/system/
+sudo install -m 0644 ../systemd/heyi-eval-agent@.service /etc/systemd/system/
+sudo systemd-analyze verify /etc/systemd/system/heyi-eval-agent@.service \
+    /etc/systemd/system/heyi-eval-agent.slice
+sudo systemctl daemon-reload
+```
+
+### 13.2 验证沙箱五层
+
+`drills/run_all.sh` 顺序跑 5 个攻击演练,任一 BREACH 立刻 exit 1:
+
+```bash
+sudo bash /home/ai/heyi-eval-v10/deploy/agent-sandbox/drills/run_all.sh
+```
+
+期望输出尾部:
+
+```
+ALL 5 DRILLS PASSED — INV-16/17/18/19/20 hold end-to-end
+  drill-1 rc=0   # store deletion blocked (filesystem ACL)
+  drill-2 rc=0   # docker exec into minimax blocked (socket proxy 403)
+  drill-3 rc=0   # sudo escalation blocked (whitelist denies forbidden)
+  drill-4 rc=0   # audit log evasion blocked (deny-all ACL)
+  drill-5 rc=0   # fork-bomb cgroup-capped + RuntimeMaxSec watchdog
+```
+
+任何一项 BREACH = 沙箱漏洞,**不要继续 PR#22b 接入 agent**,先回到
+`deploy/agent-sandbox/` 排查。
+
+### 13.3 常见排错
+
+| 症状                                            | 根因 / 处理 |
+|------------------------------------------------|---|
+| `useradd: user 'heyi-eval-agent' exists`(idempotent OK) | setup_agent_user.sh 是幂等的,第二次跑就是 normalise,不报错 |
+| drill 1 报 `权限不够` 在 drill 脚本本身          | `/home/ai` 是 `0750 ai:ai` → agent 用户连 traverse 都不能;acl_install.sh §0 加了 `setfacl -m u:heyi-eval-agent:x /home/ai`(只通过,不可 ls)。重跑 acl_install.sh 修复 |
+| `docker compose up` 后 proxy 容器 restart-loop  | tecnativa 镜像需要写 `/tmp/haproxy.cfg` + `/run/haproxy.pid`;compose 里已经声明 `tmpfs:/tmp size=8m + /run size=4m`,**不要**给 `/var/run/docker.sock` 加 `:ro`(unix socket 双向,会让 haproxy 永远阻塞);也不要把 `pids_limit` 降到 64 以下(haproxy worker fork 会 EAGAIN) |
+| drill 2 显示 `read -> 5xx`                       | proxy 还没 healthy,等 6 秒再跑;或 `docker logs heyi-eval-agent-socket-proxy` 看真实状态 |
+| drill 5 在 ssh 远端"无声卡住"超过 30 秒          | 不要用 `systemd-run --wait` 经 ssh+sudo+pipe 调用 — fd 继承让 ssh channel 不关。drill 已经改用 detach + `systemctl is-active` 轮询;若再卡,kill ssh 子进程 + 直接登录 nv8 跑 `bash deploy/agent-sandbox/drills/attack_resource_budget.sh > /tmp/drill5.out 2>&1` |
+| drill 4 报 `BREACH cat audit.sqlite succeeded`  | INV-18 被破:看 `getfacl /var/log/heyi-eval-agent`,正确状态是 `user:heyi-eval-agent:---`(default ACL 也要 `---`);重跑 acl_install.sh §5 修复 |
+
+### 13.4 §13 核对清单
+
+- [x] `id heyi-eval-agent` 不含 `docker` / `sudo` / `wheel` / `adm`
+- [x] `getfacl /home/ai/heyi-eval-data/store` 显示 `user:heyi-eval-agent:r-x`(不含 `w`)
+- [x] `getfacl /var/log/heyi-eval-agent` 显示 `user:heyi-eval-agent:---`
+- [x] `curl http://127.0.0.1:2377/_ping` 返回 `OK`,`curl -X POST .../containers/minimax/stop` 返回 `403`
+- [x] `systemctl list-unit-files heyi-eval-agent@.service` 显示 `static`
+- [x] `bash deploy/agent-sandbox/drills/run_all.sh` 退出 0,5/5 BLOCKED OK
+- [ ] (推迟到 PR#22b)`heyi-eval-agent-run` 脚本接入 + audit daemon 注入
