@@ -71,7 +71,7 @@ cd /home/ai/heyi-eval-v10
 .venv/bin/python -m orchestrator enqueue Qwen/Qwen2.5-0.5B-Instruct
 
 # 然后人手跑一轮 pipeline (不走 systemd 自动循环):
-.venv/bin/python -m orchestrator run --once
+.venv/bin/python -m orchestrator run
 ```
 
 **期望日志关键节点**:
@@ -256,7 +256,7 @@ sudo systemctl restart heyi-eval-orchestrator
 ```bash
 cd /home/ai/heyi-eval-v10
 .venv/bin/python -m orchestrator enqueue Qwen/Qwen2.5-0.5B-Instruct
-.venv/bin/python -m orchestrator run --once 2>&1 | tee /tmp/k28_drill.log
+.venv/bin/python -m orchestrator run 2>&1 | tee /tmp/k28_drill.log
 ```
 
 期望日志关键节点:
