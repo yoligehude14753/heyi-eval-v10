@@ -392,6 +392,59 @@ def _default_downloader(*, repo_id: str, local_dir: str,
 # ── pipeline entrypoint ───────────────────────────────────────────────────
 
 
+def _run_downloader_with_timeout(
+    dl: Downloader,
+    *,
+    repo_id: str,
+    local_dir: str,
+    max_workers: int,
+    allow_patterns: list[str] | None,
+    timeout_s: float | None,
+) -> None:
+    """Invoke ``dl`` with a wall-clock budget.
+
+    PR#34c: when huggingface_hub.snapshot_download retries against a flaky
+    mirror, it can sit in epoll_wait against CLOSE-WAIT sockets for hours
+    without making progress (we observed gemma-4-26B stuck at 6.5 GB for
+    56 minutes with no orchestrator log activity). The HF library has no
+    "total time budget" parameter, so we enforce one externally with a
+    daemon thread + join(timeout).
+
+    On timeout we raise ``TimeoutError`` so the caller can run
+    ``_cleanup_partial`` and surface a hard-fail to the Panel. The download
+    thread itself is left as a daemon — it will be reaped at process exit;
+    we accept this trade-off because Python lacks a portable way to
+    interrupt a blocking I/O call from another thread.
+    """
+    if timeout_s is None or timeout_s <= 0:
+        dl(repo_id=repo_id, local_dir=local_dir, max_workers=max_workers,
+           allow_patterns=allow_patterns)
+        return
+
+    import threading
+    holder: dict[str, Any] = {}
+
+    def _worker() -> None:
+        try:
+            dl(
+                repo_id=repo_id, local_dir=local_dir,
+                max_workers=max_workers, allow_patterns=allow_patterns,
+            )
+            holder["ok"] = True
+        except BaseException as e:
+            holder["err"] = e
+
+    t = threading.Thread(target=_worker, name="hf-snapshot-dl", daemon=True)
+    t.start()
+    t.join(timeout=timeout_s)
+    if t.is_alive():
+        raise TimeoutError(
+            f"snapshot_download exceeded wall-clock budget of {timeout_s:.0f}s"
+        )
+    if "err" in holder:
+        raise holder["err"]
+
+
 def ensure_model_staged(
     *,
     hf_id: str,
@@ -404,6 +457,7 @@ def ensure_model_staged(
     headroom_floor_bytes: int = 5 * 1024 * 1024 * 1024,
     allow_patterns: list[str] | None = None,
     max_workers: int = 8,
+    download_timeout_s: float | None = None,
     now: Callable[[], float] = time.time,
 ) -> StageModelResult:
     """Synchronously ensure ``hf_id`` is fully staged at ``target_dir``.
@@ -481,10 +535,25 @@ def ensure_model_staged(
     target_dir.mkdir(parents=True, exist_ok=True)
     dl = downloader or _default_downloader
     try:
-        dl(
+        _run_downloader_with_timeout(
+            dl,
             repo_id=hf_id,
             local_dir=str(target_dir),
             max_workers=max_workers,
+            allow_patterns=effective_allow,
+            timeout_s=download_timeout_s,
+        )
+    except TimeoutError as e:
+        # Wall-clock budget exhausted (PR#34c). Treat exactly like a
+        # download_failed: clean up the partial, hard-fail the run.
+        freed = _cleanup_partial(target_dir)
+        return StageModelResult(
+            ok=False, skipped=False,
+            error=f"snapshot_download timeout: {e}",
+            error_kind="download_timeout",
+            duration_s=now() - t0,
+            target_dir=str(target_dir),
+            bytes_freed=freed,
             allow_patterns=effective_allow,
         )
     except Exception as e:

@@ -136,6 +136,18 @@ _SUPPORTED_PIPELINE_TAGS = {
     # "text-to-image", "text-to-video",
 }
 
+# Library names that indicate the repo is a convenience bundle of unrelated
+# models or a non-LLM ecosystem (ComfyUI nodes, diffusion-single-file packs,
+# raw .safetensors weights without a tokenizer, etc.). PR#34a: discovered
+# during the WanVideo_comfy incident where one repo dragged 142 GB of
+# unrelated text-to-video model variants into the cache.
+_REJECTED_LIBRARIES = {
+    "diffusion-single-file",
+    "ComfyUI",
+    "comfyui",
+    "diffusers-single-file",
+}
+
 
 def _enqueue_policy_passes(c, args) -> tuple[bool, str]:
     """Return (allow, reason) for a candidate. reason is human-readable."""
@@ -143,6 +155,8 @@ def _enqueue_policy_passes(c, args) -> tuple[bool, str]:
         return False, "private/gated"
     if c.pipeline_tag and c.pipeline_tag not in _SUPPORTED_PIPELINE_TAGS:
         return False, f"pipeline_tag={c.pipeline_tag}"
+    if c.library_name and c.library_name in _REJECTED_LIBRARIES:
+        return False, f"library_name={c.library_name}"
     # need at least *some* recency signal
     if (c.downloads or 0) < args.min_downloads and (c.likes or 0) < args.min_likes:
         return False, f"low signal (dl={c.downloads} likes={c.likes})"

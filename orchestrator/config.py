@@ -106,6 +106,14 @@ class OrchestratorConfig:
         os.environ.get("HEYI_EVAL_DEPLOY_REPAIR_AGENT_TIMEOUT_S", "90")
     )
 
+    # PR#34c: wall-clock budget for snapshot_download inside STAGE_MODEL.
+    # Default 30 min — long enough for legitimate ~50 GB downloads on the
+    # hf-mirror, short enough to surface a CLOSE-WAIT hang as a real
+    # failure instead of pinning the queue. Set 0 to disable the budget.
+    stage_model_download_timeout_s: float = float(
+        os.environ.get("HEYI_EVAL_STAGE_MODEL_TIMEOUT_S", "1800")
+    )
+
     # HF mirror endpoint
     hf_endpoint: str = os.environ.get("HF_ENDPOINT", "https://hf-mirror.com")
 

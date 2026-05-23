@@ -409,9 +409,56 @@ def _has_recent_successful_run(store: Store, hf_id: str, *, within_days: int = 3
     return False
 
 
+def _hf_ids_in_queue(store: Store) -> set[str]:
+    """Read queue.jsonl and return the set of hf_ids currently pending."""
+    qp = queue_path(store)
+    if not qp.exists():
+        return set()
+    out: set[str] = set()
+    import json as _json
+    for raw in qp.read_text(encoding="utf-8").splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            out.add(_json.loads(raw).get("hf_id", ""))
+        except Exception:
+            continue
+    out.discard("")
+    return out
+
+
+def _hf_ids_in_progress(store: Store) -> set[str]:
+    """Return the set of hf_ids currently active in the DB.
+
+    Includes both ``pending`` and ``in_progress`` since both consume a
+    slot and would cause duplicate work if re-enqueued. We deliberately
+    exclude terminal states (``ok``, ``failed``, ``aborted``) — a
+    failed run is allowed to be retried by re-enqueue.
+    """
+    rows = store.list_runs(limit=500)
+    return {
+        r["hf_id"]
+        for r in rows
+        if r["status"] in ("in_progress", "pending")
+    }
+
+
 def enqueue(store: Store, hf_id: str, *, skip_if_recent: bool = False) -> str | None:
-    """Add an hf_id to the queue. Returns the new run_id, or None if
-    skip_if_recent was True and we already have a recent OK run."""
+    """Add an hf_id to the queue. Returns the new run_id, or None if:
+    - skip_if_recent was True and we already have a recent OK run, OR
+    - the same hf_id is already pending in the queue or currently
+      in_progress / queued (PR#34b dedup).
+
+    The dedup is unconditional (independent of skip_if_recent) because
+    enqueueing the same model twice always wastes a download and a GPU
+    slot — we observed this when the hourly auto-enqueue timer pushed
+    the same hf_id 4× before the orchestrator finished the first run.
+    """
+    pending = _hf_ids_in_queue(store) | _hf_ids_in_progress(store)
+    if hf_id in pending:
+        print(f"skip (dedup): {hf_id} already pending/in_progress")
+        return None
     if skip_if_recent and _has_recent_successful_run(store, hf_id):
         return None
     qp = queue_path(store)
@@ -462,6 +509,51 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0 if run.status == RunStatus.OK else 1
 
 
+def _sweep_orphan_in_progress(
+    store: Store, *, stale_after_s: float = 1800.0
+) -> int:
+    """Mark stale 'in_progress' runs as aborted on orchestrator startup.
+
+    PR#34d: when the orchestrator process is killed mid-run (systemd
+    restart, OOM, manual stop), the active run's row in runs.sqlite
+    stays 'in_progress' forever, the cache directory leaks (we saw
+    142 GB of WanVideo_comfy left behind), and worse — duplicate
+    enqueue dedup thinks the model is still being worked on. Sweep
+    any in_progress run that hasn't seen a heartbeat update for
+    longer than `stale_after_s` and re-mark it ABORTED with reason
+    'orchestrator_restart_orphan'.
+
+    Returns the number of runs swept.
+    """
+    now = time.time()
+    swept = 0
+    for r in store.list_runs(status=RunStatus.IN_PROGRESS, limit=200):
+        # Heartbeat = most recent of created_at / updated_at / ended_at.
+        # ended_at should be NULL for in_progress, so use the max of
+        # the others. We also defensively fall back to started_at.
+        candidates = [
+            r.get("updated_at") or 0.0,
+            r.get("created_at") or 0.0,
+            r.get("started_at") or 0.0,
+        ]
+        last_touch = max(float(x) for x in candidates if x)
+        if last_touch and (now - last_touch) < stale_after_s:
+            continue  # still fresh, leave alone
+        run = store.get_run(r["run_id"])
+        if run is None:
+            continue
+        run.status = RunStatus.ABORTED
+        run.failure_reason = "orchestrator_restart_orphan"
+        run.ended_at = now
+        store.save_run(run)
+        swept += 1
+        print(
+            f"[sweep] orphan in_progress -> aborted: {r['run_id']} ({r['hf_id']}) "
+            f"stale_for={now - last_touch:.0f}s"
+        )
+    return swept
+
+
 def cmd_loop(args: argparse.Namespace) -> int:
     from datetime import date as _date
     cfg = OrchestratorConfig()
@@ -469,6 +561,12 @@ def cmd_loop(args: argparse.Namespace) -> int:
     state = LoopState()
     heartbeat_interval = float(os.environ.get("HEYI_HEARTBEAT_INTERVAL", "14400"))  # 4h
     engine_remind_interval = float(os.environ.get("HEYI_ENGINE_REMIND_INTERVAL", "3600"))  # 1h
+
+    stale_after = float(os.environ.get("HEYI_ORPHAN_STALE_S", "1800"))
+    n_swept = _sweep_orphan_in_progress(store, stale_after_s=stale_after)
+    if n_swept:
+        print(f"[startup] swept {n_swept} orphan in_progress run(s)")
+
     print(f"loop mode (stub_only={args.stub_only}), ctrl-c to stop")
 
     while True:

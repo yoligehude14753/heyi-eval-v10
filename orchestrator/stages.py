@@ -437,6 +437,9 @@ def _execute_stage_model_stage(
             "HF_ENDPOINT",
             getattr(cfg, "hf_endpoint", None) or "https://hf-mirror.com",
         ),
+        download_timeout_s=float(
+            getattr(cfg, "stage_model_download_timeout_s", 0.0)
+        ) or None,
     )
     artifact = model_stager.write_provenance(rd, result)
 
