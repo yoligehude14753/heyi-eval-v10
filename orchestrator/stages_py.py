@@ -333,14 +333,25 @@ def _select_eval_gpus(
     return list(cfg.eval_gpus[:tp_size]), None
 
 
-def _graceful_skip(t0: float, reason: str) -> StageResult:
-    """Wrap a graceful-skip reason into the canonical StageResult shape."""
+def _graceful_skip(
+    t0: float, reason: str, *, error_kind: str = "insufficient_gpu",
+) -> StageResult:
+    """Wrap a graceful-skip reason into the canonical StageResult shape.
+
+    PR#25: ``error_kind`` is now parameterised. Historically every
+    abort path emitted ``error_kind="insufficient_gpu"`` regardless
+    of actual cause (model_missing, eval_pool_busy, port_collision,
+    etc.), which (a) made the test_s3_model_path_missing test
+    misleading and (b) made Panel grouping useless. New callers
+    pass a specific kind; the default keeps the old behaviour so
+    no caller needs an immediate update.
+    """
     return StageResult(
         ok=False,
         duration_s=time.time() - t0,
         artifacts=[],
-        error=f"insufficient_gpu: {reason}",
-        error_kind="insufficient_gpu",
+        error=f"{error_kind}: {reason}",
+        error_kind=error_kind,
         extra={"aborted": True, "reason": reason},
     )
 
@@ -382,6 +393,7 @@ def execute_deploy(
                 t0,
                 f"model not in eval-cache: {model_host_path}; "
                 "will retry after model is staged",
+                error_kind="model_missing",
             )
 
         cname = container_name_for(run.run_id, engine)

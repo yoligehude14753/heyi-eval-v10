@@ -111,10 +111,15 @@ def _default_judge_call(prompt: str, image_data_url: str) -> str:
 def _parse_judge_json(text: str) -> tuple[bool | None, str]:
     """Parse the judge's JSON reply. Returns (pass, reason).
 
-    Tolerant of leading prose / markdown fences — same approach the
-    showcase planner uses.
+    Tolerant of leading prose / markdown fences AND of reasoning-
+    model chain-of-thought wrappers (``<think>...</think>``). The
+    latter is critical for MiniMax-M2.7 (PR#23): it ALWAYS prefixes
+    answers with a CoT block, and that block typically contains
+    braces (``"e.g. {pass: true}"``) which confused the old
+    find("{") / rfind("}") strategy.
     """
-    text = text.strip()
+    from orchestrator.llm_text_utils import strip_think_blocks
+    text = strip_think_blocks(text).strip()
     if not text:
         return None, "empty judge response"
     # Try a plain parse first.

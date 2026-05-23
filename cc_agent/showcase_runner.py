@@ -183,11 +183,24 @@ def _render_items_for_grading(items: list[dict[str, Any]]) -> str:
 def _extract_json_array(text: str) -> list[dict[str, Any]] | None:
     """Pull the first ``[...]`` block out of ``text`` and parse it.
 
-    Robust to LLM responses that prefix the JSON with ``Here are the
-    items:`` or wrap it in ```json fences. Returns None on parse failure.
+    Robust to:
+    - LLM responses prefixed with ``Here are the items:``
+    - ```json fences```
+    - ``<think>...</think>`` chain-of-thought blocks (PR#25); critical
+      for MiniMax-M2.7 / Qwen3-thinking / DeepSeek-R1 outputs whose
+      CoT often contains stray ``[``/``]`` inside reasoning examples
+      that pollute the old find("[") / rfind("]") heuristic. Stripping
+      upstream means the planner stops falling through to the default
+      item on every M2.7-served run.
+
+    Returns None on parse failure.
     """
     if not text:
         return None
+    # Lazy import keeps the showcase_runner unit tests free of the
+    # orchestrator import chain when running in isolation.
+    from orchestrator.llm_text_utils import strip_think_blocks
+    text = strip_think_blocks(text)
     fence_match = re.search(r"```(?:json)?\s*(\[[\s\S]*?\])\s*```", text)
     if fence_match:
         candidate = fence_match.group(1)
@@ -236,9 +249,45 @@ def _plan_items(
             f"planning failed: {e}", kind="planning_failed",
         ) from e
 
+    # PR#25: surface a diagnostic flag when the response is pure CoT
+    # so operators can spot reasoning-model truncation immediately.
+    # We tried bumping max_tokens to 6144 and 16384 in nv8 testing;
+    # MiniMax-M2.7 still consumes the whole budget inside
+    # <think>...</think> for a 5-item planning task — 28k chars of
+    # pure CoT observed without ever emitting the array. The vLLM
+    # `chat_template_kwargs={enable_thinking:false}` flag is silently
+    # ignored on this build of M2.7. The pragmatic remedy is the
+    # existing graceful fallback (default showcase item); we just
+    # make the cause crystal clear in the log instead of "non-JSON".
+
     parsed = _extract_json_array(r.text)
     if not parsed:
-        log.warning("planner returned non-JSON; falling back to default item")
+        # Diagnose the cause so operators don't have to grep for the
+        # raw response. The three cases we care about:
+        #   (a) thinking-model truncation: response is essentially
+        #       all <think>...</think> (open or closed) and the JSON
+        #       array never appears.
+        #   (b) malformed: there's a `[` but the bracket pair doesn't
+        #       parse cleanly.
+        #   (c) empty / unrelated: no `[` at all, no <think>.
+        raw = r.text or ""
+        lowered = raw.lower()
+        has_think = "<think" in lowered
+        has_close_think = "</think" in lowered
+        has_bracket = "[" in raw
+        if has_think and not has_close_think:
+            cause = "thinking_truncated"
+        elif has_think and not has_bracket:
+            cause = "thinking_only"
+        elif has_bracket:
+            cause = "malformed_json"
+        else:
+            cause = "no_array_marker"
+        preview = raw[:400].replace("\n", "\\n")
+        log.warning(
+            "planner fallback (cause=%s, total_len=%d, preview=%r)",
+            cause, len(raw), preview,
+        )
         return []
     return parsed
 
