@@ -89,6 +89,23 @@ class OrchestratorConfig:
     # match the rules/42-heyi-m27-api.md contract.
     judge_model_name: str = os.environ.get("HEYI_EVAL_JUDGE_MODEL", "MiniMax-M2.7")
 
+    # PR#33: DEPLOY auto-repair (rule-based + LLM-agent escalation).
+    # When enabled, a DEPLOY failure with one of
+    # {early_exit, image_pull, docker_api} triggers `deploy_repair`
+    # which walks rule-based strategies first, then (if exhausted)
+    # asks the judge LLM for free-form proposals. Each proposal is
+    # validated + sandboxed (no docker access; agent only emits JSON).
+    # Disable via env HEYI_EVAL_DEPLOY_REPAIR_AGENT=0.
+    deploy_repair_agent_enabled: bool = (
+        os.environ.get("HEYI_EVAL_DEPLOY_REPAIR_AGENT", "1") != "0"
+    )
+    deploy_repair_agent_attempts: int = int(
+        os.environ.get("HEYI_EVAL_DEPLOY_REPAIR_AGENT_ATTEMPTS", "3")
+    )
+    deploy_repair_agent_timeout_s: float = float(
+        os.environ.get("HEYI_EVAL_DEPLOY_REPAIR_AGENT_TIMEOUT_S", "90")
+    )
+
     # HF mirror endpoint
     hf_endpoint: str = os.environ.get("HF_ENDPOINT", "https://hf-mirror.com")
 

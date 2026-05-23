@@ -364,12 +364,30 @@ def execute_deploy(
     cfg: OrchestratorConfig,
     *,
     sleep: Any = time.sleep,
+    enable_repair: bool = True,
 ) -> StageResult:
     """Spawn an e9-<engine>-<short> container serving the run's model.
 
     Side effects (only on ok=True):
         runs/<run_id>/deploy.json  with container_name + base_url + image
         runs/<run_id>/_meta/deploy.json (legacy alias for validators)
+        runs/<run_id>/_meta/deploy_repair.json (PR#33; only if repair
+            was triggered — absence means first-attempt success)
+
+    PR#33: when the first attempt fails with an engine-side error
+    (early_exit / docker_api / image_pull), the function walks a small
+    ordered list of deterministic repair strategies — adding
+    --trust-remote-code, lowering max_model_len, swapping the vLLM
+    image to :latest, swapping the engine to SGLang, falling back to
+    transformers — re-invoking the docker spawn after each plan
+    mutation. The whole attempt history (winning strategy, every
+    rejected strategy, full container log tails) is recorded into
+    _meta/deploy_repair.json so the Panel can show 'auto-fixed via
+    swap_engine_sglang' and the operator can trust the run despite
+    the divergence from the original plan.
+
+    Repair is skipped (enable_repair=False) by tests that want to
+    exercise the failure path directly.
     """
     t0 = time.time()
     rd = cfg.run_dir(run.run_id)
@@ -425,89 +443,236 @@ def execute_deploy(
 
         client = _docker_client()
 
-        _reuse_or_recreate(client, cname, run.run_id, engine)
+        # PR#33: extract the docker-spawn + early-exit check into a
+        # reusable helper so the repair loop can call it multiple
+        # times with mutated plans/images without copy-pasting all of
+        # the device_requests / volumes / labels boilerplate.
+        def _try_once(active_plan: dict[str, Any], active_image: str,
+                      active_engine: str) -> tuple[bool, dict[str, Any]]:
+            """Spawn one deploy attempt. Returns (ok, info_dict).
 
-        if engine == "vllm":
-            command = _vllm_command(model_in_container, vllm_args, port)
-        elif engine == "sglang":
-            command = _sglang_command(model_in_container, vllm_args, port)
-        else:  # transformers
-            command = ["serve", "--model-path", model_in_container, "--port", str(port)]
-
-        labels = {
-            LABEL_RUN: run.run_id,
-            LABEL_STAGE: StageName.DEPLOY.value,
-            LABEL_ENGINE: engine,
-        }
-        device_requests = (
-            [
-                docker.types.DeviceRequest(
-                    device_ids=[str(i) for i in selected_gpus],
-                    capabilities=[["gpu"]],
-                )
-            ]
-            if selected_gpus
-            else []
-        )
-        try:
-            container = client.containers.run(
-                image,
-                command=command,
-                name=cname,
-                detach=True,
-                remove=False,
-                labels=labels,
-                network_mode="host",
-                ipc_mode="host",
-                shm_size="16g",
-                volumes={
-                    str(model_host_path): {"bind": model_in_container, "mode": "ro"},
-                },
-                device_requests=device_requests,
-            )
-        except ImageNotFound as e:
-            raise StagePyError(f"image not found: {image}: {e}",
-                               kind="image_pull") from e
-        except APIError as e:
-            msg = str(e)
-            if "address already in use" in msg or "port is already allocated" in msg:
-                raise StagePyError(
-                    f"port {port} already in use: {e}", kind="port_in_use",
-                ) from e
-            raise StagePyError(f"docker API error: {e}", kind="docker_api") from e
-
-        sleep(0.5)
-        container.reload()
-        if container.status in ("exited", "dead"):
-            tail = _tail_logs(container, 50)
+            info_dict on success:
+              {"container": <Container>, "engine": engine, "image": image,
+               "args": vllm_args, "command": command}
+            info_dict on failure (raised exceptions are NOT propagated
+            here, they're translated into the failure dict so the
+            repair loop can inspect them):
+              {"error_kind": str, "error": str, "logs": str,
+               "engine": str, "image": str}
+            """
+            cur_args = dict(active_plan.get("vllm_args") or {})
+            cur_args.setdefault("served_model_name", "evaluated")
+            _reuse_or_recreate(client, cname, run.run_id, active_engine)
+            if active_engine == "vllm":
+                cur_cmd = _vllm_command(model_in_container, cur_args, port)
+            elif active_engine == "sglang":
+                cur_cmd = _sglang_command(model_in_container, cur_args, port)
+            else:  # transformers
+                cur_cmd = ["serve", "--model-path", model_in_container,
+                           "--port", str(port)]
             try:
-                container.remove(force=True)
-            except DockerException:
-                pass
+                container = client.containers.run(
+                    active_image,
+                    command=cur_cmd,
+                    name=cname,
+                    detach=True, remove=False,
+                    labels={
+                        LABEL_RUN: run.run_id,
+                        LABEL_STAGE: StageName.DEPLOY.value,
+                        LABEL_ENGINE: active_engine,
+                    },
+                    network_mode="host",
+                    ipc_mode="host",
+                    shm_size="16g",
+                    volumes={
+                        str(model_host_path): {
+                            "bind": model_in_container, "mode": "ro",
+                        },
+                    },
+                    device_requests=(
+                        [
+                            docker.types.DeviceRequest(
+                                device_ids=[str(i) for i in selected_gpus],
+                                capabilities=[["gpu"]],
+                            )
+                        ] if selected_gpus else []
+                    ),
+                )
+            except ImageNotFound as e:
+                return False, {
+                    "error_kind": "image_pull",
+                    "error": f"image not found: {active_image}: {e}",
+                    "logs": "",
+                    "engine": active_engine, "image": active_image,
+                }
+            except APIError as e:
+                msg = str(e)
+                if "address already in use" in msg or "port is already allocated" in msg:
+                    return False, {
+                        "error_kind": "port_in_use",
+                        "error": f"port {port} already in use: {e}",
+                        "logs": "", "engine": active_engine,
+                        "image": active_image,
+                    }
+                return False, {
+                    "error_kind": "docker_api",
+                    "error": f"docker API error: {e}",
+                    "logs": "", "engine": active_engine,
+                    "image": active_image,
+                }
+
+            sleep(0.5)
+            container.reload()
+            if container.status in ("exited", "dead"):
+                tail = _tail_logs(container, 100)
+                try:
+                    container.remove(force=True)
+                except DockerException:
+                    pass
+                return False, {
+                    "error_kind": "early_exit",
+                    "error": f"container exited immediately; "
+                             f"tail logs: {tail[:200]!r}",
+                    "logs": tail,
+                    "engine": active_engine, "image": active_image,
+                }
+            return True, {
+                "container": container, "engine": active_engine,
+                "image": active_image, "args": cur_args, "command": cur_cmd,
+            }
+
+        # ── first attempt ──
+        ok, info = _try_once(plan, image, engine)
+        repair_log: dict[str, Any] | None = None
+
+        # ── PR#33 repair loop ──
+        if not ok and enable_repair and info["error_kind"] in (
+                "early_exit", "image_pull", "docker_api"):
+            from . import deploy_repair as dr
+
+            failure = dr.DeployFailure(
+                engine=info["engine"], image=info["image"],
+                error_kind=info["error_kind"], logs=info["logs"],
+            )
+            fcls = failure.classify()
+            print(f"  [DEPLOY] first attempt failed: {info['error_kind']} "
+                  f"({fcls}); engaging deploy_repair")
+
+            attempts_record: list[dict[str, Any]] = [{
+                "strategy": "(initial)",
+                "engine": info["engine"], "image": info["image"],
+                "ok": False, "error_kind": info["error_kind"],
+                "error": info["error"][:500],
+                "logs_tail": info["logs"][-500:],
+            }]
+            proposals = dr.propose_attempts(plan, failure)
+            print(f"  [DEPLOY] repair proposed {len(proposals)} strategies: "
+                  f"{[p.name for p in proposals]}")
+
+            winning: dr.StrategyResult | None = None
+            for proposal in proposals:
+                cand_plan = proposal.new_plan or plan
+                cand_engine = (cand_plan.get("engine") or engine).lower()
+                cand_image = proposal.new_image or _ENGINE_IMAGES.get(
+                    cand_engine, image)
+                t_strat = time.time()
+                ok2, info2 = _try_once(cand_plan, cand_image, cand_engine)
+                attempts_record.append({
+                    "strategy": proposal.name,
+                    "engine": cand_engine, "image": cand_image,
+                    "notes": proposal.notes,
+                    "duration_s": round(time.time() - t_strat, 1),
+                    "ok": ok2,
+                    "error_kind": info2.get("error_kind") if not ok2 else None,
+                    "error": (info2.get("error") or "")[:500] if not ok2 else None,
+                    "logs_tail": (info2.get("logs") or "")[-500:] if not ok2 else None,
+                })
+                if ok2:
+                    winning = proposal
+                    info = info2
+                    plan = cand_plan
+                    engine = cand_engine
+                    image = cand_image
+                    ok = True
+                    break
+
+            # ── PR#33 LLM-agent escalation ──
+            # If rule-based strategies all failed, ask the MiniMax-M2.7
+            # judge for a free-form proposal. The agent gets the
+            # failure logs + curated metadata + every previous attempt
+            # and is REQUIRED to propose a non-no-op change. We try
+            # up to `cfg.deploy_repair_agent_attempts` agent proposals
+            # in series.
+            agent_summary: dict[str, Any] | None = None
+            if not ok and cfg.deploy_repair_agent_enabled:
+                agent_summary = _attempt_agent_repair(
+                    rd=rd,
+                    cfg=cfg,
+                    hf_id=run.hf_id,
+                    failure=failure,
+                    engine=engine,
+                    image=image,
+                    plan=plan,
+                    attempts_record=attempts_record,
+                    try_once=_try_once,
+                )
+                if agent_summary and agent_summary.get("ok"):
+                    info = agent_summary["info"]
+                    plan = agent_summary["plan"]
+                    engine = agent_summary["engine"]
+                    image = agent_summary["image"]
+                    ok = True
+                    winning = dr.StrategyResult(
+                        name=f"agent:{agent_summary['strategy']}",
+                        new_plan=plan, new_image=image,
+                        notes=agent_summary.get("diagnosis", "")[:200],
+                    )
+
+            repair_log = {
+                "stage": "DEPLOY_REPAIR",
+                "failure_class": fcls,
+                "ok": ok,
+                "winning_strategy": winning.name if winning else None,
+                "attempts": attempts_record,
+                "strategies_proposed": [p.name for p in proposals],
+                "agent_escalation": agent_summary,
+            }
+            _write_artifact(rd / "_meta", "deploy_repair.json", repair_log)
+
+        # ── translate the final outcome ──
+        if not ok:
+            # Re-raise as StagePyError so the outer try/except records
+            # the same shape as pre-PR#33.
             raise StagePyError(
-                f"container exited immediately; tail logs: {tail!r}",
-                kind="early_exit",
-                logs=tail,
+                info["error"], kind=info["error_kind"],
+                logs=info.get("logs", ""),
             )
 
+        container = info["container"]
         base_url = f"http://127.0.0.1:{port}"
         deploy_payload = {
             "stage": "DEPLOY",
-            "engine": engine,
-            "engine_image": image,
+            "engine": info["engine"],
+            "engine_image": info["image"],
             "container_name": cname,
             "base_url": base_url,
             "model_path_host": str(model_host_path),
             "model_path_container": model_in_container,
             "started_at": datetime.now(tz=UTC).isoformat(timespec="seconds"),
         }
+        if repair_log is not None:
+            deploy_payload["repaired_via"] = repair_log["winning_strategy"]
+            deploy_payload["repair_attempts"] = len(repair_log["attempts"])
         _write_artifact(rd, "deploy.json", deploy_payload)
         _write_artifact(rd / "_meta", "deploy.json", deploy_payload)
 
+        artifacts = ["deploy.json", "_meta/deploy.json"]
+        if repair_log is not None:
+            artifacts.append("_meta/deploy_repair.json")
         return StageResult(
             ok=True,
             duration_s=time.time() - t0,
-            artifacts=["deploy.json", "_meta/deploy.json"],
+            artifacts=artifacts,
             payload=deploy_payload,
             rc=0,
             container_name=cname,
@@ -568,6 +733,187 @@ def _write_artifact(directory: Path, filename: str, payload: dict[str, Any]) -> 
         json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+
+def _attempt_agent_repair(
+    *,
+    rd: Path,
+    cfg: OrchestratorConfig,
+    hf_id: str,
+    failure: Any,           # deploy_repair.DeployFailure
+    engine: str,
+    image: str,
+    plan: dict[str, Any],
+    attempts_record: list[dict[str, Any]],
+    try_once: Callable[..., tuple[bool, dict[str, Any]]],
+) -> dict[str, Any] | None:
+    """PR#33 LLM-agent escalation. Returns a summary dict that includes
+    ``ok`` and (on success) the winning info/plan/engine/image so the
+    caller can install it as if a rule-based strategy had won. Always
+    returns a dict so the repair_log can record the escalation
+    transparently (proposals_seen, why_each_failed, etc.) — even when
+    the agent itself failed to propose anything usable.
+    """
+    try:
+        from heyi_engine import HeyiEngineClient
+        from cc_agent import deploy_repair_agent as agent_mod
+    except Exception as e:  # pragma: no cover — env misconfig only
+        return {
+            "ok": False,
+            "phase": "import",
+            "error": f"could not import LLM-agent dependencies: {e}",
+            "proposals": [],
+        }
+
+    # Load curated context (best effort — agent works with thinner data).
+    curated = {}
+    modelcard = ""
+    try:
+        cpath = rd / "_meta" / "curated.json"
+        if cpath.exists():
+            curated = json.loads(cpath.read_text(encoding="utf-8"))
+        mpath = rd / "_meta" / "modelcard.md"
+        if mpath.exists():
+            modelcard = mpath.read_text(encoding="utf-8")
+    except OSError:
+        pass
+
+    client = HeyiEngineClient(
+        base_url=cfg.engine_url, api_key=cfg.engine_api_key,
+    )
+
+    proposals_log: list[dict[str, Any]] = []
+    max_attempts = int(getattr(cfg, "deploy_repair_agent_attempts", 3))
+    cur_engine, cur_image, cur_plan = engine, image, plan
+    for attempt_i in range(max_attempts):
+        t0 = time.time()
+        # Build previous_attempts for the agent: rule-based attempts +
+        # any prior agent proposals that actually got EXECUTED
+        # (parse-error / engine-error rows are skipped because they
+        # never proposed a concrete strategy to mark as 'tried').
+        agent_priors = []
+        for p in proposals_log:
+            proposal = p.get("proposal")
+            if not isinstance(proposal, dict):
+                continue
+            agent_priors.append({
+                "strategy": proposal.get("strategy") or "agent_freeform",
+                "engine": proposal.get("engine") or cur_engine,
+                "image": proposal.get("image") or cur_image,
+                "ok": p.get("ok", False),
+                "error_kind": p.get("error_kind"),
+            })
+        try:
+            prop = agent_mod.propose_repair(
+                hf_id=hf_id, curated=curated, modelcard=modelcard,
+                failure_class=failure.classify(),
+                log_tail=failure.logs,
+                engine_plan=cur_plan,
+                previous_attempts=attempts_record + agent_priors,
+                client=client,
+                judge_model_name=getattr(cfg, "judge_model_name", "MiniMax-M2.7"),
+                timeout_s=float(getattr(cfg, "deploy_repair_agent_timeout_s", 90.0)),
+            )
+        except Exception as e:
+            proposals_log.append({
+                "attempt": attempt_i + 1,
+                "ok": False,
+                "phase": "propose",
+                "error": f"{type(e).__name__}: {e}",
+                "duration_s": round(time.time() - t0, 1),
+            })
+            continue
+
+        if not prop.ok:
+            proposals_log.append({
+                "attempt": attempt_i + 1,
+                "ok": False,
+                "phase": "propose",
+                "error": prop.error,
+                "raw_response_head": (prop.raw_response or "")[:300],
+                "duration_s": round(time.time() - t0, 1),
+            })
+            continue
+
+        # Build candidate plan + image + engine from proposal.
+        cand_plan = dict(cur_plan)
+        if prop.vllm_args:
+            new_args = dict(cur_plan.get("vllm_args") or {})
+            new_args.update(prop.vllm_args)
+            cand_plan["vllm_args"] = new_args
+        if prop.engine:
+            cand_plan["engine"] = prop.engine
+        cand_engine = (cand_plan.get("engine") or cur_engine).lower()
+        cand_image = prop.image or _ENGINE_IMAGES.get(cand_engine, cur_image)
+
+        # Run the candidate.
+        t_run = time.time()
+        ok2, info2 = try_once(cand_plan, cand_image, cand_engine)
+        prop_summary = {
+            "strategy": prop.strategy,
+            "engine": prop.engine,
+            "image": prop.image,
+            "vllm_args": prop.vllm_args,
+            "diagnosis": prop.diagnosis[:300],
+            "rationale": prop.rationale[:300],
+        }
+        proposals_log.append({
+            "attempt": attempt_i + 1,
+            "ok": ok2,
+            "phase": "execute",
+            "proposal": prop_summary,
+            "propose_duration_s": round(time.time() - t0 - (time.time() - t_run), 1),
+            "execute_duration_s": round(time.time() - t_run, 1),
+            "error_kind": info2.get("error_kind") if not ok2 else None,
+            "error": (info2.get("error") or "")[:500] if not ok2 else None,
+            "logs_tail": (info2.get("logs") or "")[-500:] if not ok2 else None,
+        })
+        # Also append to the outer attempts_record so any further
+        # agent calls see this as already-tried.
+        attempts_record.append({
+            "strategy": f"agent:{prop.strategy}",
+            "engine": cand_engine, "image": cand_image,
+            "notes": prop.rationale[:200],
+            "duration_s": round(time.time() - t_run, 1),
+            "ok": ok2,
+            "error_kind": info2.get("error_kind") if not ok2 else None,
+            "error": (info2.get("error") or "")[:500] if not ok2 else None,
+            "logs_tail": (info2.get("logs") or "")[-500:] if not ok2 else None,
+        })
+
+        if ok2:
+            return {
+                "ok": True,
+                "strategy": prop.strategy,
+                "diagnosis": prop.diagnosis,
+                "rationale": prop.rationale,
+                "info": info2,
+                "plan": cand_plan,
+                "engine": cand_engine,
+                "image": cand_image,
+                "proposals": proposals_log,
+                "winning_attempt": attempt_i + 1,
+            }
+        # Update "current" to the just-tried so next agent proposal
+        # sees fresh failure context.
+        cur_plan, cur_engine, cur_image = cand_plan, cand_engine, cand_image
+        # Update failure object's logs for next iteration so the agent
+        # diagnoses the NEW error, not the original.
+        # (failure is a frozen dataclass; rebuild it.)
+        import dataclasses
+        failure = dataclasses.replace(
+            failure,
+            engine=cand_engine, image=cand_image,
+            error_kind=info2.get("error_kind") or failure.error_kind,
+            logs=info2.get("logs") or failure.logs,
+        )
+
+    return {
+        "ok": False,
+        "phase": "exhausted",
+        "proposals": proposals_log,
+        "max_attempts": max_attempts,
+    }
 
 
 # ── READY_WAIT ────────────────────────────────────────────────────────────
