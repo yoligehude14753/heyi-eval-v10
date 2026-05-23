@@ -29,6 +29,13 @@ class StageName(str, Enum):
     CURATE = "CURATE"
     METADATA = "METADATA"
     ENGINE_SELECT = "ENGINE_SELECT"
+    # PR#31: Idempotent model-weights staging into the orchestrator's
+    # local cache (`cfg.model_cache_root / cfg.hf_local_dir(hf_id)`).
+    # Sits AFTER ENGINE_SELECT (so we already know whether the run is
+    # oversize and can skip the download) and BEFORE DEPLOY (so by the
+    # time DEPLOY runs, the weights are guaranteed on disk and the
+    # docker bind-mount cannot miss).
+    STAGE_MODEL = "STAGE_MODEL"
     DEPLOY = "DEPLOY"
     READY_WAIT = "READY_WAIT"
     CAPABILITY = "CAPABILITY"
@@ -42,6 +49,7 @@ STAGES_IN_ORDER: list[StageName] = [
     StageName.CURATE,
     StageName.METADATA,
     StageName.ENGINE_SELECT,
+    StageName.STAGE_MODEL,
     StageName.DEPLOY,
     StageName.READY_WAIT,
     StageName.CAPABILITY,
@@ -55,6 +63,10 @@ RUN_LEVEL_STAGES: set[StageName] = {
     StageName.CURATE,
     StageName.METADATA,
     StageName.ENGINE_SELECT,
+    # STAGE_MODEL is run-level (no docker, no GPU; pure local-filesystem
+    # + HF Hub I/O), and full-restartable: it's idempotent on a
+    # already-staged dir.
+    StageName.STAGE_MODEL,
 }
 
 STAGE_LEVEL_STAGES: set[StageName] = {

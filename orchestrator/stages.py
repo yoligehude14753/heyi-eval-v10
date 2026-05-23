@@ -24,6 +24,7 @@ stages have consistent observability.
 """
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -392,6 +393,93 @@ def _execute_engine_select_stage(
     )
 
 
+def _execute_stage_model_stage(
+    run: Run, cfg: OrchestratorConfig,
+) -> StageResult:
+    """PR#31: download model weights into the orchestrator's local
+    cache so DEPLOY's bind-mount is guaranteed to find them.
+
+    Reads ``_meta/engine.json`` and ``_meta/metadata.json`` for context,
+    delegates the heavy lifting to ``orchestrator.model_stager``.
+    Idempotent on already-staged dirs and INV-23-aware (oversize models
+    are skipped without download).
+    """
+    import json as _json
+    from . import model_stager
+    t0 = time.time()
+    rd = cfg.run_dir(run.run_id)
+    meta_dir = rd / "_meta"
+
+    engine_plan: dict[str, Any] = {}
+    ep = meta_dir / "engine.json"
+    if ep.exists():
+        try:
+            engine_plan = _json.loads(ep.read_text(encoding="utf-8"))
+        except Exception:
+            engine_plan = {}
+
+    metadata: dict[str, Any] = {}
+    mp = meta_dir / "metadata.json"
+    if mp.exists():
+        try:
+            metadata = _json.loads(mp.read_text(encoding="utf-8"))
+        except Exception:
+            metadata = {}
+
+    target_dir = cfg.model_cache_root / cfg.hf_local_dir(run.hf_id)
+
+    result = model_stager.ensure_model_staged(
+        hf_id=run.hf_id,
+        target_dir=target_dir,
+        metadata=metadata,
+        engine_plan=engine_plan,
+        hf_endpoint=os.environ.get(
+            "HF_ENDPOINT",
+            getattr(cfg, "hf_endpoint", None) or "https://hf-mirror.com",
+        ),
+    )
+    artifact = model_stager.write_provenance(rd, result)
+
+    if result.ok:
+        return StageResult(
+            ok=True, duration_s=time.time() - t0,
+            artifacts=[str(artifact.relative_to(rd))],
+            payload={
+                "bytes_on_disk": result.bytes_on_disk,
+                "files": result.files,
+                "target_dir": result.target_dir,
+                "already_staged": (result.extra or {}).get("already_staged", False),
+            },
+            rc=0,
+        )
+
+    # Graceful skip (oversize from ENGINE_SELECT or disk-full) — let the
+    # pipeline turn the run into ABORTED (PR#11 contract).
+    if result.skipped:
+        return StageResult(
+            ok=False, duration_s=time.time() - t0,
+            artifacts=[str(artifact.relative_to(rd))],
+            payload={},
+            rc=0,
+            error=result.skipped_reason or "stage_model skipped",
+            error_kind=result.error_kind or "stage_model_skipped",
+            extra={
+                "aborted": True,
+                "reason": result.skipped_reason or "stage_model skipped",
+            },
+        )
+
+    # Hard failure (download error / post-download sanity). Retry-worthy.
+    return StageResult(
+        ok=False, duration_s=time.time() - t0,
+        artifacts=[str(artifact.relative_to(rd))],
+        payload={},
+        rc=1,
+        error=result.error or "stage_model failed",
+        error_kind=result.error_kind or "stage_model_failed",
+    )
+
+
 def _pipeline_to_modalities(tag: str) -> list[str]:
     """HF pipeline_tag → our modality list."""
     t = tag.lower()
@@ -515,7 +603,8 @@ def _vllm_args_hint(metadata: dict[str, Any]) -> dict[str, Any]:
 
 
 _STUB_STAGES = {StageName.DISCOVER}
-_PY_STAGES = {StageName.CURATE, StageName.METADATA, StageName.ENGINE_SELECT}
+_PY_STAGES = {StageName.CURATE, StageName.METADATA, StageName.ENGINE_SELECT,
+              StageName.STAGE_MODEL}
 # v10 native stages: orchestrator owns docker socket + eval HTTP path.
 # DEPLOY / READY_WAIT / CLEANUP land in stages_py;
 # CAPABILITY lands in capability.py;
@@ -560,6 +649,8 @@ def execute_stage(
             return _execute_metadata_stage(run, cfg)
         if stage == StageName.ENGINE_SELECT:
             return _execute_engine_select_stage(run, cfg)
+        if stage == StageName.STAGE_MODEL:
+            return _execute_stage_model_stage(run, cfg)
     if stage in _NATIVE_STAGES:
         # Lazy imports — stages_py imports docker-py at module load and
         # we don't want to force that on processes that only run the

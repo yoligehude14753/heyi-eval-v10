@@ -386,14 +386,19 @@ def execute_deploy(
 
         model_host_path = _model_path_on_host(cfg, run.hf_id)
         if not model_host_path.exists():
-            # Model weights not yet downloaded to eval-cache.
-            # Treat as graceful skip so the run is re-queued on next loop
-            # iteration once the model has been staged.
-            return _graceful_skip(
-                t0,
-                f"model not in eval-cache: {model_host_path}; "
-                "will retry after model is staged",
-                error_kind="model_missing",
+            # PR#31: STAGE_MODEL runs immediately before DEPLOY in
+            # STAGES_IN_ORDER and is responsible for ensuring the
+            # weights are on disk (snapshot_download into model_cache_root).
+            # If DEPLOY still sees a missing path here, the pipeline
+            # ordering was bypassed (resume from old state, tests
+            # constructing runs manually, etc.) — fail hard with a
+            # diagnostic rather than the old `model_missing` graceful
+            # skip, which silently masked the bug PR#30 exposed.
+            raise StagePyError(
+                f"DEPLOY found no model at {model_host_path}; expected "
+                f"STAGE_MODEL stage to have staged it. Either the stage "
+                f"was skipped or the cache layout changed.",
+                kind="model_missing_after_stage",
             )
 
         cname = container_name_for(run.run_id, engine)
