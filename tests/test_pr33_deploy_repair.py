@@ -246,6 +246,46 @@ class TestAgentParseProposal(unittest.TestCase):
         obj = self._parse(raw)
         self.assertEqual(obj["engine"], "sglang")
 
+    def test_extracts_json_from_unclosed_think_block(self) -> None:
+        """PR#37: MiniMax-M2.7 sometimes emits the JSON INSIDE the
+        <think> block and the response gets truncated before
+        </think>. The fallback balanced-scan should still find the
+        JSON.
+
+        This was the EXACT failure shape on the nv8 Qwen3.6-GGUF run
+        — three consecutive parse_errors because strip_think_blocks
+        is a no-op when </think> is missing and the regex extractor
+        returned nothing.
+        """
+        raw = (
+            '<think>Let me reason about this glm_ocr failure.\n'
+            'I should swap to the latest image.\n'
+            'Here is my JSON proposal:\n'
+            '{"diagnosis":"glm_ocr needs newer vllm",'
+            '"strategy":"swap_image","engine":null,'
+            '"image":"vllm/vllm-openai:latest",'
+            '"vllm_args":{"trust_remote_code":true},'
+            '"rationale":"newer vllm has glm_ocr support."}\n'
+            'Hmm wait, let me reconsider... ' + ('x' * 50)
+            # NOTE: no </think> — truncated by max_tokens
+        )
+        obj = self._parse(raw)
+        self.assertEqual(obj["image"], "vllm/vllm-openai:latest")
+        self.assertEqual(obj["vllm_args"]["trust_remote_code"], True)
+
+    def test_balanced_scan_handles_braces_in_strings(self) -> None:
+        """The fallback must NOT trip on benign braces inside string
+        values (e.g. a vllm_args value mentioning {} in a comment)."""
+        raw = (
+            '<think>'
+            '{"diagnosis":"the model uses {} in its name",'
+            '"strategy":"swap","engine":"vllm","image":null,'
+            '"vllm_args":null,"rationale":"x"}'
+        )
+        obj = self._parse(raw)
+        self.assertIn("{}", obj["diagnosis"])
+        self.assertEqual(obj["engine"], "vllm")
+
     def test_extracts_json_from_markdown_fence(self) -> None:
         raw = ('```json\n'
                '{"diagnosis":"x","strategy":"y","engine":"vllm",'

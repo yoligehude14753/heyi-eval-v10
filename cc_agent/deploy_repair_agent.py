@@ -177,15 +177,76 @@ JSON object only.
 _JSON_BLOCK = re.compile(r"\{.*\}", re.DOTALL)
 
 
+def _find_balanced_json(text: str) -> str | None:
+    """Locate the first balanced ``{...}`` JSON object in ``text``.
+
+    Honest scan with brace counting (string-aware) rather than a regex
+    so we don't trip on benign braces inside strings. Returns None if
+    no balanced object exists.
+
+    PR#37: needed because MiniMax-M2.7 sometimes wraps its proposal
+    in a thinking block whose closing ``</think>`` is cut off by the
+    token budget — the regex-based extractor either found nothing or
+    grabbed an unbalanced fragment.
+    """
+    n = len(text)
+    i = 0
+    while i < n:
+        if text[i] != "{":
+            i += 1
+            continue
+        depth = 0
+        in_str = False
+        esc = False
+        j = i
+        while j < n:
+            ch = text[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+            else:
+                if ch == '"':
+                    in_str = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return text[i : j + 1]
+            j += 1
+        i += 1
+    return None
+
+
 def _parse_proposal(raw: str) -> dict[str, Any]:
     """Extract the first balanced JSON object from raw and validate it
     against the strict schema. Raises DeployRepairAgentError on parse
     or schema errors.
+
+    PR#37 hardening: when the LLM wraps its answer in a ``<think>``
+    block and the response is truncated before ``</think>`` closes,
+    ``strip_think_blocks`` is a no-op (no closing tag) and the regex
+    finds nothing. Fall back to scanning the WHOLE raw text for a
+    balanced object — the model often writes the JSON inside the
+    think block, which is fine if we extract it carefully.
     """
     cleaned = strip_think_blocks(raw or "")
     m = _JSON_BLOCK.search(cleaned)
     if not m:
-        raise DeployRepairAgentError(f"no JSON in response: {raw[:200]!r}")
+        # First fallback: balanced scan on the cleaned text
+        blob = _find_balanced_json(cleaned)
+        if blob is None:
+            # Second fallback: balanced scan on the raw text (covers
+            # truncated <think> blocks where the JSON sits inside).
+            blob = _find_balanced_json(raw or "")
+        if blob is None:
+            raise DeployRepairAgentError(
+                f"no JSON in response: {raw[:200]!r}")
+        m = type("M", (), {"group": lambda self, _i: blob})()  # type: ignore
     blob = m.group(0)
     try:
         obj = json.loads(blob)
@@ -261,7 +322,12 @@ def propose_repair(
     client: HeyiEngineClient,
     judge_model_name: str = "MiniMax-M2.7",
     timeout_s: float = 90.0,
-    max_tokens: int = 800,
+    # PR#37: bumped from 800 → 2400. The Qwen3.6-GGUF live run on
+    # nv8 showed all three agent attempts truncated inside an
+    # un-closed <think> block (~600 think tokens + JSON didn't fit
+    # in 800). 2400 gives ~1800 think + 600 JSON which matches the
+    # claimed M2.7 reasoning budget.
+    max_tokens: int = 2400,
 ) -> AgentProposal:
     """Ask the LLM-agent for ONE repair proposal.
 
