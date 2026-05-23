@@ -73,10 +73,21 @@ class OrchestratorConfig:
         default_factory=lambda: _env_path("HEYI_EVAL_BACKUPS", "~/heyi-eval-backups")
     )
 
-    # heyi_engine (local LLM, v10). The model name is auto-discovered from
-    # /v1/models — there is no model-name field here.
+    # heyi_engine (local LLM, v10). On nv8 this is the MiniMax-M2.7
+    # vLLM container `minimax` serving on port 10814 (TP=4, GPU 0-3).
+    # Three reachable paths per `rules/42-heyi-m27-api.md`:
+    #   (A) nv8-local       http://127.0.0.1:10814    (this default)
+    #   (B) Tailscale       http://100.127.173.85:10814
+    #   (C) trycloudflare   read /home/ai/cf-m27-url.txt (URL is dynamic)
+    # When you're on the mac dev box, export HEYI_ENGINE_URL to (B) or (C).
     engine_url: str = os.environ.get("HEYI_ENGINE_URL", "http://127.0.0.1:10814")
     engine_api_key: str | None = os.environ.get("HEYI_ENGINE_API_KEY")
+    # PR#23: pin the model name. M2.7 vLLM serves model
+    # "MiniMax-M2.7" and previously llm_judge.py hard-coded "auto"
+    # (which vLLM accepts as "first registered model" but breaks the
+    # day someone serves two models on the same endpoint). Pinned to
+    # match the rules/42-heyi-m27-api.md contract.
+    judge_model_name: str = os.environ.get("HEYI_EVAL_JUDGE_MODEL", "MiniMax-M2.7")
 
     # HF mirror endpoint
     hf_endpoint: str = os.environ.get("HF_ENDPOINT", "https://hf-mirror.com")
@@ -110,11 +121,18 @@ class OrchestratorConfig:
 
     # evaluation-side GPU pool (the eval pipeline spawns e9-* containers
     # restricted to these GPU indices; PR#11 wires the actual injection).
-    # Default (4,5,6,7) is the steady-state complement of prod_engine_gpus.
-    # If empty (HEYI_EVAL_EVAL_GPUS=""), PR#11 graceful-skip path activates.
+    #
+    # PR#23 (2026-05) shrinks default from (4,5,6,7) → (5,6,7) because
+    # GPU 4 on nv8 is occupied by the ComfyUI host process
+    # (`python main.py --port 8188`, ~93 GB). Production (M2.7) holds
+    # (0,1,2,3) and the eval pipeline must not touch GPU 4. Setting
+    # HEYI_EVAL_EVAL_GPUS="" still activates PR#11 graceful-skip.
+    # Any model whose tensor_parallel_size > len(eval_gpus)=3 is now
+    # gated at ENGINE_SELECT (PR#23 oversize gate) and aborted with
+    # metadata-only — see orchestrator/stages.py + INV-23.
     eval_gpus: tuple[int, ...] = field(
         default_factory=lambda: _parse_gpu_tuple(
-            "HEYI_EVAL_EVAL_GPUS", (4, 5, 6, 7)
+            "HEYI_EVAL_EVAL_GPUS", (5, 6, 7)
         )
     )
 

@@ -62,13 +62,18 @@ def _make_cfg_with_env(monkeypatch: pytest.MonkeyPatch, env: dict[str, str]) -> 
 
 
 def test_c1_defaults_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
-    """C1: with no env vars set, defaults match the steady state on nv8
-    (production = MiniMax-M2.7 TP=4 on GPU 0-3; evaluation owns 4-7)."""
+    """C1: with no env vars set, defaults match the steady state on nv8.
+
+    PR#23 (2026-05) shrank the eval pool default from (4,5,6,7) to
+    (5,6,7) because GPU 4 on nv8 holds the ComfyUI host process; see
+    rules/42-heyi-m27-api.md + orchestrator/config.py::eval_gpus.
+    Production (MiniMax-M2.7 TP=4) still owns (0,1,2,3).
+    """
     cfg = _make_cfg_with_env(monkeypatch, {})
     assert cfg.prod_engine_container == "minimax"
     assert cfg.prod_engine_gpus == (0, 1, 2, 3)
     assert cfg.prod_engine_min_gpu_mib == 80_000
-    assert cfg.eval_gpus == (4, 5, 6, 7)
+    assert cfg.eval_gpus == (5, 6, 7)
 
 
 def test_c2_switch_to_kimi_k26_transient(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -83,9 +88,10 @@ def test_c2_switch_to_kimi_k26_transient(monkeypatch: pytest.MonkeyPatch) -> Non
     )
     assert cfg.prod_engine_container == "kimi-k26"
     assert cfg.prod_engine_gpus == (0, 1, 2, 3, 4, 5, 6, 7)
-    # defaults for the eval pool remain (4-7); PR#11 graceful-skip logic
-    # will see prod_engine_gpus overlapping eval_gpus and abort.
-    assert cfg.eval_gpus == (4, 5, 6, 7)
+    # defaults for the eval pool are (5,6,7) (PR#23); PR#11 graceful-
+    # skip logic will see prod_engine_gpus overlapping eval_gpus and
+    # abort.
+    assert cfg.eval_gpus == (5, 6, 7)
 
 
 def test_c3_eval_gpu_pool_override(monkeypatch: pytest.MonkeyPatch) -> None:

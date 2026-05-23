@@ -688,3 +688,73 @@ outbox 至少有 `run_meta.json` + `payload.stdout`,且 `payload.stdout`
 - [x] `sudo -u ai .venv/bin/python -m orchestrator.agent_runner m3demo-Y --mode smoke` ok=True
 - [x] `agent_summary.json` 中 `audit.end_exit == 0` 且 `audit.begin_id != null`
 - [x] `outbox/run_meta.json` 由 ai 用户可读(ownership ai:ai)
+
+## 15 · 接入 M2.7 API + GPU 池收缩(PR#23)
+
+PR#23 把 v10 评估管线对齐到 2026-05 的 nv8 实际拓扑:
+
+- **生产 LLM = MiniMax-M2.7**(vLLM 容器 `minimax`,TP=4,GPU 0-3,端口
+  10814,模型名字符串 `MiniMax-M2.7`)。LLM-judge 全部走这一条管线。
+- **GPU 4** 被 ComfyUI host 进程长期占用(`python main.py --port 8188`,
+  ~93 GB),评估池**绝不**触碰。
+- **评估池** 默认 `(5, 6, 7)` 共 3 张卡(188 GB 余量),操作员可通过
+  `HEYI_EVAL_EVAL_GPUS` 临时扩缩。
+- **超大模型**(`tensor_parallel_size > 3`,即 70B+/MoE)在
+  `ENGINE_SELECT` 阶段被 INV-23 oversize 闸门拦下,只落元数据,不进
+  DEPLOY。
+
+### 15.1 LLM-judge 模型名(强制)
+
+历史的 `"model": "auto"` 已废弃——M2.7 vLLM 服务名是字符串
+`MiniMax-M2.7`,新代码硬性引用:
+
+- `orchestrator/llm_judge.py` 调用 chat completions 时 body 必填
+  `"model": "MiniMax-M2.7"`;
+- 改名走 env `HEYI_EVAL_JUDGE_MODEL`(例如临时切到 staging M2.8),
+  不要改源码;
+- 静态守护 `tests/test_pr23_m27_api_and_oversize.py::TestJudgeModelName::test_no_auto_literal_anywhere` 拦截任何回归把 `"model": "auto"` 提交回来。
+
+三条访问路径见 `rules/42-heyi-m27-api.md`:
+本机 `http://127.0.0.1:10814/v1` / Tailscale `http://100.127.173.85:10814/v1` / 公网 `cat /home/ai/cf-m27-url.txt`。
+nv8 上 orchestrator 默认走本机;mac 开发箱跑 e2e 时:
+
+```bash
+export HEYI_ENGINE_URL=http://100.127.173.85:10814
+export HEYI_EVAL_JUDGE_MODEL=MiniMax-M2.7
+```
+
+### 15.2 评估池切换(操作员视角)
+
+```bash
+# 常态(PR#23 默认,GPU 4 给 ComfyUI):
+unset HEYI_EVAL_EVAL_GPUS
+
+# 临时回到 4 卡池(ComfyUI 已下线):
+export HEYI_EVAL_EVAL_GPUS="4,5,6,7"
+
+# 仅 2 卡评测窗口(GPU 6/7 借出):
+export HEYI_EVAL_EVAL_GPUS="5"
+
+# 当晚完全没有 GPU 可用(全员上 prod):
+export HEYI_EVAL_EVAL_GPUS=""    # PR#11 graceful-skip 全量
+```
+
+### 15.3 oversize 闸门(开发者视角)
+
+- 判定时机:`ENGINE_SELECT`(NOT DEPLOY) — 避免浪费 100 GB+ 模型下载。
+- 判定公式:`tp_size = vllm_args.tensor_parallel_size`(由
+  `_vllm_args_hint(metadata)` 根据 `param_count` 粗估),与
+  `len(cfg.eval_gpus)` 直接比较。
+- 触发结果:engine.json `engine="metadata_only" oversize=true`,
+  pipeline 走 `GracefulSkip` → run 标 `ABORTED`(不计 failure)。
+- Panel 仍能拉到 metadata.json + engine.json,该模型以"仅采集"展示。
+- 想强行测一把超大模型:操作员临时扩 `HEYI_EVAL_EVAL_GPUS` 到匹配
+  tp_size 的 GPU 数即可,**无需改代码**。
+
+### 15.4 §15 核对清单
+
+- [x] `cfg.eval_gpus == (5,6,7)`(无 env 时)
+- [x] `cfg.judge_model_name == "MiniMax-M2.7"`(无 env 时)
+- [x] `orchestrator/llm_judge.py` 不再含 `"model": "auto"`
+- [x] 405B 模型 ENGINE_SELECT 后 `engine.json::engine == "metadata_only"` 且 `oversize == true`
+- [x] 7B 模型 ENGINE_SELECT 后正常 `engine == "vllm"` 且 `oversize == false`

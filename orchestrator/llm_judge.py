@@ -78,8 +78,13 @@ def _default_judge_call(prompt: str, image_data_url: str) -> str:
 
     base = os.environ.get("HEYI_ENGINE_URL", "http://127.0.0.1:10814")
     api_key = os.environ.get("HEYI_ENGINE_API_KEY")
+    # PR#23: pin model name. M2.7 vLLM serves "MiniMax-M2.7"; the
+    # previous "auto" hack only worked because vLLM happens to route
+    # unknown names to the first served model. Per
+    # rules/42-heyi-m27-api.md the contract is the literal string.
+    judge_model = os.environ.get("HEYI_EVAL_JUDGE_MODEL", "MiniMax-M2.7")
     body = json.dumps({
-        "model": "auto",
+        "model": judge_model,
         "messages": [{
             "role": "user",
             "content": [

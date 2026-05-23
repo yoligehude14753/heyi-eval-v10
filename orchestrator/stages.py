@@ -336,18 +336,53 @@ def _execute_engine_select_stage(
     engine, image, reason, fallback = _pick_engine(modality, pipeline_tag,
                                                    library_name=(metadata.get("hf_info") or {}).get("library_name"))
 
+    vllm_args = _vllm_args_hint(metadata)
+
+    # PR#23: oversize gate (INV-23). On nv8 the steady-state eval pool
+    # is GPU 5-7 (len=3); a model requesting tp_size > 3 (typically
+    # 70B+ with TP=4) can never fit. Detect it HERE in ENGINE_SELECT
+    # — before we burn time pulling a 130 GB checkpoint or fighting
+    # the docker daemon — and abort with metadata-only so the row
+    # still surfaces in the Panel with hf metadata captured.
+    #
+    # Per user contract (rules/42-heyi-m27-api.md): "超大参数模型
+    # 可以收集并备注,不用测了". This is the abort that materialises
+    # that policy.
+    tp_size = int((vllm_args or {}).get("tensor_parallel_size", 1) or 1)
+    oversize = tp_size > len(cfg.eval_gpus)
+
     plan = {
         "stage": "ENGINE_SELECT",
         "hf_id": run.hf_id,
-        "engine": engine,
+        "engine": engine if not oversize else "metadata_only",
         "engine_image": image,
         "reason": reason,
         "fallback_engine": fallback,
-        # cc-agent reads these env vars to actually launch the inner container
-        "vllm_args": _vllm_args_hint(metadata),
+        "vllm_args": vllm_args,
+        "eval_pool_size": len(cfg.eval_gpus),
+        "eval_pool_gpus": list(cfg.eval_gpus),
+        "oversize": oversize,
     }
     (meta_dir / "engine.json").write_text(
         json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    if oversize:
+        skip_reason = (
+            f"oversize: model needs tensor_parallel_size={tp_size} but "
+            f"eval pool has {len(cfg.eval_gpus)} GPUs "
+            f"({list(cfg.eval_gpus)}); metadata captured at "
+            f"_meta/metadata.json + _meta/engine.json, no DEPLOY"
+        )
+        return StageResult(
+            ok=False, duration_s=time.time() - t0,
+            artifacts=["_meta/engine.json"],
+            payload={"engine": "metadata_only", "oversize": True},
+            rc=0,
+            error=f"oversize_skip: {skip_reason}",
+            error_kind="oversize_skip",
+            extra={"aborted": True, "reason": skip_reason, "tp_size": tp_size,
+                   "eval_pool_size": len(cfg.eval_gpus)},
+        )
 
     return StageResult(
         ok=True, duration_s=time.time() - t0,
