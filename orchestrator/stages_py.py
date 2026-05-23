@@ -694,10 +694,47 @@ def execute_deploy(
             # from "loaded but won't serve". Skip the probe entirely
             # when getattr(cfg, "deploy_inference_probe_enabled") is
             # False (tests can disable).
+            #
+            # PR#36a refinement (post-mms-300m run): the probe targets
+            # /v1/chat/completions, which is ONLY appropriate for
+            # text/code-capable models. ASR / TTS / image-gen models
+            # legitimately 501 on chat/completions — that's not a lie,
+            # the engine just doesn't serve text. Read capability_tags
+            # from <run>/_meta/curated.json and only fire the probe
+            # when "text" or "code" is among them.
             probe_enabled = getattr(
                 cfg, "deploy_inference_probe_enabled", True
             )
+            probe_applicable = False
             if probe_enabled and models_listed:
+                cap_tags: list[str] = []
+                try:
+                    cpath = rd / "_meta" / "curated.json"
+                    if cpath.exists():
+                        cobj = json.loads(cpath.read_text(encoding="utf-8"))
+                        raw = cobj.get("capability_tags") or []
+                        if isinstance(raw, list):
+                            cap_tags = [str(t).lower() for t in raw]
+                except Exception:
+                    cap_tags = []
+                # Text/code models: always probe.
+                # Audio/vision/image-gen models: skip probe.
+                # No tags / mixed: probe (default safe).
+                text_like = {"text", "code"}
+                audio_visual_only = {"audio", "asr", "tts", "image-gen",
+                                     "video-gen", "music-gen", "vision",
+                                     "ocr", "video-understanding",
+                                     "music-understanding"}
+                if cap_tags:
+                    if any(t in text_like for t in cap_tags):
+                        probe_applicable = True
+                    elif all(t in audio_visual_only for t in cap_tags):
+                        probe_applicable = False
+                    else:
+                        probe_applicable = True
+                else:
+                    probe_applicable = True
+            if probe_applicable:
                 probe_timeout = float(
                     getattr(cfg, "deploy_inference_probe_timeout_s", 20.0)
                 )

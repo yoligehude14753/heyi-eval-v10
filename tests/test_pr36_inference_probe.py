@@ -168,6 +168,95 @@ class InferenceProbeInTryOnceTests(unittest.TestCase):
         finally:
             td.cleanup()
 
+    def _write_curated(self, cfg, run, capability_tags: list[str]):
+        """Helper: write a minimal curated.json with given tags."""
+        rd = Path(cfg.run_dir(run.run_id))
+        (rd / "_meta").mkdir(parents=True, exist_ok=True)
+        (rd / "_meta" / "curated.json").write_text(json.dumps({
+            "hf_id": run.hf_id,
+            "capability_tags": capability_tags,
+            "modalities": capability_tags,
+        }))
+
+    def test_probe_skipped_for_audio_only_models(self):
+        """ASR / TTS / audio models legitimately don't support
+        /v1/chat/completions. The probe must not fire for them —
+        otherwise we'd flag every wav2vec/whisper model as
+        inference_broken just because transformers-runner correctly
+        refuses text inference for them.
+        """
+        td, cfg, run, client = self._setup(501, TRANSFORMERS_501_BODY)
+        self._write_curated(cfg, run, ["audio"])
+        try:
+            with _patch_docker(client), \
+                 patch.object(stages_py, "_http_get_json",
+                              return_value=(200, {"data": [{"id": "x"}]})), \
+                 patch.object(stages_py, "_http_post_json") as probe:
+                r = stages_py.execute_deploy(
+                    run, cfg, sleep=_NOP_SLEEP, enable_repair=False,
+                )
+            probe.assert_not_called()
+            self.assertTrue(r.ok,
+                            "audio-only models must not be flagged "
+                            "inference_broken by the chat probe")
+        finally:
+            td.cleanup()
+
+    def test_probe_fires_for_text_models(self):
+        """Text models are the canonical case the probe is for."""
+        td, cfg, run, client = self._setup(501, TRANSFORMERS_501_BODY)
+        self._write_curated(cfg, run, ["text"])
+        try:
+            with _patch_docker(client), \
+                 patch.object(stages_py, "_http_get_json",
+                              return_value=(200, {"data": [{"id": "x"}]})), \
+                 patch.object(stages_py, "_http_post_json",
+                              return_value=(501, None, TRANSFORMERS_501_BODY)):
+                r = stages_py.execute_deploy(
+                    run, cfg, sleep=_NOP_SLEEP, enable_repair=False,
+                )
+            self.assertFalse(r.ok)
+            self.assertEqual(r.error_kind, "inference_broken")
+        finally:
+            td.cleanup()
+
+    def test_probe_fires_for_text_plus_audio_models(self):
+        """Models with mixed modalities (e.g. text+audio multimodal):
+        the probe should still fire because chat-completions IS a
+        valid capability for them — only PURE non-text models opt out."""
+        td, cfg, run, client = self._setup(501, TRANSFORMERS_501_BODY)
+        self._write_curated(cfg, run, ["text", "audio"])
+        try:
+            with _patch_docker(client), \
+                 patch.object(stages_py, "_http_get_json",
+                              return_value=(200, {"data": [{"id": "x"}]})), \
+                 patch.object(stages_py, "_http_post_json",
+                              return_value=(501, None, TRANSFORMERS_501_BODY)):
+                r = stages_py.execute_deploy(
+                    run, cfg, sleep=_NOP_SLEEP, enable_repair=False,
+                )
+            self.assertFalse(r.ok)
+            self.assertEqual(r.error_kind, "inference_broken")
+        finally:
+            td.cleanup()
+
+    def test_probe_fires_when_no_curated_json(self):
+        """No curated.json (unusual) → default to probing.
+        Backward compat: same behaviour as PR#36a's initial impl."""
+        td, cfg, run, client = self._setup(501, TRANSFORMERS_501_BODY)
+        try:
+            with _patch_docker(client), \
+                 patch.object(stages_py, "_http_get_json",
+                              return_value=(200, {"data": [{"id": "x"}]})), \
+                 patch.object(stages_py, "_http_post_json",
+                              return_value=(501, None, TRANSFORMERS_501_BODY)):
+                r = stages_py.execute_deploy(
+                    run, cfg, sleep=_NOP_SLEEP, enable_repair=False,
+                )
+            self.assertFalse(r.ok)
+        finally:
+            td.cleanup()
+
     def test_probe_skipped_when_models_never_listed(self):
         """If /v1/models never returned 200 within the early-crash window,
         we DON'T fire the probe — the container is still spinning up,
