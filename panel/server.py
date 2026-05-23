@@ -480,6 +480,7 @@ INDEX_HTML = """<!doctype html>
     <table id="runs-table"><thead><tr>
       <th>run_id</th><th>hf_id</th><th>状态</th>
       <th>DISCOVER</th><th>CURATE</th><th>METADATA</th><th>ENGINE_SELECT</th>
+      <th>STAGE_MODEL</th>
       <th>DEPLOY</th><th>READY_WAIT</th><th>CAPABILITY</th><th>SHOWCASE</th><th>CLEANUP</th>
       <th>总时长</th>
     </tr></thead><tbody></tbody></table>
@@ -522,7 +523,7 @@ function formatTs(ts) {
   return new Date(ts).toLocaleString('zh-CN');
 }
 
-const STAGES = ['DISCOVER','CURATE','METADATA','ENGINE_SELECT','DEPLOY','READY_WAIT','CAPABILITY','SHOWCASE','CLEANUP'];
+const STAGES = ['DISCOVER','CURATE','METADATA','ENGINE_SELECT','STAGE_MODEL','DEPLOY','READY_WAIT','CAPABILITY','SHOWCASE','CLEANUP'];
 
 async function refresh() {
   document.getElementById('updated').textContent = '更新中… ' + new Date().toLocaleString('zh-CN');
@@ -628,7 +629,7 @@ async function refresh() {
       <td>${stages}</td>
       <td>${formatDuration(r.duration_s)}</td>
     </tr>`;
-  }).join('') || '<tr><td colspan="13" class="muted">无 runs</td></tr>';
+  }).join('') || '<tr><td colspan="14" class="muted">无 runs</td></tr>';
 
   // discover
   const d = await getJSON('/api/discover');

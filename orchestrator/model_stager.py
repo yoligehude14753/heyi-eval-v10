@@ -54,26 +54,166 @@ GRACEFUL_OVERSIZE_INHERITED = "oversize_inherited"
 # ── disk + completeness probes ────────────────────────────────────────────
 
 
-WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".gguf", ".npz")
+WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".gguf", ".npz", ".onnx", ".pth")
+# CoreML / mlpackage / TF SavedModel are *directories*, not files.
+# whisperkit-coreml is the motivating PR#32 case: 29 GB of valid
+# `.mlpackage` / `.mlmodelc` dirs but no `.safetensors` file → old
+# detector returned False → orchestrator marked the run
+# `incomplete_after_download` and we burned 29 GB to no effect.
+WEIGHT_DIR_SUFFIXES = (".mlpackage", ".mlmodelc", ".savedmodel")
+# PR#32: not every HF repo ships `config.json`; CoreML packages,
+# diffusion pipelines, and many GGUF-only repos use other manifest
+# names. The detector now treats ANY of these as "the manifest is
+# present", so a repo that lacks config.json doesn't get falsely
+# flagged incomplete.
+MANIFEST_NAMES = (
+    "config.json",
+    "model_index.json",       # diffusers pipelines
+    "preprocessor_config.json",
+    "generation_config.json",
+    "tokenizer_config.json",
+    "feature_extractor_config.json",
+)
+# Filename markers that, on their own, indicate the dir holds weights
+# even if nothing else matches (e.g. CoreML repos that ship only the
+# pipeline JSON + .mlpackage dirs).
+WEIGHT_FILENAMES = ("model.safetensors.index.json",
+                    "pytorch_model.bin.index.json")
 
 
 def _has_weight_file(d: Path) -> bool:
-    """A staged dir is 'complete enough' if it has config.json plus
-    at least one file we recognise as model weights. We do NOT verify
-    sha256 — that's HF Hub's job, and the .cache/huggingface/download/
-    ledger handles resume-correctness internally."""
-    if not (d / "config.json").exists():
+    """A staged dir is 'complete enough' if **any** of the following
+    hold:
+
+      1. it has a known manifest file (config.json / model_index.json
+         / preprocessor_config.json / …) AND at least one weight-like
+         file or directory (safetensors / bin / gguf / mlpackage / …);
+      2. it has no `.cache/huggingface/download/*.incomplete` ledger
+         entries AND contains at least one weight file/dir.
+
+    We do NOT verify sha256 — that's HF Hub's job, and the
+    ``.cache/huggingface/download/`` ledger handles resume-correctness
+    internally.
+    """
+    if not d.exists():
         return False
+
+    # 1. Half-finished downloads MUST disqualify the dir, regardless of
+    # what else looks complete on disk. HF writes `<file>.incomplete`
+    # alongside the partial blob; presence of any one means a shard
+    # is still mid-flight.
+    incomplete_dir = d / ".cache" / "huggingface" / "download"
+    if incomplete_dir.exists():
+        try:
+            for ent in incomplete_dir.iterdir():
+                if ent.name.endswith(".incomplete"):
+                    return False
+        except OSError:
+            pass
+
+    has_manifest = False
+    has_weight = _scan_for_weights(d, max_depth=3)
     try:
         for entry in d.iterdir():
-            # Ignore HF's own bookkeeping dirs.
-            if entry.name.startswith("."):
+            name = entry.name
+            if name.startswith("."):
                 continue
-            if entry.suffix.lower() in WEIGHT_SUFFIXES:
-                return True
+            if entry.is_file() and name in MANIFEST_NAMES:
+                has_manifest = True
+            if entry.is_file() and name in WEIGHT_FILENAMES:
+                has_weight = True
+    except OSError:
+        return False
+
+    # Either (manifest + weight) or (post-download, no incomplete ledger,
+    # weight present and the manifest may be absent for atypical repos).
+    return has_weight and (has_manifest or _no_download_ledger(d))
+
+
+def _scan_for_weights(d: Path, max_depth: int = 3) -> bool:
+    """Walk ``d`` up to ``max_depth`` levels looking for any file with
+    a recognised weight suffix OR any directory with a weight-dir
+    suffix (.mlpackage / .mlmodelc / .savedmodel).
+
+    PR#32 motivation: argmaxinc/whisperkit-coreml ships its weights
+    nested two levels down (``whisperkit-coreml/openai_whisper-base/
+    AudioEncoder.mlmodelc/``). A flat ``iterdir()`` misses them and the
+    detector wrongly says 'incomplete' on a 29 GB legitimate snapshot.
+    """
+    try:
+        stack: list[tuple[Path, int]] = [(d, 0)]
+        while stack:
+            cur, depth = stack.pop()
+            try:
+                entries = list(cur.iterdir())
+            except OSError:
+                continue
+            for entry in entries:
+                if entry.name.startswith("."):
+                    continue
+                if entry.is_file() and entry.suffix.lower() in WEIGHT_SUFFIXES:
+                    return True
+                if entry.is_dir():
+                    if entry.suffix.lower() in WEIGHT_DIR_SUFFIXES:
+                        return True
+                    if depth + 1 < max_depth:
+                        stack.append((entry, depth + 1))
     except OSError:
         return False
     return False
+
+
+def _no_download_ledger(d: Path) -> bool:
+    """A finished snapshot_download leaves an empty `.cache/huggingface/
+    download/` (just the symlink registry); a half-finished one has
+    `.incomplete` files. If the ledger dir doesn't exist at all, the
+    dir was populated by something other than huggingface_hub (a
+    manual rsync, an old layout) — treat that as 'finished'.
+    """
+    led = d / ".cache" / "huggingface" / "download"
+    if not led.exists():
+        return True
+    try:
+        for ent in led.iterdir():
+            if ent.name.endswith(".incomplete"):
+                return False
+    except OSError:
+        return True
+    return True
+
+
+def _cleanup_partial(target_dir: Path) -> int:
+    """Best-effort delete of a failed/partial download dir. Returns
+    bytes freed (0 if the dir didn't exist or was empty).
+
+    PR#32 motivation: the unsloth/Qwen3.6-27B-GGUF download failed at
+    Hub-403 after dumping 328 GB of partially-downloaded shards onto
+    disk; without cleanup, the cache leaked that space (and the next
+    re-enqueue happily resumed into the same dead dir). We delete on
+    every hard-fail path so the cache is self-healing.
+    """
+    if not target_dir.exists():
+        return 0
+    try:
+        # Measure before removing for accurate reporting.
+        size = sum(
+            f.stat().st_size for f in target_dir.rglob("*")
+            if f.is_file()
+        )
+    except OSError:
+        size = 0
+    try:
+        shutil.rmtree(target_dir)
+    except OSError:
+        # Don't mask the real download error if cleanup itself fails;
+        # the operator will see the failed run + a stale dir and can
+        # decide. Log via stderr for parity with the rest of the
+        # module (no real logger here yet).
+        import sys as _sys
+        print(f"[model_stager] cleanup_partial failed for {target_dir}",
+              file=_sys.stderr)
+        return 0
+    return size
 
 
 def _free_bytes(p: Path) -> int:
@@ -91,32 +231,115 @@ def _free_bytes(p: Path) -> int:
         return 0
 
 
-def _estimate_size_bytes(metadata: dict[str, Any]) -> int | None:
+def _estimate_size_bytes(metadata: dict[str, Any],
+                         allow_patterns: list[str] | None = None) -> int | None:
     """Estimate the download footprint from curator + HF metadata.
 
     Order:
       1. ``hf_info.usedStorage`` (HF API field, exact when present).
       2. ``hf_info.safetensors.total`` (sum of shard sizes).
-      3. fallback: param_count(B) × 2 bytes/param (fp16/bf16 default).
+      3. ``hf_info.siblings`` sum of ``size`` (filtered by allow_patterns
+         when given) — covers GGUF repos correctly.
+      4. fallback: param_count(B) × 2 bytes/param (fp16/bf16 default).
+
+    PR#32 added (3): unsloth/Qwen3.6-27B-GGUF has param_count=27B,
+    so the old fp16 fallback estimated 54 GB; the actual repo holds
+    eight quantization variants totaling 328 GB. After we narrow with
+    allow_patterns=[*Q4_K_M.gguf] the real-with-pattern estimate is
+    ~16 GB — accurate again.
     """
     hf = metadata.get("hf_info") or {}
     used = hf.get("usedStorage") or hf.get("used_storage")
-    if isinstance(used, int) and used > 0:
+    if isinstance(used, int) and used > 0 and not allow_patterns:
+        # usedStorage covers the WHOLE repo; only trust it when we'll
+        # also download the whole repo (no allow_patterns filter).
         return used
     st = hf.get("safetensors")
     if isinstance(st, dict):
         total = st.get("total")
-        if isinstance(total, int) and total > 0:
+        if isinstance(total, int) and total > 0 and not allow_patterns:
             return total
+
+    # Per-sibling sum (with optional allow_patterns filter).
+    siblings = hf.get("siblings") or []
+    if isinstance(siblings, list) and siblings:
+        from fnmatch import fnmatch
+        total = 0
+        matched = 0
+        for sib in siblings:
+            if not isinstance(sib, dict):
+                continue
+            name = sib.get("rfilename") or sib.get("path") or ""
+            size = sib.get("size") or sib.get("lfs", {}).get("size") if isinstance(sib.get("lfs"), dict) else sib.get("size")
+            if not isinstance(size, int) or size <= 0:
+                continue
+            if allow_patterns:
+                if not any(fnmatch(name, pat) for pat in allow_patterns):
+                    continue
+            total += size
+            matched += 1
+        if matched > 0:
+            return total
+
     pc = metadata.get("param_count") or ""
     import re
     m = re.search(r"(\d+(?:\.\d+)?)\s*b\b", str(pc).lower())
     if not m:
-        # PR#26 fallback: try hf_id (e.g. "Llama-3.1-405B-Instruct").
         m = re.search(r"(\d+(?:\.\d+)?)\s*b\b", (metadata.get("hf_id") or "").lower())
     if m:
         billions = float(m.group(1))
         return int(billions * 1e9 * 2)
+    return None
+
+
+# ── allow_patterns heuristic ────────────────────────────────────────────────
+
+
+# Default quantization preference for GGUF repos. Q4_K_M is the
+# 2025-2026 community consensus "best size/quality tradeoff" for a
+# 7B-70B class model. We pick a single variant so the orchestrator
+# doesn't blindly download all 8 quantizations (the unsloth/Qwen3.6
+# 328 GB disaster).
+GGUF_PREFERRED_QUANT = "Q4_K_M"
+
+
+def _looks_like_gguf_repo(hf_id: str, metadata: dict[str, Any]) -> bool:
+    name = (hf_id or "").lower()
+    if name.endswith("-gguf") or "-gguf-" in name or name.endswith(".gguf"):
+        return True
+    hf = metadata.get("hf_info") or {}
+    if (hf.get("library_name") or "").lower() == "gguf":
+        return True
+    sib = hf.get("siblings") or []
+    # If most of the siblings are .gguf, it's a GGUF repo.
+    gguf_count = sum(
+        1 for s in sib
+        if isinstance(s, dict) and (s.get("rfilename") or "").lower().endswith(".gguf")
+    )
+    if sib and gguf_count >= max(1, len(sib) // 2):
+        return True
+    return False
+
+
+def _compute_allow_patterns(hf_id: str,
+                            metadata: dict[str, Any]) -> list[str] | None:
+    """Return a small allow_patterns whitelist when the repo type
+    requires it; ``None`` means 'pull everything snapshot_download
+    would normally pull'.
+
+    PR#32: this prevents the 'GGUF repo with 8 quantization variants
+    silently consumes 328 GB' case. For GGUF repos we pick exactly one
+    quantization (``Q4_K_M`` by default) plus the manifest files. Any
+    repo whose siblings list says it's predominantly GGUF gets this
+    treatment, not just `*-GGUF`-named ones.
+    """
+    if _looks_like_gguf_repo(hf_id, metadata):
+        return [
+            f"*{GGUF_PREFERRED_QUANT}*.gguf",
+            "*.json",
+            "*.md",
+            "tokenizer*",
+        ]
     return None
 
 
@@ -134,6 +357,10 @@ class StageModelResult:
     bytes_on_disk: int = 0
     files: int = 0
     target_dir: str = ""
+    # PR#32: surfaces how much disk a hard-fail cleanup reclaimed,
+    # so the Panel can show "freed 328G" instead of a silent rmtree.
+    bytes_freed: int = 0
+    allow_patterns: list[str] | None = None
     extra: dict[str, Any] | None = None
 
 
@@ -217,10 +444,18 @@ def ensure_model_staged(
             extra={"already_staged": True},
         )
 
+    # PR#32: pick allow_patterns BEFORE size estimation, so the size
+    # estimate matches what we'll actually download (critical for GGUF
+    # repos where the unfiltered size can be 5-10× the filtered one).
+    effective_allow = (
+        allow_patterns if allow_patterns is not None
+        else _compute_allow_patterns(hf_id, metadata)
+    )
+
     # 3. Disk-headroom gate: if we can estimate, refuse to start a
     # download we know won't fit. Pre-flight check, NOT a partial-fail
     # cleanup (that's harder to make idempotent).
-    estimate = _estimate_size_bytes(metadata)
+    estimate = _estimate_size_bytes(metadata, allow_patterns=effective_allow)
     free = _free_bytes(target_dir)
     headroom_needed = int(headroom_floor_bytes)
     if estimate is not None:
@@ -250,9 +485,15 @@ def ensure_model_staged(
             repo_id=hf_id,
             local_dir=str(target_dir),
             max_workers=max_workers,
-            allow_patterns=allow_patterns,
+            allow_patterns=effective_allow,
         )
     except Exception as e:
+        # PR#32: clean up the partial-download dir so the cache doesn't
+        # accumulate dead-weight from failed runs (the 357 GB residue
+        # bug). We only delete if the target was created BY THIS CALL
+        # — if a prior run had already staged real weights here, we
+        # mustn't blow them away.
+        freed = _cleanup_partial(target_dir)
         # Hard-fail. Do NOT graceful-skip — the orchestrator's normal
         # retry path is the right home for "transient network failure",
         # and a hard fault makes the Panel surface the run as `failed`
@@ -264,18 +505,27 @@ def ensure_model_staged(
             error_kind="download_failed",
             duration_s=now() - t0,
             target_dir=str(target_dir),
+            bytes_freed=freed,
+            allow_patterns=effective_allow,
         )
 
     # 5. Post-download sanity: did we actually get weights?
     if not _has_weight_file(target_dir):
+        # PR#32: same cleanup as the exception path. A "succeeded but
+        # nothing usable on disk" outcome (e.g. allow_patterns matched
+        # zero files, or the repo only ships an unsupported layout)
+        # is by definition unusable — the cache should not retain it.
+        freed = _cleanup_partial(target_dir)
         return StageModelResult(
             ok=False, skipped=False,
             error=(
                 f"snapshot_download returned ok but target_dir lacks "
-                f"config.json + weights: {target_dir}"),
+                f"recognised weights: {target_dir}"),
             error_kind="incomplete_after_download",
             duration_s=now() - t0,
             target_dir=str(target_dir),
+            bytes_freed=freed,
+            allow_patterns=effective_allow,
         )
 
     size_bytes = sum(
@@ -291,6 +541,7 @@ def ensure_model_staged(
         bytes_on_disk=size_bytes,
         files=files,
         target_dir=str(target_dir),
+        allow_patterns=effective_allow,
         extra={
             "already_staged": False,
             "estimate_bytes": estimate,
@@ -316,6 +567,8 @@ def write_provenance(run_dir: Path, result: StageModelResult) -> Path:
         "bytes_on_disk": result.bytes_on_disk,
         "files": result.files,
         "target_dir": result.target_dir,
+        "bytes_freed": result.bytes_freed,
+        "allow_patterns": result.allow_patterns,
         "extra": result.extra or {},
     }, ensure_ascii=False, indent=2), encoding="utf-8")
     return out
