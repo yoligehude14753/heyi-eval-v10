@@ -662,10 +662,42 @@ setInterval(refresh, 30000);
 
 
 def render_results_page() -> str:
-    """Standalone results leaderboard — all-test-results-at-a-glance view."""
+    """Standalone results leaderboard — all-test-results-at-a-glance view.
+
+    PR#32 follow-up: sort rows so the actual evaluation results
+    (status=ok with capability + pass_rate data) are at the top —
+    previously a single failed run with a 4 KB vLLM traceback in its
+    failure_reason pushed every successful run below the fold and the
+    user couldn't see any actual evaluation data without scrolling.
+    Also: truncate failure_reason at 200 chars in the cell, expose
+    full text via title= attr / a details disclosure.
+    """
     data = results_leaderboard()
+
+    def _row_priority(r: dict) -> tuple:
+        """Lowest tuple sorts first.
+        (0, _) = ok with real capability data (preferred top)
+        (1, _) = ok without capability data
+        (2, _) = in_progress
+        (3, _) = failed
+        (4, _) = aborted (typically oversize gate / skipped)"""
+        st = r.get("status") or ""
+        has_cap = isinstance(r.get("pass_rate"), (int, float))
+        if st == "ok" and has_cap:
+            # within OK-with-cap, higher pass_rate first
+            return (0, -(r.get("pass_rate") or 0))
+        if st == "ok":
+            return (1, 0)
+        if st == "in_progress":
+            return (2, 0)
+        if st == "failed":
+            return (3, 0)
+        return (4, 0)
+
+    sorted_rows = sorted(data["rows"], key=_row_priority)
+
     rows_html = []
-    for r in data["rows"]:
+    for r in sorted_rows:
         if r.get("hf_id") in (None, "?"):
             continue
         hf = html.escape(r.get("hf_id") or "-")
@@ -690,7 +722,25 @@ def render_results_page() -> str:
             dur_s = f"{dur / 60:.1f}m" if dur >= 60 else f"{dur:.0f}s"
         else:
             dur_s = "-"
-        fail = html.escape(r.get("failure_reason") or "")
+        fail_raw = r.get("failure_reason") or ""
+        # PR#32 follow-up: enormous vLLM tracebacks (4 KB+ with ANSI
+        # escape sequences) used to be dumped raw into the cell — one
+        # bad row hid every other row below the fold. Truncate display
+        # to 200 chars; full text available via title= tooltip.
+        if len(fail_raw) > 200:
+            fail_short = fail_raw[:200] + "…"
+        else:
+            fail_short = fail_raw
+        fail = html.escape(fail_short)
+        if fail_raw:
+            fail_html = (
+                '<div class="err" '
+                'style="font-size:11px;overflow:hidden;max-height:80px" '
+                f'title="{html.escape(fail_raw, quote=True)}">'
+                f'✗ {fail}</div>'
+            )
+        else:
+            fail_html = ""
         showcase_n = r.get("showcase_items") or 0
 
         # PR#18 perf columns
@@ -729,8 +779,7 @@ def render_results_page() -> str:
             f"<td>{ttft_cell}</td><td>{tps_cell}</td>"
             f"<td>{showcase_n} 条</td>"
             f"<td><span class='pill'>{fi}</span></td>"
-            f"<td style='max-width:380px;font-size:12px;color:#b8b8c4'>{summary}"
-            f"{f'<div class=err style=font-size:11px>✗ {fail}</div>' if fail else ''}</td>"
+            f"<td style='max-width:380px;font-size:12px;color:#b8b8c4;overflow:hidden;text-overflow:ellipsis;max-height:120px'>{summary}{fail_html}</td>"
             f"<td>{dur_s}</td></tr>"
         )
 
