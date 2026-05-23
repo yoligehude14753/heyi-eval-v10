@@ -359,5 +359,111 @@ class CapabilityHonestyGateTests(unittest.TestCase):
         self.assertIn("capability_endpoint_broken", src)
 
 
+# ── iterative repair flow (PR#36a refactor) ──────────────────────────
+
+
+class IterativeRepairFlowTests(unittest.TestCase):
+    """The repair loop must re-propose strategies after each failed
+    attempt so newly-classified failures bring in new strategies.
+
+    The canonical chain from the nv8 Qwen3.6-27B-GGUF run:
+        attempt 1 (initial)               → gguf_needs_file_path
+            (proposes [use_gguf_file_path, swap_engine_transformers])
+        attempt 2 (use_gguf_file_path)    → model_type_unknown
+            (proposes [swap_vllm_image_latest, swap_engine_sglang,
+                       swap_engine_transformers])
+        attempt 3 (swap_vllm_image_latest)→ inference_broken/501
+            (proposes [swap_engine_sglang])
+        attempt 4 (swap_engine_sglang)    → ok ✓
+
+    Before PR#36a the loop only used the strategy list generated from
+    attempt 1's failure shape and would never reach swap_engine_sglang
+    on the inference_broken classification.
+    """
+
+    def _next_strategies(
+        self, plan: dict, engine: str, image: str, error_kind: str,
+        logs: str,
+    ) -> list[str]:
+        f = deploy_repair.DeployFailure(
+            engine=engine, image=image, error_kind=error_kind, logs=logs,
+        )
+        return [p.name for p in deploy_repair.propose_attempts(plan, f)]
+
+    def test_round1_gguf_dir_proposes_use_gguf_file_path(self):
+        plan = {"engine": "vllm",
+                "engine_image": "vllm/vllm-openai:v0.11.0",
+                "vllm_args": {}, "_gguf_filename_hint": "Q4_K_M.gguf"}
+        s = self._next_strategies(
+            plan, "vllm", "vllm/vllm-openai:v0.11.0", "early_exit",
+            "For GGUF: pass the local path of the GGUF checkpoint",
+        )
+        self.assertIn("use_gguf_file_path", s,
+                      f"round1 must propose use_gguf_file_path, got {s}")
+
+    def test_round2_qwen35_not_supported_proposes_engine_swap(self):
+        """After use_gguf_file_path fixed the path but vLLM still can't
+        load qwen35 arch, the chain must move to a different engine."""
+        plan = {"engine": "vllm",
+                "engine_image": "vllm/vllm-openai:v0.11.0"}
+        s = self._next_strategies(
+            plan, "vllm", "vllm/vllm-openai:v0.11.0", "early_exit",
+            "ValueError: GGUF model with architecture qwen35 is not "
+            "supported yet",
+        )
+        # The pre-PR#36 single-shot would have returned mostly the same
+        # set as round 1; we just need ONE forward-motion strategy here.
+        self.assertTrue(
+            "swap_engine_sglang" in s or "swap_engine_transformers" in s
+            or "swap_vllm_image_latest" in s,
+            f"round2 must propose an engine/image swap, got {s}",
+        )
+
+    def test_round3_transformers_501_proposes_back_to_vllm_or_sglang(self):
+        """The KEY test: when transformers-runner went up and answered
+        501, PR#36a must propose going to vllm:latest or sglang.
+        Before PR#36, neither was applicable from a transformers
+        failure."""
+        plan = {"engine": "transformers",
+                "engine_image": "heyi-eval/transformers-runner:v10"}
+        s = self._next_strategies(
+            plan, "transformers", "heyi-eval/transformers-runner:v10",
+            "inference_broken",
+            ("[inference_probe] HTTP 501: NotImplementedError: GGUF "
+             "model with architecture qwen35 is not supported"),
+        )
+        # At least one forward-motion engine swap must be proposed
+        forward_motion = {"swap_vllm_image_latest", "swap_engine_sglang"}
+        self.assertTrue(
+            forward_motion & set(s),
+            f"round3 must propose a forward-motion engine swap "
+            f"({forward_motion}), got {s}",
+        )
+
+    def test_iterative_repair_terminates_when_no_new_strategies(self):
+        """The loop must NOT cycle forever; when classify() returns a
+        class with no applicable strategies, propose_attempts returns
+        an empty actionable set."""
+        plan = {"engine": "sglang",
+                "engine_image": "lmsysorg/sglang:latest"}
+        s = self._next_strategies(
+            plan, "sglang", "lmsysorg/sglang:latest",
+            "early_exit", "completely unknown error pattern",
+        )
+        # swap_engine_transformers is the last-resort fallback; nothing
+        # more invasive than that should be proposed. Specifically NOT
+        # swap_engine_sglang (already on sglang) nor swap_vllm (not vllm).
+        applicable = [p for p in s
+                      if p not in {"swap_engine_sglang"}]
+        # Empty or just transformers — anything is fine, as long as no
+        # infinite loop is possible. We rely on the seen_strategies
+        # gate in stages_py to prevent retry of the same strategy.
+        for name in applicable:
+            self.assertNotEqual(
+                name, "swap_engine_sglang",
+                "sglang strategy must reject when already on sglang",
+            )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

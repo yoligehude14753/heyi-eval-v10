@@ -276,30 +276,38 @@ def propose_repair(
         engine_plan=engine_plan, previous_attempts=previous_attempts,
     )
 
+    # PR#36: HeyiEngineClient exposes `.call(messages, ...)` not
+    # `.chat(...)`. The previous code path was unreachable in the
+    # PR#33 dry-run because the strategies always succeeded; the
+    # PR#35 GGUF live experiment was the first that exhausted
+    # rule-based strategies and tried to escalate — and crashed with
+    # AttributeError. Use .call() and read .text off the CallResult.
+    #
+    # Note: judge_model_name is consumed by heyi_engine via the
+    # production deployment's model discovery; the parameter is kept
+    # in this signature only for logging/audit (we record which
+    # judge identity we asked).
     try:
-        resp = client.chat(
-            model=judge_model_name,
+        result = client.call(
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": user},
             ],
             temperature=0.2,
             max_tokens=max_tokens,
-            timeout=timeout_s,
         )
     except HeyiEngineError as e:
         return AgentProposal(
             ok=False, error=f"engine_error: {e}",
             duration_s=time.time() - t0,
         )
+    except AttributeError as e:
+        return AgentProposal(
+            ok=False, error=f"client_api_mismatch: {e}",
+            duration_s=time.time() - t0,
+        )
 
-    raw = ""
-    if isinstance(resp, dict):
-        choices = resp.get("choices") or []
-        if choices and isinstance(choices[0], dict):
-            msg = choices[0].get("message") or {}
-            raw = msg.get("content") or ""
-    raw = str(raw)
+    raw = str(result.text or "")
 
     try:
         obj = _parse_proposal(raw)

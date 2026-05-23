@@ -757,36 +757,93 @@ def execute_deploy(
                 "error": info["error"][:500],
                 "logs_tail": info["logs"][-500:],
             }]
-            proposals = dr.propose_attempts(plan, failure)
-            print(f"  [DEPLOY] repair proposed {len(proposals)} strategies: "
-                  f"{[p.name for p in proposals]}")
-
+            # PR#36a: re-propose strategies after EACH failed attempt so
+            # the classifier can react to evolving failure shapes. The
+            # canonical example is the GGUF chain:
+            #   1) early_exit / gguf_needs_file_path
+            #      → use_gguf_file_path (vllm) proposed
+            #   2) early_exit / model_type_unknown (qwen35 unsupported)
+            #      → swap_engine_transformers proposed
+            #   3) inference_broken (transformers can't serve GGUF)
+            #      → only now should swap_vllm_image_latest /
+            #        swap_engine_sglang be proposed
+            # Before this change, the strategy list was frozen at step 1
+            # and steps 2-3 would never reach the strategies that
+            # actually fit them.
+            seen_strategies: set[str] = set()
+            all_proposed: list[str] = []
+            current_failure = failure
             winning: dr.StrategyResult | None = None
-            for proposal in proposals:
-                cand_plan = proposal.new_plan or plan
-                cand_engine = (cand_plan.get("engine") or engine).lower()
-                cand_image = proposal.new_image or _ENGINE_IMAGES.get(
-                    cand_engine, image)
-                t_strat = time.time()
-                ok2, info2 = _try_once(cand_plan, cand_image, cand_engine)
-                attempts_record.append({
-                    "strategy": proposal.name,
-                    "engine": cand_engine, "image": cand_image,
-                    "notes": proposal.notes,
-                    "duration_s": round(time.time() - t_strat, 1),
-                    "ok": ok2,
-                    "error_kind": info2.get("error_kind") if not ok2 else None,
-                    "error": (info2.get("error") or "")[:500] if not ok2 else None,
-                    "logs_tail": (info2.get("logs") or "")[-500:] if not ok2 else None,
-                })
-                if ok2:
-                    winning = proposal
-                    info = info2
+            max_iterations = 8
+            iter_count = 0
+            while iter_count < max_iterations:
+                iter_count += 1
+                proposals = dr.propose_attempts(plan, current_failure)
+                # Filter out strategies we've already tried this run
+                fresh = [p for p in proposals if p.name not in seen_strategies]
+                if not fresh:
+                    if iter_count == 1:
+                        print("  [DEPLOY] repair: no applicable strategies")
+                    else:
+                        print(
+                            f"  [DEPLOY] repair: no new strategies applicable "
+                            f"after iter {iter_count - 1}"
+                        )
+                    break
+                print(f"  [DEPLOY] repair iter {iter_count}: "
+                      f"{[p.name for p in fresh]} (cls="
+                      f"{current_failure.classify()})")
+                tried_any = False
+                for proposal in fresh:
+                    seen_strategies.add(proposal.name)
+                    if proposal.name not in all_proposed:
+                        all_proposed.append(proposal.name)
+                    cand_plan = proposal.new_plan or plan
+                    cand_engine = (cand_plan.get("engine") or engine).lower()
+                    cand_image = proposal.new_image or _ENGINE_IMAGES.get(
+                        cand_engine, image)
+                    t_strat = time.time()
+                    ok2, info2 = _try_once(cand_plan, cand_image, cand_engine)
+                    attempts_record.append({
+                        "strategy": proposal.name,
+                        "engine": cand_engine, "image": cand_image,
+                        "notes": proposal.notes,
+                        "duration_s": round(time.time() - t_strat, 1),
+                        "ok": ok2,
+                        "error_kind": info2.get("error_kind") if not ok2 else None,
+                        "error": (info2.get("error") or "")[:500] if not ok2 else None,
+                        "logs_tail": (info2.get("logs") or "")[-500:] if not ok2 else None,
+                    })
+                    tried_any = True
+                    if ok2:
+                        winning = proposal
+                        info = info2
+                        plan = cand_plan
+                        engine = cand_engine
+                        image = cand_image
+                        ok = True
+                        break
+                    # Failure: build the failure object for the NEXT
+                    # round so re-classification can route to new
+                    # strategies on the evolved shape.
+                    current_failure = dr.DeployFailure(
+                        engine=cand_engine, image=cand_image,
+                        error_kind=info2.get("error_kind") or "early_exit",
+                        logs=info2.get("logs") or "",
+                    )
+                    # Update the running plan/engine/image so subsequent
+                    # propose_attempts sees the engine we just tried
+                    # (otherwise swap_engine_sglang would keep getting
+                    # rejected with "already on sglang" or
+                    # "not a vllm failure").
                     plan = cand_plan
                     engine = cand_engine
                     image = cand_image
-                    ok = True
+                if ok or not tried_any:
                     break
+            proposals = []  # for repair_log compatibility below
+            for name in all_proposed:
+                proposals.append(dr.StrategyResult(name, None))
 
             # ── PR#33 LLM-agent escalation ──
             # If rule-based strategies all failed, ask the MiniMax-M2.7

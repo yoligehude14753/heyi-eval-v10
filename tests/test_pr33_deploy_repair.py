@@ -277,19 +277,36 @@ class TestAgentParseProposal(unittest.TestCase):
 # ── LLM-agent: end-to-end with mocked client ─────────────────────────────
 
 
+class _FakeCallResult:
+    def __init__(self, text: str):
+        self.text = text
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.model_id = "fake"
+        self.elapsed_s = 0.01
+        self.finish_reason = "stop"
+        self.raw_response: dict = {}
+
+
 class _FakeClient:
-    """Mimics HeyiEngineClient.chat() with a canned response."""
+    """Mimics HeyiEngineClient.call() with a canned response.
+
+    Renamed `chat` → `call` in PR#36 to match the production
+    HeyiEngineClient API; PR#33's agent escalation was unreachable
+    before so the mismatch went undetected until the PR#36 live
+    experiment surfaced AttributeError mid-repair on nv8.
+    """
     def __init__(self, content: str, raises: bool = False):
         self._content = content
         self._raises = raises
         self.calls: list[dict] = []
 
-    def chat(self, *, model, messages, **kw):
-        self.calls.append({"model": model, "messages": messages, **kw})
+    def call(self, *, messages, **kw):
+        self.calls.append({"messages": messages, **kw})
         if self._raises:
             from heyi_engine import HeyiEngineError
             raise HeyiEngineError("simulated network failure")
-        return {"choices": [{"message": {"content": self._content}}]}
+        return _FakeCallResult(self._content)
 
 
 class TestAgentProposeRepair(unittest.TestCase):
