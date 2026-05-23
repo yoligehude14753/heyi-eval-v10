@@ -183,14 +183,24 @@ def _vllm_command(model_in_container: str, args: Mapping[str, Any], port: int) -
     Accepts both snake_case and kebab-case keys. We don't validate
     every possible flag — vllm itself does that at startup; bad flags
     surface as STARTED-then-EXITED containers and S7 catches them.
+
+    PR#35: ``args["model_path_override"]`` is a private-by-convention
+    key set by deploy_repair's GGUF strategy. When present, it
+    replaces the default container-bind path for the ``--model``
+    flag (so vLLM gets a single GGUF file path, not a directory)
+    AND is suppressed from the CLI translation so it doesn't leak
+    as ``--model-path-override``.
     """
+    actual_model = str(args.get("model_path_override") or model_in_container)
     cmd = [
-        "--model", model_in_container,
+        "--model", actual_model,
         "--host", "0.0.0.0",
         "--port", str(port),
     ]
     seen: set[str] = set()
     for k, v in args.items():
+        if k == "model_path_override":
+            continue
         flag = "--" + k.replace("_", "-")
         if flag in seen:
             continue
@@ -403,6 +413,18 @@ def execute_deploy(
             )
 
         model_host_path = _model_path_on_host(cfg, run.hf_id)
+        # PR#35: surface the first GGUF filename in the cache (if any)
+        # so deploy_repair's strategy_use_gguf_file_path can rewrite
+        # the --model arg to a concrete file rather than a directory.
+        # We pick Q4_K_M preferentially to match PR#32's narrow logic;
+        # if no Q4_K_M is present (e.g. operator already cleaned), fall
+        # back to lexicographic-first .gguf in the dir.
+        if model_host_path.exists():
+            gguf_files = sorted(p.name for p in model_host_path.glob("*.gguf"))
+            preferred = [n for n in gguf_files if "Q4_K_M" in n]
+            gguf_hint = (preferred or gguf_files or [None])[0]
+            if gguf_hint:
+                plan["_gguf_filename_hint"] = gguf_hint
         if not model_host_path.exists():
             # PR#31: STAGE_MODEL runs immediately before DEPLOY in
             # STAGES_IN_ORDER and is responsible for ensuring the
@@ -521,9 +543,54 @@ def execute_deploy(
                     "image": active_image,
                 }
 
-            sleep(0.5)
-            container.reload()
-            if container.status in ("exited", "dead"):
+            # PR#35: poll the container status across an "early crash
+            # window" instead of just a single 0.5s sleep. vLLM 0.11.0
+            # against GGUF / glm_ocr / other freshly-released model
+            # types crashes ~5-15s into startup, AFTER pydantic model
+            # config validation. With the old 0.5s probe we'd return
+            # ok=True, the container would die seconds later, READY_WAIT
+            # would notice (`container_died`) but the PR#33 auto-repair
+            # loop is wired only into _try_once — so the crash was
+            # invisible to repair. By stretching the probe to ~20s, the
+            # same crashes now surface here, in the repair-aware path,
+            # and the existing strategies (swap_vllm_image_latest,
+            # swap_engine_transformers, …) actually fire.
+            early_crash_window_s = float(
+                getattr(cfg, "deploy_early_crash_window_s", 20.0)
+            )
+            poll_step_s = 0.5
+            # Drive the loop by iteration count, not wall-clock, so unit
+            # tests that inject `sleep=_NOP_SLEEP` don't hang spinning
+            # against time.time() until the wall budget elapses. In
+            # production the loop body is dominated by the injected
+            # sleep + the brief container.reload() RPC, so iteration
+            # count and wall-clock are equivalent. We add 1 to round up
+            # so a 20 s window with 0.5 s step → 40 iterations.
+            n_steps = max(1, int(round(early_crash_window_s / poll_step_s)))
+            died = False
+            for _ in range(n_steps):
+                sleep(poll_step_s)
+                try:
+                    container.reload()
+                except DockerException:
+                    # Container disappeared between reloads — treat as died.
+                    died = True
+                    break
+                if container.status in ("exited", "dead"):
+                    died = True
+                    break
+                # Optimistic exit: as soon as the container is healthy on
+                # /v1/models we can stop polling early. This keeps repair
+                # iterations fast on the happy path.
+                try:
+                    status, body = _http_get_json(
+                        f"http://127.0.0.1:{port}/v1/models", timeout=1.0
+                    )
+                    if status == 200 and isinstance(body, dict) and body.get("data"):
+                        break
+                except Exception:
+                    pass
+            if died:
                 tail = _tail_logs(container, 100)
                 try:
                     container.remove(force=True)
@@ -531,7 +598,7 @@ def execute_deploy(
                     pass
                 return False, {
                     "error_kind": "early_exit",
-                    "error": f"container exited immediately; "
+                    "error": f"container exited within early-crash window; "
                              f"tail logs: {tail[:200]!r}",
                     "logs": tail,
                     "engine": active_engine, "image": active_image,

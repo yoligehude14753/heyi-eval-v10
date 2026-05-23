@@ -106,6 +106,20 @@ class OrchestratorConfig:
         os.environ.get("HEYI_EVAL_DEPLOY_REPAIR_AGENT_TIMEOUT_S", "90")
     )
 
+    # PR#35: how long DEPLOY's _try_once polls container status before
+    # declaring "this attempt is healthy". vLLM model-config validation
+    # for new architectures (glm_ocr, GGUF, …) fails ~5-15 s into
+    # startup; with a too-short window the crash escapes the repair
+    # loop and surfaces in READY_WAIT instead (where PR#33 isn't
+    # wired). 20 s is short enough not to delay legitimate cold
+    # starts (real vLLM ready-times for 7-27 B text models are
+    # 30-60 s, so the container is comfortably still "starting"
+    # at the 20 s mark) and long enough to catch every crash we've
+    # observed live. Override via HEYI_EVAL_DEPLOY_EARLY_CRASH_S.
+    deploy_early_crash_window_s: float = float(
+        os.environ.get("HEYI_EVAL_DEPLOY_EARLY_CRASH_S", "20")
+    )
+
     # PR#34c: wall-clock budget for snapshot_download inside STAGE_MODEL.
     # Default 30 min — long enough for legitimate ~50 GB downloads on the
     # hf-mirror, short enough to surface a CLOSE-WAIT hang as a real

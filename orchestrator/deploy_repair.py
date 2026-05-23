@@ -82,6 +82,7 @@ class DeployFailure:
 
         Class names are short strings stable enough to switch on:
           - ``model_type_unknown``
+          - ``gguf_needs_file_path``  (PR#35)
           - ``oom``
           - ``missing_dep``
           - ``port_in_use``
@@ -95,6 +96,12 @@ class DeployFailure:
             return "image_pull"
         if self.error_kind == "port_in_use":
             return "port_in_use"
+        # PR#35: vLLM 0.11.0 rejects --model=<dir> for GGUF repos
+        # with the exact message below. Catch it BEFORE the more
+        # general "model_type_unknown" branch because the same log
+        # also contains "Invalid repository ID or local directory".
+        if "For GGUF:" in s and "local path of the GGUF checkpoint" in s:
+            return "gguf_needs_file_path"
         if re.search(r"model type `[^`]+` but [Tt]ransformers does not "
                      r"recognize", s) or "Unrecognized configuration class" in s:
             return "model_type_unknown"
@@ -175,6 +182,16 @@ def strategy_add_trust_remote_code(
         return StrategyResult("add_trust_remote_code", None,
                               notes="not applicable to engine "
                               + failure.engine)
+    # PR#35: trust_remote_code can't fix GGUF path-vs-file failures
+    # (the model never reaches the load_remote_code branch — pydantic
+    # rejects the bare directory before we get there). Skip rather
+    # than burn a deploy attempt on an irrelevant strategy.
+    if failure.classify() == "gguf_needs_file_path":
+        return StrategyResult(
+            "add_trust_remote_code", None,
+            notes="failure is gguf_needs_file_path; trust_remote_code "
+                  "can't fix repo-format mismatch",
+        )
     args = dict(plan.get("vllm_args") or {})
     if args.get("trust_remote_code") in (True, "true", "True"):
         return StrategyResult("add_trust_remote_code", None,
@@ -277,6 +294,54 @@ def strategy_swap_engine_sglang(
     )
 
 
+def strategy_use_gguf_file_path(
+    plan: dict[str, Any], failure: DeployFailure,
+) -> StrategyResult:
+    """PR#35: vLLM rejects ``--model=<dir>`` for GGUF; point it at a file.
+
+    vLLM 0.11.0 error message::
+
+        Invalid repository ID or local directory specified: '/model'.
+        ...
+        3. For GGUF: pass the local path of the GGUF checkpoint.
+           Loading GGUF from a remote repo directly is not yet supported.
+
+    The strategy rewrites ``vllm_args.model_path_override`` so the
+    DEPLOY layer can substitute it into the ``--model`` argument.
+    We look up the actual filename via ``plan["_gguf_filename_hint"]``
+    if the caller populated it (the orchestrator does this from the
+    staged-cache directory listing); otherwise we fall back to a
+    best-guess glob ``/model/*Q4_K_M*.gguf`` which matches our
+    PR#32 narrow-download pattern.
+
+    This is a vLLM-only fix; SGLang has its own GGUF code path.
+    """
+    if failure.engine != "vllm":
+        return StrategyResult("use_gguf_file_path", None,
+                              notes="not a vllm failure")
+    if failure.classify() != "gguf_needs_file_path":
+        return StrategyResult(
+            "use_gguf_file_path", None,
+            notes="failure does not match GGUF path-vs-file signature",
+        )
+    hint = plan.get("_gguf_filename_hint")
+    if hint:
+        target = f"/model/{hint.lstrip('/')}"
+    else:
+        # Best-effort fallback aligned with PR#32's allow_patterns
+        # default ("*Q4_K_M*.gguf"). vLLM accepts a glob here as of
+        # 0.11.0 if exactly one file matches.
+        target = "/model/*Q4_K_M*.gguf"
+    args = dict(plan.get("vllm_args") or {})
+    args["model_path_override"] = target
+    new_plan = copy.deepcopy(plan)
+    new_plan["vllm_args"] = args
+    return StrategyResult(
+        "use_gguf_file_path", new_plan,
+        notes=f"point --model at GGUF file: {target}",
+    )
+
+
 def strategy_swap_engine_transformers(
     plan: dict[str, Any], failure: DeployFailure,
 ) -> StrategyResult:
@@ -302,6 +367,7 @@ def strategy_swap_engine_transformers(
 
 BUILTIN_STRATEGIES: list[StrategyFn] = [
     strategy_add_trust_remote_code,
+    strategy_use_gguf_file_path,
     strategy_lower_max_model_len,
     strategy_swap_vllm_image_latest,
     strategy_swap_engine_sglang,
