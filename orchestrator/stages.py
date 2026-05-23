@@ -462,38 +462,52 @@ def _vllm_args_hint(metadata: dict[str, Any]) -> dict[str, Any]:
     Not authoritative — cc-agent can still adapt at runtime (e.g. lower
     gpu-memory-utilization to fit alongside glm-51, like it did in T11).
 
-    PR#23 hardening: tensor_parallel_size estimation must handle
-    fractional param strings ("72.7B", "1.5B", "236.5B") because
-    HF model cards usually report the precise total, not a rounded
-    integer. The old substring-match heuristic missed e.g. "72.7B"
-    (no "72b" substring) and silently fell through to tp=1, which
-    then bypassed the INV-23 oversize gate. Now we extract the
-    leading numeric component with a regex.
+    Param-size estimation tiers (PR#23 + PR#26):
+      1. ``metadata["param_count"]`` (curator output, preferred).
+      2. PR#26: fall back to ``metadata["hf_id"]`` — public model
+         names almost always embed the size (``Llama-3.1-405B``,
+         ``Qwen2.5-72B``, ``DeepSeek-V3``). Without this fallback,
+         a curator gap (param_count=None) silently bypasses INV-23
+         and the oversize gate misses the model, which is exactly
+         what happened on the nv8 PR#26 batch run for Llama 405B.
     """
     import re
     ctx = metadata.get("context_length")
-    param_str = (metadata.get("param_count") or "").lower()
     hint: dict[str, Any] = {}
     if ctx and isinstance(ctx, int) and ctx > 0:
         hint["max_model_len"] = min(ctx, 32_768)
-    if param_str:
+
+    def _extract_b(s: str) -> float | None:
         # Extract the leading "<num>b" amount in billions; tolerate
         # decimals and stray surrounding text. e.g.:
-        #   "72.7B"     -> 72.7
-        #   "405B"      -> 405
-        #   "1.5b"      -> 1.5
-        #   "MoE-236.5B-A21B" -> 236.5 (we take the FIRST match)
-        m = re.search(r"(\d+(?:\.\d+)?)\s*b\b", param_str)
-        if m:
-            b = float(m.group(1))
-            if b >= 65:
-                hint["tensor_parallel_size"] = 4
-            elif b >= 28:
-                hint["tensor_parallel_size"] = 2
-            else:
-                hint["tensor_parallel_size"] = 1
-        else:
+        #   "72.7B"           -> 72.7
+        #   "405B"            -> 405
+        #   "1.5b"            -> 1.5
+        #   "MoE-236.5B-A21B" -> 236.5 (first match wins)
+        m = re.search(r"(\d+(?:\.\d+)?)\s*b\b", s.lower())
+        return float(m.group(1)) if m else None
+
+    b = _extract_b(metadata.get("param_count") or "")
+    if b is None:
+        # PR#26 hf-id fallback. Strict word-boundary regex on the
+        # model id so we don't false-positive on e.g. version
+        # numbers ("v1.5") embedded in a smaller model's path.
+        b = _extract_b(metadata.get("hf_id") or "")
+
+    if b is None:
+        # Truly unknown — preserve historical default of tp=1 only
+        # when we have ANY size signal at all (was the old behaviour
+        # when param_str was non-empty but unparseable).
+        if metadata.get("param_count") or metadata.get("hf_id"):
             hint["tensor_parallel_size"] = 1
+        return hint
+
+    if b >= 65:
+        hint["tensor_parallel_size"] = 4
+    elif b >= 28:
+        hint["tensor_parallel_size"] = 2
+    else:
+        hint["tensor_parallel_size"] = 1
     return hint
 
 

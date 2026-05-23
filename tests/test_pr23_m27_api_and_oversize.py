@@ -255,6 +255,40 @@ class TestVllmArgsHintTpHeuristic(unittest.TestCase):
         # E.g. "unknown", "TBD"
         self.assertEqual(self._hint(param_count="unknown")["tensor_parallel_size"], 1)
 
+    # ── PR#26: hf_id fallback when curator missed param_count ──
+
+    def test_hf_id_405b_triggers_tp4_when_param_count_missing(self) -> None:
+        """Reproduces the nv8 batch-eval gap: Llama 3.1-405B had
+        param_count=None, so the gate missed it. After PR#26 the
+        hf_id ("meta-llama/Llama-3.1-405B-Instruct") supplies the
+        size and tp=4 is selected.
+        """
+        h = self._hint(hf_id="meta-llama/Llama-3.1-405B-Instruct")
+        self.assertEqual(h["tensor_parallel_size"], 4)
+
+    def test_hf_id_72b_triggers_tp4(self) -> None:
+        h = self._hint(hf_id="Qwen/Qwen2.5-72B-Instruct")
+        self.assertEqual(h["tensor_parallel_size"], 4)
+
+    def test_hf_id_7b_stays_tp1(self) -> None:
+        h = self._hint(hf_id="Qwen/Qwen2.5-7B-Instruct")
+        self.assertEqual(h["tensor_parallel_size"], 1)
+
+    def test_param_count_wins_over_hf_id(self) -> None:
+        # If the curator successfully extracted param_count, that's
+        # authoritative — the model id is just a backup signal.
+        h = self._hint(
+            param_count="7B",
+            hf_id="Org/Some-Confusing-405B-Path-7B-Instruct",
+        )
+        self.assertEqual(h["tensor_parallel_size"], 1)
+
+    def test_neither_signal_returns_no_tp_hint(self) -> None:
+        # No param_count AND no hf_id → don't emit tp at all (keeps
+        # old "no information" behaviour).
+        h = self._hint()
+        self.assertNotIn("tensor_parallel_size", h)
+
 
 class TestEngineSelectArtifactShape(unittest.TestCase):
     """engine.json gets the new PR#23 fields; downstream stages
