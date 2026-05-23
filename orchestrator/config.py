@@ -120,6 +120,20 @@ class OrchestratorConfig:
         os.environ.get("HEYI_EVAL_DEPLOY_EARLY_CRASH_S", "20")
     )
 
+    # PR#36a: verify the deployed engine actually serves
+    # chat/completions before letting the run advance into
+    # CAPABILITY. /v1/models can return 200 while the engine
+    # NotImplementedError's every completion (transformers-runner
+    # + GGUF on nv8). The probe is gated by the model already
+    # showing up in /v1/models, so cold starts don't spuriously
+    # trip it.
+    deploy_inference_probe_enabled: bool = (
+        os.environ.get("HEYI_EVAL_INFERENCE_PROBE", "1") != "0"
+    )
+    deploy_inference_probe_timeout_s: float = float(
+        os.environ.get("HEYI_EVAL_INFERENCE_PROBE_TIMEOUT_S", "20")
+    )
+
     # PR#34c: wall-clock budget for snapshot_download inside STAGE_MODEL.
     # Default 30 min — long enough for legitimate ~50 GB downloads on the
     # hf-mirror, short enough to surface a CLOSE-WAIT hang as a real

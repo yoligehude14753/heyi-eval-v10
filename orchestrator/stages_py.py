@@ -249,6 +249,81 @@ def _http_get_json(url: str, *, timeout: float = 5.0) -> tuple[int, dict[str, An
         return (0, None)
 
 
+def _http_post_json(
+    url: str,
+    body: dict[str, Any],
+    *,
+    timeout: float = 15.0,
+) -> tuple[int, dict[str, Any] | None, str]:
+    """Tiny POST helper. Returns ``(status_code, parsed_body_or_None, raw_text)``.
+
+    PR#36a: used by ``_inference_probe`` to verify a deployed engine
+    actually serves completions, not just ``/v1/models``. We need
+    the raw text on error paths (501 from transformers-runner doesn't
+    return JSON) so the repair classifier can pattern-match on
+    things like ``"NotImplementedError"`` in the body.
+    """
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data,
+        headers={"Content-Type": "application/json",
+                 "Accept": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read().decode("utf-8", errors="replace")
+            try:
+                return (r.getcode(), json.loads(raw), raw)
+            except json.JSONDecodeError:
+                return (r.getcode(), None, raw)
+    except urllib.error.HTTPError as e:
+        raw = ""
+        try:
+            raw = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        return (e.code, None, raw)
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
+        return (0, None, str(e))
+
+
+def _inference_probe(
+    base_url: str,
+    *,
+    timeout: float = 15.0,
+) -> tuple[bool, int, str]:
+    """PR#36a: smoke-test ``/v1/chat/completions`` with a 1-token call.
+
+    Returns ``(ok, status, body_excerpt)``. ``ok`` is True only when
+    the endpoint returned a 2xx and the response shape includes at
+    least one choice — anything else (4xx, 5xx, missing 'choices',
+    connection refused, timeout) is False.
+
+    A deployed engine that serves ``/v1/models`` but rejects actual
+    inference is exactly the trap PR#33 fell into on nv8 with
+    qwen35-arch GGUF and transformers-runner: the container looked
+    healthy, /v1/models returned 200, but every completion 501'd.
+    This probe makes that lie impossible.
+    """
+    status, body, raw = _http_post_json(
+        f"{base_url.rstrip('/')}/v1/chat/completions",
+        {
+            "model": "evaluated",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1,
+            "temperature": 0.0,
+        },
+        timeout=timeout,
+    )
+    if status == 200 and isinstance(body, dict):
+        choices = body.get("choices") or []
+        if choices:
+            return (True, status, "ok")
+        return (False, status, "200 OK but empty choices")
+    return (False, status, (raw or "")[:400])
+
+
 # ── GPU isolation (PR#11) ─────────────────────────────────────────────────
 
 # nvidia-smi memory.used threshold below which we consider a GPU "idle
@@ -568,6 +643,7 @@ def execute_deploy(
             # so a 20 s window with 0.5 s step → 40 iterations.
             n_steps = max(1, int(round(early_crash_window_s / poll_step_s)))
             died = False
+            models_listed = False
             for _ in range(n_steps):
                 sleep(poll_step_s)
                 try:
@@ -587,6 +663,7 @@ def execute_deploy(
                         f"http://127.0.0.1:{port}/v1/models", timeout=1.0
                     )
                     if status == 200 and isinstance(body, dict) and body.get("data"):
+                        models_listed = True
                         break
                 except Exception:
                     pass
@@ -603,6 +680,53 @@ def execute_deploy(
                     "logs": tail,
                     "engine": active_engine, "image": active_image,
                 }
+            # PR#36a: a container that's "running" and listing /v1/models
+            # is not enough — we observed transformers-runner accept a
+            # GGUF directory, return 200 on /v1/models, then 501 on every
+            # chat/completions. That broke the eval (0/50 capability)
+            # while marking the run "ok". Verify with a tiny inference
+            # probe; if the engine refuses real work, surface that as a
+            # repair-visible failure so deploy_repair can swap to an
+            # engine/image combo that DOES serve completions.
+            #
+            # We only run the probe when /v1/models already listed a
+            # model — that's the gate that distinguishes "still loading"
+            # from "loaded but won't serve". Skip the probe entirely
+            # when getattr(cfg, "deploy_inference_probe_enabled") is
+            # False (tests can disable).
+            probe_enabled = getattr(
+                cfg, "deploy_inference_probe_enabled", True
+            )
+            if probe_enabled and models_listed:
+                probe_timeout = float(
+                    getattr(cfg, "deploy_inference_probe_timeout_s", 20.0)
+                )
+                ok_inf, status, excerpt = _inference_probe(
+                    f"http://127.0.0.1:{port}", timeout=probe_timeout,
+                )
+                if not ok_inf:
+                    # Surface as early_exit-equivalent so the existing
+                    # repair loop reacts. The logs field carries the
+                    # response body so the classifier can pattern-match
+                    # on "NotImplementedError" / "501" / etc.
+                    tail = _tail_logs(container, 100)
+                    combined_logs = (
+                        f"[inference_probe] HTTP {status}: {excerpt}\n\n"
+                        f"[container_logs_tail]\n{tail}"
+                    )
+                    try:
+                        container.remove(force=True)
+                    except DockerException:
+                        pass
+                    return False, {
+                        "error_kind": "inference_broken",
+                        "error": (
+                            f"engine listed /v1/models but chat/completions "
+                            f"returned HTTP {status}: {excerpt[:200]!r}"
+                        ),
+                        "logs": combined_logs,
+                        "engine": active_engine, "image": active_image,
+                    }
             return True, {
                 "container": container, "engine": active_engine,
                 "image": active_image, "args": cur_args, "command": cur_cmd,
@@ -612,9 +736,10 @@ def execute_deploy(
         ok, info = _try_once(plan, image, engine)
         repair_log: dict[str, Any] | None = None
 
-        # ── PR#33 repair loop ──
+        # ── PR#33 repair loop (extended in PR#36a to cover inference_broken) ──
         if not ok and enable_repair and info["error_kind"] in (
-                "early_exit", "image_pull", "docker_api"):
+                "early_exit", "image_pull", "docker_api",
+                "inference_broken"):
             from . import deploy_repair as dr
 
             failure = dr.DeployFailure(

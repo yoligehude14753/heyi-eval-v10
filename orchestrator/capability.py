@@ -39,6 +39,7 @@ import logging
 import time
 import urllib.error
 import urllib.request
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -1325,6 +1326,44 @@ def execute_capability(
     total = len(all_items_flat)
     pass_rate = (pass_count / total) if total else 0.0
 
+    # PR#36b: detect "endpoint broken across the board" and surface
+    # it as a hard CAPABILITY failure, not a silent OK with 0/N pass.
+    # The whisperkit-coreml run (PR#33-era) and the Qwen3.6-27B-GGUF
+    # transformers-runner run (PR#35-era) both finished status="ok"
+    # with 0/N pass and every item carrying error="http 501" — the
+    # Panel showed them as green ✓ even though zero useful work
+    # happened. That's a lie we must stop telling.
+    #
+    # Signature:
+    #   - at least N items attempted (so a 1-item modality without
+    #     real data doesn't trip us)
+    #   - 0% pass rate
+    #   - >= 80% of items carry the SAME HTTP-style error string
+    #
+    # We don't auto-fail just on "0% pass"; small models genuinely
+    # bombing GSM8K is a legitimate outcome, but those items will
+    # have non-empty `actual` and empty `error`.
+    broken_endpoint_reason: str | None = None
+    MIN_ITEMS_FOR_GATE = 4
+    if total >= MIN_ITEMS_FOR_GATE and pass_count == 0:
+        errored_items = [
+            it for it in all_items_flat
+            if (it.get("error") or "").strip() and not (it.get("actual") or "")
+        ]
+        if errored_items and (len(errored_items) / total) >= 0.8:
+            # Tally error signatures (first 40 chars, stripped of dynamic bits)
+            sig_counts: dict[str, int] = {}
+            for it in errored_items:
+                sig = re.sub(r"\d{2,}", "<n>", (it.get("error") or "")[:60])
+                sig_counts[sig] = sig_counts.get(sig, 0) + 1
+            if sig_counts:
+                top_sig, top_n = max(sig_counts.items(), key=lambda kv: kv[1])
+                if top_n / total >= 0.8:
+                    broken_endpoint_reason = (
+                        f"0/{total} pass; {top_n}/{total} items "
+                        f"errored with the same pattern {top_sig!r}"
+                    )
+
     payload: dict[str, Any] = {
         "stage": "CAPABILITY",
         "run_id": run.run_id,
@@ -1339,9 +1378,27 @@ def execute_capability(
     }
     if overall_aborted:
         payload["aborted_due_to"] = overall_aborted
+    if broken_endpoint_reason:
+        payload["broken_endpoint"] = broken_endpoint_reason
 
     _write_artifact(rd, "capability.json", payload)
     _write_artifact(rd / "_meta", "capability.json", payload)
+
+    if broken_endpoint_reason:
+        return StageResult(
+            ok=False,
+            duration_s=time.time() - t0,
+            artifacts=["capability.json", "_meta/capability.json"],
+            error=broken_endpoint_reason,
+            error_kind="capability_endpoint_broken",
+            payload={
+                "pass_rate": payload["pass_rate"],
+                "score": payload["score"],
+                "items": total,
+                "broken_endpoint": broken_endpoint_reason,
+            },
+            rc=1,
+        )
 
     return StageResult(
         ok=True,

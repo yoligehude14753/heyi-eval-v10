@@ -83,6 +83,9 @@ class DeployFailure:
         Class names are short strings stable enough to switch on:
           - ``model_type_unknown``
           - ``gguf_needs_file_path``  (PR#35)
+          - ``inference_not_implemented`` (PR#36a — engine listed
+            models but chat/completions returned 501/NotImplemented)
+          - ``inference_other_5xx`` (PR#36a — other server error)
           - ``oom``
           - ``missing_dep``
           - ``port_in_use``
@@ -96,6 +99,16 @@ class DeployFailure:
             return "image_pull"
         if self.error_kind == "port_in_use":
             return "port_in_use"
+        # PR#36a: inference-probe failure classification. The probe
+        # body distinguishes 501-NotImplementedError (model loaded but
+        # engine can't run it — transformers-runner+GGUF case) from
+        # generic 5xx (model crashed during inference, model_runner
+        # bug, etc).
+        if self.error_kind == "inference_broken":
+            if "501" in s or "NotImplementedError" in s or \
+               "not implemented" in s.lower():
+                return "inference_not_implemented"
+            return "inference_other_5xx"
         # PR#35: vLLM 0.11.0 rejects --model=<dir> for GGUF repos
         # with the exact message below. Catch it BEFORE the more
         # general "model_type_unknown" branch because the same log
@@ -250,20 +263,34 @@ def strategy_swap_vllm_image_latest(
     For ``model_type_unknown`` and ``cuda_arch_mismatch``-style
     errors a newer vLLM build usually fixes it because vLLM tracks
     HF transformers releases closely.
+
+    PR#36a: also applies when:
+    - the current engine is NOT vllm AND the failure is an
+      inference probe failure on whatever fallback we're stuck on
+      (transformers-runner can't serve GGUF → try vllm:latest with
+      the same GGUF file_path_override the use_gguf_file_path
+      strategy installed earlier);
+    - ``inference_other_5xx`` because that shape commonly indicates
+      a model-runner bug fixed in a later vLLM release.
     """
-    if failure.engine != "vllm":
+    if failure.image == "vllm/vllm-openai:latest" and failure.engine == "vllm":
         return StrategyResult("swap_vllm_image_latest", None,
-                              notes="not a vllm failure")
-    if failure.image.endswith(":latest"):
-        return StrategyResult("swap_vllm_image_latest", None,
-                              notes="already on :latest")
+                              notes="already on vllm/vllm-openai:latest")
     cls = failure.classify()
     if cls not in ("model_type_unknown", "cuda_arch_mismatch",
-                   "missing_dep", "other_early_exit"):
+                   "missing_dep", "other_early_exit",
+                   "inference_other_5xx",
+                   "inference_not_implemented"):
         return StrategyResult("swap_vllm_image_latest", None,
                               notes=f"class {cls!r} unlikely to be fixed "
                               "by image bump")
+    # For non-inference classes the engine must already be vLLM.
+    if cls in ("model_type_unknown", "cuda_arch_mismatch",
+               "missing_dep", "other_early_exit") and failure.engine != "vllm":
+        return StrategyResult("swap_vllm_image_latest", None,
+                              notes="not a vllm failure")
     new_plan = copy.deepcopy(plan)
+    new_plan["engine"] = "vllm"  # force engine to vllm when we're returning
     return StrategyResult(
         "swap_vllm_image_latest", new_plan,
         new_image="vllm/vllm-openai:latest",
@@ -274,18 +301,33 @@ def strategy_swap_vllm_image_latest(
 def strategy_swap_engine_sglang(
     plan: dict[str, Any], failure: DeployFailure,
 ) -> StrategyResult:
-    """Switch vLLM → SGLang. SGL's model coverage overlaps but is not
+    """Switch to SGLang. SGL's model coverage overlaps but is not
     identical to vLLM's; it's a useful fallback for the
-    ``model_type_unknown`` class."""
-    if failure.engine != "vllm":
+    ``model_type_unknown`` class.
+
+    PR#36a: also applies when an inference probe fails (the current
+    engine couldn't actually serve completions — usually
+    transformers-runner with an unsupported quantization). The
+    strategy targets any non-sglang engine, not just vLLM, because
+    the repair chain may already have stepped through several
+    engines and the next viable alternative could be SGL even from
+    a transformers fallback.
+    """
+    if failure.engine == "sglang":
         return StrategyResult("swap_engine_sglang", None,
-                              notes="not a vllm failure")
+                              notes="already on sglang")
     cls = failure.classify()
-    if cls not in ("model_type_unknown", "unsupported_dtype",
-                   "other_early_exit"):
+    inference_classes = ("inference_not_implemented", "inference_other_5xx")
+    deploy_classes = ("model_type_unknown", "unsupported_dtype",
+                      "other_early_exit")
+    if cls not in deploy_classes + inference_classes:
         return StrategyResult("swap_engine_sglang", None,
                               notes=f"class {cls!r} unlikely to be helped by "
                               "engine swap")
+    # When responding to an inference-broken failure, the previous
+    # engine was already running. We must NOT silently fall back to
+    # vLLM's image; the caller passes us the active plan and we
+    # rewrite engine only.
     new_plan = copy.deepcopy(plan)
     new_plan["engine"] = "sglang"
     return StrategyResult(

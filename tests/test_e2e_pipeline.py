@@ -298,6 +298,15 @@ class _Harness:
             capability_timeout_s=5,
             showcase_timeout_s=5,
             cleanup_timeout_s=5,
+            # PR#36a: the DEPLOY-level inference probe lives in
+            # stages_py, not in capability.py. The E2E harness mocks
+            # the capability stage's chat helper for sad-path tests
+            # but doesn't (and shouldn't) mock the deploy probe's
+            # _http_post_json. Disable the probe here so e2e tests
+            # still exercise the original DEPLOY → CAPABILITY flow.
+            # The PR#36a tests in test_pr36_inference_probe.py turn
+            # the probe back on explicitly.
+            deploy_inference_probe_enabled=False,
         )
 
         # Patch every external boundary.
