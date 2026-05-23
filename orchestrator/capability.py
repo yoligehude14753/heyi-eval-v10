@@ -851,31 +851,119 @@ def _load_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 def _read_capability_tags(run_dir: Path) -> list[str]:
-    """Read curated.json::capability_tags (preferred) or fall back to
-    modalities. Defaults to ``["text"]`` if nothing is available.
+    """Resolve capability_tags for a run, tiered:
+
+    1. Explicit ``curated.json::capability_tags`` — the
+       enricher/curator's authoritative output.
+    2. PR#27 fallback: ``metadata.json::hf_info.pipeline_tag`` —
+       the HF Hub model-author tag. This is more reliable than
+       anything we derive post-hoc, e.g. ``openai/whisper-tiny``
+       has ``pipeline_tag=automatic-speech-recognition`` even when
+       the curator failed to populate either `capability_tags` or
+       `modalities`. Without this fallback, whisper got tagged
+       as the default `["text"]` and got 25 gsm8k-style prompts
+       blasted at its ASR-only endpoint (all 25 returned http 501;
+       see docs/PR26_BATCH_EVAL_REPORT.md §3).
+    3. ``curated.json::modalities`` (legacy heuristic) — kept as
+       a last-resort signal when only the curator's modality
+       list survives.
+    4. Hard default ``["text"]``.
     """
     meta_curated = run_dir / "_meta" / "curated.json"
     if meta_curated.exists():
         try:
             obj = json.loads(meta_curated.read_text(encoding="utf-8"))
             tags = obj.get("capability_tags")
-            if isinstance(tags, list) and all(isinstance(t, str) for t in tags):
+            if isinstance(tags, list) and all(isinstance(t, str) for t in tags) and tags:
                 return tags
-            modalities = obj.get("modalities")
-            if isinstance(modalities, list):
-                return _infer_tags_from_modalities(modalities)
         except (json.JSONDecodeError, OSError):
-            pass
+            obj = {}
+    else:
+        obj = {}
+
+    # PR#27: pipeline_tag fallback (preferred over modalities since
+    # it's the canonical HF Hub author signal).
+    pipeline_tag = ""
+    metadata_path = run_dir / "_meta" / "metadata.json"
+    if metadata_path.exists():
+        try:
+            md = json.loads(metadata_path.read_text(encoding="utf-8"))
+            pipeline_tag = (md.get("hf_info") or {}).get("pipeline_tag") or ""
+        except (json.JSONDecodeError, OSError):
+            pipeline_tag = ""
+    inferred = _pipeline_tag_to_capability_tags(pipeline_tag)
+    if inferred:
+        return inferred
+
+    # Legacy: curated.modalities → tags (kept for very old enricher
+    # outputs that have no pipeline_tag at all).
+    modalities = obj.get("modalities") or []
+    if isinstance(modalities, list) and modalities:
+        return _infer_tags_from_modalities(modalities)
+
     return ["text"]
 
 
-def _infer_tags_from_modalities(modalities: list[str]) -> list[str]:
-    """Best-effort fallback when curator hasn't emitted capability_tags.
+def _pipeline_tag_to_capability_tags(tag: str) -> list[str]:
+    """Map an HF Hub ``pipeline_tag`` to the v10 capability_tags
+    that gate ``_select_applicable_categories``.
 
-    Defaults to ['text', 'code'] because every model HF lets you call
-    via chat/completions supports text I/O at least nominally, and the
-    coding tasks degrade gracefully on non-coder LLMs. Extra tags are
-    added for any non-textual modality the curator did note.
+    Critically distinguishes "chat-capable" pipelines (text,
+    text2text, multimodal chat) from "single-purpose" pipelines
+    (ASR-only, TTS-only, diffusion). A model whose pipeline is
+    ``automatic-speech-recognition`` must NOT inherit the ``text``
+    tag — its endpoint doesn't support chat completions and every
+    text item will 501 (PR#26 §3).
+
+    Returns ``[]`` when the tag is empty/unknown so the caller can
+    cascade further.
+    """
+    t = (tag or "").strip().lower()
+    if not t:
+        return []
+    # Chat-capable text pipelines.
+    if t in ("text-generation", "text2text-generation",
+             "fill-mask", "question-answering",
+             "summarization", "translation"):
+        return ["text", "code"]
+    # Vision-language (chat + image input).
+    if t in ("image-text-to-text", "visual-question-answering"):
+        return ["text", "code", "vision"]
+    if t == "image-to-text":
+        return ["text", "vision"]
+    if t == "video-to-text":
+        return ["text", "video"]
+    # Multimodal in/out.
+    if t == "any-to-any":
+        return ["text", "code", "vision", "audio", "asr"]
+    # Single-purpose audio pipelines.
+    if t == "automatic-speech-recognition":
+        return ["asr"]
+    if t == "audio-classification":
+        return ["audio"]
+    if t == "text-to-speech":
+        return ["tts"]
+    # Single-purpose diffusion / generation pipelines.
+    if t in ("text-to-image", "image-to-image", "inpainting"):
+        return ["image_gen"]
+    if t in ("text-to-video", "image-to-video", "video-to-video"):
+        return ["video_gen"]
+    if t == "text-to-audio":
+        return ["music_gen"]
+    # Embedding / classification (no v10 category for these yet).
+    if t in ("feature-extraction", "sentence-similarity",
+             "text-classification", "token-classification",
+             "zero-shot-classification"):
+        return ["embedding"]
+    return []
+
+
+def _infer_tags_from_modalities(modalities: list[str]) -> list[str]:
+    """Last-resort heuristic when neither ``capability_tags`` nor
+    ``pipeline_tag`` are available. Conservatively assumes text
+    + code chat support PLUS any non-textual modality the curator
+    noted; the PR#27 ``_pipeline_tag_to_capability_tags`` path is
+    preferred over this whenever a pipeline_tag exists.
     """
     tags: list[str] = ["text", "code"]
     norm = {str(m).lower() for m in modalities}
