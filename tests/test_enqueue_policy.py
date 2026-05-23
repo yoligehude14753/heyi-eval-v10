@@ -157,6 +157,82 @@ class DedupTests(unittest.TestCase):
             new_id = enqueue(store, "X/Y", skip_if_recent=False)
             self.assertIsNotNone(new_id)
 
+    # PR#38: recent-failure dampening on the cron path
+    def test_enqueue_skip_if_recent_blocks_on_recent_failure(self):
+        """PR#38: cron auto-enqueue (skip_if_recent=True) must NOT
+        re-enqueue a model that failed in the last 12 h. Live nv8
+        observed 4-5× repeats of the same fast-fail models per day."""
+        from orchestrator.main import _has_recent_failed_run
+        with tempfile.TemporaryDirectory() as td:
+            store = Store(Path(td))
+            r = Run(run_id="r-1", hf_id="X/Y")
+            r.status = RunStatus.FAILED
+            r.created_at = time.time() - 3600  # 1h ago
+            r.ended_at = r.created_at + 30
+            store.save_run(r)
+
+            self.assertTrue(_has_recent_failed_run(store, "X/Y"))
+            result = enqueue(store, "X/Y", skip_if_recent=True)
+            self.assertIsNone(result, "cron should skip recently-failed")
+
+    def test_enqueue_skip_if_recent_blocks_on_recent_aborted(self):
+        """Aborted is also a 'recent fail' signal — typically oversize
+        gating; no point in re-trying within 12 h."""
+        with tempfile.TemporaryDirectory() as td:
+            store = Store(Path(td))
+            r = Run(run_id="r-1", hf_id="X/Y")
+            r.status = RunStatus.ABORTED
+            r.created_at = time.time() - 1800  # 30min ago
+            r.ended_at = r.created_at + 5
+            store.save_run(r)
+
+            result = enqueue(store, "X/Y", skip_if_recent=True)
+            self.assertIsNone(result)
+
+    def test_enqueue_manual_path_still_adds_failed(self):
+        """Manual CLI (`orchestrator.main enqueue`) passes
+        skip_if_recent=False and MUST still allow re-running failed
+        models — that's the only way to retest after a fix."""
+        with tempfile.TemporaryDirectory() as td:
+            store = Store(Path(td))
+            r = Run(run_id="r-1", hf_id="X/Y")
+            r.status = RunStatus.FAILED
+            r.created_at = time.time() - 600
+            store.save_run(r)
+
+            new_id = enqueue(store, "X/Y", skip_if_recent=False)
+            self.assertIsNotNone(new_id, "manual enqueue must bypass "
+                                         "the recent-fail block")
+
+    def test_enqueue_skip_old_failure_does_not_block(self):
+        """A failure from 15 h ago should NOT block; the 12 h window
+        expires."""
+        with tempfile.TemporaryDirectory() as td:
+            store = Store(Path(td))
+            r = Run(run_id="r-1", hf_id="X/Y")
+            r.status = RunStatus.FAILED
+            r.created_at = time.time() - 15 * 3600
+            r.ended_at = r.created_at + 30
+            store.save_run(r)
+
+            new_id = enqueue(store, "X/Y", skip_if_recent=True)
+            self.assertIsNotNone(new_id, "cron must retry after 12h "
+                                         "backoff window")
+
+    def test_has_recent_failed_run_window_param(self):
+        """Custom window parameter works."""
+        from orchestrator.main import _has_recent_failed_run
+        with tempfile.TemporaryDirectory() as td:
+            store = Store(Path(td))
+            r = Run(run_id="r-1", hf_id="X/Y")
+            r.status = RunStatus.FAILED
+            r.created_at = time.time() - 6 * 3600  # 6h ago
+            store.save_run(r)
+            self.assertTrue(_has_recent_failed_run(
+                store, "X/Y", within_hours=12))
+            self.assertFalse(_has_recent_failed_run(
+                store, "X/Y", within_hours=4))
+
 
 class CmdEnqueueIntegrationTests(unittest.TestCase):
 

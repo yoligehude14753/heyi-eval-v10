@@ -409,6 +409,36 @@ def _has_recent_successful_run(store: Store, hf_id: str, *, within_days: int = 3
     return False
 
 
+def _has_recent_failed_run(
+    store: Store, hf_id: str, *, within_hours: float = 12.0,
+) -> bool:
+    """PR#38 (post-PR#36 nv8 observation): has this hf_id recently
+    failed or been aborted? Used by enqueue() to dampen hourly cron
+    re-tries of models that always fail fast.
+
+    Live nv8 data: discover/auto-enqueue brings ``gemma-4-26B-it-GGUF``,
+    ``Andycurrent/Gemma-3-1B-...-GGUF``, ``Qwen3-Coder-Next-GGUF`` back
+    to the queue every hour. Each gets re-staged (sometimes 13 GB of
+    download, then deleted on failure) and re-deployed for ~30s before
+    failing identically. Five hours, ~70 GB disk consumed for the same
+    three failures over and over.
+
+    We only block on the *last* status to allow PR#33-style auto-repair
+    to retry once after a manual fix lands. Default window is 12 h —
+    long enough for a fix-PR turnaround, short enough that abandoned
+    models eventually re-enter the queue.
+    """
+    cutoff = time.time() - within_hours * 3600.0
+    for r in store.list_runs(limit=500):
+        if r["hf_id"] != hf_id:
+            continue
+        if r["created_at"] < cutoff:
+            continue
+        # Most recent run wins (list_runs is ordered DESC by created_at)
+        return r["status"] in ("failed", "aborted")
+    return False
+
+
 def _hf_ids_in_queue(store: Store) -> set[str]:
     """Read queue.jsonl and return the set of hf_ids currently pending."""
     qp = queue_path(store)
@@ -460,6 +490,13 @@ def enqueue(store: Store, hf_id: str, *, skip_if_recent: bool = False) -> str | 
         print(f"skip (dedup): {hf_id} already pending/in_progress")
         return None
     if skip_if_recent and _has_recent_successful_run(store, hf_id):
+        return None
+    # PR#38: dampen hourly cron retries of models that failed within
+    # the last 12h. Honor the same `skip_if_recent` flag (only applies
+    # to the cron/auto-discover path; manual `enqueue` CLI calls pass
+    # skip_if_recent=False and bypass this).
+    if skip_if_recent and _has_recent_failed_run(store, hf_id):
+        print(f"skip (recent-fail): {hf_id} failed/aborted in last 12h")
         return None
     qp = queue_path(store)
     qp.parent.mkdir(parents=True, exist_ok=True)
