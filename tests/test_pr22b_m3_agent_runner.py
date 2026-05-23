@@ -205,14 +205,21 @@ class TestInvokeAgent(unittest.TestCase):
 
         def runner(argv):
             a = list(argv)
+            # Tolerate either ['systemctl', ...] (root) or
+            # ['sudo', '-n', 'systemctl', ...] (unprivileged).
+            if a[:3] == ["sudo", "-n", "systemctl"]:
+                a = a[2:]
             if a[:1] == ["systemctl"]:
                 if a[1] == "start":
                     return _cp(rc=start_rc, stderr="" if start_rc == 0 else "boom")
                 if a[1] == "show":
-                    # find "--property X"
-                    prop = a[a.index("--property") + 1]
+                    # PR#22b-M3: agent_runner now passes --property=X
+                    # (one token) to match sudoers literal-token rule.
+                    prop_tokens = [
+                        t.split("=", 1)[1] for t in a if t.startswith("--property=")
+                    ]
+                    prop = prop_tokens[0] if prop_tokens else None
                     if prop == "ActiveState":
-                        # consume sequentially; once exhausted return last
                         i = min(idx["i"], len(states) - 1)
                         idx["i"] += 1
                         return _cp(stdout=states[i])
@@ -283,6 +290,79 @@ class TestInvokeAgent(unittest.TestCase):
                 force_inproc_harvest=True,
             )
         self.assertEqual(cm.exception.kind, "timeout")
+
+    def test_use_sudo_default_wraps_systemctl(self) -> None:
+        # When unprivileged (or use_sudo=True explicit), every
+        # systemctl invocation MUST be prefixed with `sudo -n` so the
+        # call hits the NOPASSWD rule. Capture all argvs and assert.
+        spec = agent_runner.AgentSpec(mode="smoke", command="echo hi")
+        captured: list[list[str]] = []
+        def runner(argv):
+            captured.append(list(argv))
+            a = list(argv)
+            if a[:3] == ["sudo", "-n", "systemctl"]:
+                a = a[2:]
+            if a[:2] == ["systemctl", "start"]:
+                return _cp(rc=0)
+            if a[:2] == ["systemctl", "show"]:
+                prop_tokens = [
+                    t.split("=", 1)[1] for t in a if t.startswith("--property=")
+                ]
+                prop = prop_tokens[0] if prop_tokens else None
+                if prop == "ActiveState":
+                    return _cp(stdout="inactive")
+                if prop == "ExecMainStatus":
+                    return _cp(stdout="0")
+            return _cp()
+        # Pre-seed audit happy pair so summary parses cleanly.
+        aid = agent_audit.record_command(
+            argv=["x"], run_id="ut1", cwd=None,
+            user="heyi-eval-agent", pid=1, db_path=self.cfg.audit_db,
+        )
+        agent_audit.record_result(
+            parent_audit_id=aid, exit_code=0, duration_ms=1,
+            user="heyi-eval-agent", pid=1, db_path=self.cfg.audit_db,
+        )
+        agent_runner.invoke_agent(
+            "ut1", spec, cfg=self.cfg,
+            runner=runner, sleeper=lambda _s: None,
+            force_inproc_harvest=True,
+            use_sudo=True,
+        )
+        systemctl_calls = [c for c in captured if "systemctl" in c]
+        self.assertGreater(len(systemctl_calls), 0)
+        for c in systemctl_calls:
+            self.assertEqual(c[:2], ["sudo", "-n"],
+                             f"systemctl call missing sudo prefix: {c}")
+
+    def test_use_sudo_false_calls_systemctl_directly(self) -> None:
+        # Root caller path: no sudo prefix.
+        spec = agent_runner.AgentSpec(mode="smoke", command="echo hi")
+        captured: list[list[str]] = []
+        def runner(argv):
+            captured.append(list(argv))
+            a = list(argv)
+            if a[:2] == ["systemctl", "start"]:
+                return _cp(rc=0)
+            if a[:2] == ["systemctl", "show"]:
+                prop_tokens = [
+                    t.split("=", 1)[1] for t in a if t.startswith("--property=")
+                ]
+                prop = prop_tokens[0] if prop_tokens else None
+                if prop == "ActiveState":
+                    return _cp(stdout="inactive")
+                if prop == "ExecMainStatus":
+                    return _cp(stdout="0")
+            return _cp()
+        agent_runner.invoke_agent(
+            "ut1", spec, cfg=self.cfg,
+            runner=runner, sleeper=lambda _s: None,
+            force_inproc_harvest=True,
+            use_sudo=False,
+        )
+        for c in captured:
+            self.assertNotEqual(c[:1], ["sudo"],
+                                f"unexpected sudo prefix in root path: {c}")
 
     def test_unit_failed_marks_not_ok(self) -> None:
         # systemctl reports unit transitioned to failed with non-zero exit

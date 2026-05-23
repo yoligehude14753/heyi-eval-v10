@@ -101,10 +101,21 @@ class TestOrchestratorSudoersStatic(unittest.TestCase):
             txt,
             "bootstrap missing sudoers.d/heyi-eval-orchestrator install",
         )
+        # IMPORTANT: visudo runs on the SOURCE file, BEFORE install,
+        # without sudo — because the freshly-installed sudoers denies
+        # visudo to the `ai` user (HEYI_EVAL_ORCH_FORBIDDEN). Trying to
+        # `sudo visudo -c -f /etc/sudoers.d/heyi-eval-orchestrator` would
+        # be blocked by the very file we just installed.
         self.assertIn(
-            "visudo -c -f /etc/sudoers.d/heyi-eval-orchestrator",
+            "visudo -c -f '${ORCH_SUDOERS_SRC}'",
             txt,
-            "bootstrap missing visudo check for orchestrator sudoers",
+            "bootstrap must visudo -c the SOURCE file (post-install sudo visudo is self-blocked)",
+        )
+        self.assertNotIn(
+            "sudo visudo -c -f /etc/sudoers.d/heyi-eval-orchestrator",
+            txt,
+            "bootstrap must NOT post-install `sudo visudo` on the orchestrator "
+            "sudoers — that path is HEYI_EVAL_ORCH_FORBIDDEN and will fail",
         )
 
 

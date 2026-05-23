@@ -223,7 +223,38 @@ def query_recent(
         args.append(run_id)
     sql += " ORDER BY b.audit_id DESC LIMIT ?"
     args.append(int(limit))
-    with sqlite3.connect(str(db_path)) as conn:
+    # Tiered open strategy:
+    # 1. Default read-write: the typical test path (process owns the
+    #    DB, can write the directory).
+    # 2. If that fails with SQLITE_READONLY ("attempt to write a
+    #    readonly database"), fall back to ?immutable=1. This is the
+    #    nv8 orchestrator path: the audit DB lives in
+    #    /var/log/heyi-eval-agent/ (0750 root:adm) — `ai` has READ on
+    #    the file via the adm group but cannot CREATE the rollback
+    #    journal in the directory. ?immutable=1 disables locking and
+    #    change-detection.
+    #
+    # SAFETY of the immutable fallback: INV-21 guarantees the audit
+    # table is APPEND-ONLY, and invoke_agent() calls query_recent
+    # AFTER _wait_for_inactive has observed systemd reporting the
+    # unit as inactive — which itself happens only after the agent's
+    # audit-end client call has returned, so the `end` row is
+    # fsynced by the daemon before our snapshot read. Staleness
+    # window is effectively zero in the calling pattern.
+    def _open(uri: str):
+        return sqlite3.connect(uri, uri=True)
+
+    try:
+        conn = _open(f"file:{db_path}")
+        # Force the lock by issuing a query that would touch the
+        # journal so we surface SQLITE_READONLY *here*, not later.
+        conn.execute("SELECT 1").fetchall()
+    except sqlite3.OperationalError as exc:
+        if "readonly" not in str(exc).lower():
+            raise
+        conn = _open(f"file:{db_path}?immutable=1")
+
+    with conn:
         conn.row_factory = sqlite3.Row
         rows = [dict(r) for r in conn.execute(sql, args).fetchall()]
         for r in rows:

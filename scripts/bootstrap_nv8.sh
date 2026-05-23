@@ -243,10 +243,15 @@ if [[ -d "$SANDBOX_DIR" ]]; then
   fi
   ORCH_SUDOERS_SRC="${REPO_ROOT}/deploy/sudoers.d/heyi-eval-orchestrator"
   if [[ -f "$ORCH_SUDOERS_SRC" ]]; then
+    # CRITICAL: validate the SOURCE file BEFORE installing — the
+    # orchestrator's own sudoers explicitly denies visudo to ai
+    # (HEYI_EVAL_ORCH_FORBIDDEN) so post-install verification with
+    # `sudo visudo` is self-blocked. `visudo -c -f <regular-file>`
+    # parses without needing root or write access.
+    run "visudo -c -f '${ORCH_SUDOERS_SRC}'"
     if ! cmp -s "$ORCH_SUDOERS_SRC" /etc/sudoers.d/heyi-eval-orchestrator 2>/dev/null; then
       log "installing sudoers.d/heyi-eval-orchestrator"
       run "sudo install -m 0440 '${ORCH_SUDOERS_SRC}' /etc/sudoers.d/heyi-eval-orchestrator"
-      run "sudo visudo -c -f /etc/sudoers.d/heyi-eval-orchestrator"
     else
       log "sudoers.d/heyi-eval-orchestrator (unchanged)"
     fi

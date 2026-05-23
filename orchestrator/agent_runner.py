@@ -161,19 +161,43 @@ def _default_runner(argv: Sequence[str]) -> "subprocess.CompletedProcess[str]":
     )
 
 
+def _systemctl_prefix(use_sudo: bool) -> list[str]:
+    """`['sudo', '-n', 'systemctl']` for the unprivileged orchestrator,
+    `['systemctl']` for the (rare) root caller / unit-test path.
+
+    On nv8 the orchestrator runs as `ai`; polkit refuses
+    `systemctl start ...` from interactive users by default, so we
+    MUST go through sudo to hit the NOPASSWD entry in
+    `/etc/sudoers.d/heyi-eval-orchestrator`.
+    """
+    return ["sudo", "-n", "systemctl"] if use_sudo else ["systemctl"]
+
+
 def _systemctl_action(
-    action: str, unit: str, *, runner: SubprocessRunner = _default_runner,
+    action: str, unit: str, *,
+    runner: SubprocessRunner = _default_runner,
+    use_sudo: bool = True,
 ) -> tuple[int, str]:
-    """Invoke `systemctl <action> <unit>`; return (rc, stderr_or_stdout)."""
-    cp = runner(["systemctl", action, unit])
+    """Invoke `[sudo -n] systemctl <action> <unit>`; return (rc, stderr_or_stdout)."""
+    cp = runner([*_systemctl_prefix(use_sudo), action, unit])
     out = (cp.stderr or cp.stdout or "").strip()
     return cp.returncode, out
 
 
 def _systemctl_show(
-    unit: str, prop: str, *, runner: SubprocessRunner = _default_runner,
+    unit: str, prop: str, *,
+    runner: SubprocessRunner = _default_runner,
+    use_sudo: bool = True,
 ) -> str:
-    cp = runner(["systemctl", "show", "--property", prop, "--value", unit])
+    # IMPORTANT: pass `--property=X` (single token with `=`), NOT
+    # `--property X` (two tokens). Sudoers does literal-token matching
+    # on Cmnd_Alias; the orchestrator sudoers whitelists
+    # `--property=ActiveState --value` so the two-token form bypasses
+    # the rule and falls back to interactive auth → "需要密码".
+    cp = runner([
+        *_systemctl_prefix(use_sudo),
+        "show", f"--property={prop}", "--value", unit,
+    ])
     return (cp.stdout or "").strip()
 
 
@@ -185,6 +209,7 @@ def _wait_for_inactive(
     runner: SubprocessRunner = _default_runner,
     sleeper: Callable[[float], None] = time.sleep,
     now: Callable[[], float] = time.monotonic,
+    use_sudo: bool = True,
 ) -> str:
     """Poll until ActiveState is no longer activating/active.
 
@@ -195,7 +220,7 @@ def _wait_for_inactive(
     t_start = now()
     last_state = "unknown"
     while True:
-        last_state = _systemctl_show(unit, "ActiveState", runner=runner)
+        last_state = _systemctl_show(unit, "ActiveState", runner=runner, use_sudo=use_sudo)
         if last_state not in ("activating", "active", "reloading", "deactivating"):
             return last_state
         if now() - t_start > timeout_s:
@@ -354,17 +379,26 @@ def invoke_agent(
     sleeper: Callable[[float], None] = time.sleep,
     now: Callable[[], float] = time.monotonic,
     force_inproc_harvest: bool | None = None,
+    use_sudo: bool | None = None,
 ) -> AgentRunResult:
-    """Synchronously invoke the sandboxed agent and harvest results."""
+    """Synchronously invoke the sandboxed agent and harvest results.
+
+    ``use_sudo``: if None (default) auto-detect — root callers get
+    ``False``, unprivileged callers get ``True`` (the typical nv8
+    ``ai``-user orchestrator path).
+    """
     cfg = cfg or AgentRunnerConfig()
     if not RUN_ID_RE.match(run_id):
         raise AgentRunnerError(f"invalid run_id {run_id!r}", kind="bad_run_id")
+
+    if use_sudo is None:
+        use_sudo = not _running_as_root()
 
     write_spec(spec, run_id=run_id, cfg=cfg)
     unit = cfg.unit_name(run_id)
 
     t_start = now()
-    rc, out = _systemctl_action("start", unit, runner=runner)
+    rc, out = _systemctl_action("start", unit, runner=runner, use_sudo=use_sudo)
     if rc != 0:
         raise AgentRunnerError(
             f"systemctl start {unit} failed: rc={rc} stderr={out!r}",
@@ -378,10 +412,10 @@ def invoke_agent(
         runner=runner,
         sleeper=sleeper,
         now=now,
+        use_sudo=use_sudo,
     )
 
-    # Read exit code reported by systemd (Main process)
-    ec_str = _systemctl_show(unit, "ExecMainStatus", runner=runner)
+    ec_str = _systemctl_show(unit, "ExecMainStatus", runner=runner, use_sudo=use_sudo)
     try:
         unit_exit = int(ec_str)
     except (ValueError, TypeError):
