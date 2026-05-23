@@ -209,6 +209,53 @@ class TestOversizeGate(unittest.TestCase):
             os.environ.pop("HEYI_EVAL_EVAL_GPUS")
 
 
+class TestVllmArgsHintTpHeuristic(unittest.TestCase):
+    """PR#23 regression: real HF model cards report decimal param
+    counts ("72.7B"), the old substring matcher missed them, so the
+    INV-23 oversize gate fell through and 72B/405B/etc. silently ran.
+    The fix is a numeric regex extraction.
+    """
+
+    def _hint(self, **md):
+        from orchestrator.stages import _vllm_args_hint
+        return _vllm_args_hint(md)
+
+    def test_72_7b_triggers_tp4(self) -> None:
+        h = self._hint(param_count="72.7B", context_length=4096)
+        self.assertEqual(h["tensor_parallel_size"], 4)
+
+    def test_decimal_1_5b_is_tp1(self) -> None:
+        h = self._hint(param_count="1.5B")
+        self.assertEqual(h["tensor_parallel_size"], 1)
+
+    def test_236_5b_moe_extracts_first_number_for_tp4(self) -> None:
+        h = self._hint(param_count="MoE-236.5B-A21B")
+        self.assertEqual(h["tensor_parallel_size"], 4)
+
+    def test_405b_is_tp4(self) -> None:
+        self.assertEqual(self._hint(param_count="405B")["tensor_parallel_size"], 4)
+
+    def test_30b_is_tp2(self) -> None:
+        self.assertEqual(self._hint(param_count="30B")["tensor_parallel_size"], 2)
+
+    def test_34_5b_is_tp2(self) -> None:
+        self.assertEqual(self._hint(param_count="34.5B")["tensor_parallel_size"], 2)
+
+    def test_7b_is_tp1(self) -> None:
+        self.assertEqual(self._hint(param_count="7B")["tensor_parallel_size"], 1)
+
+    def test_empty_param_count_skips_tp(self) -> None:
+        # No param_str → no hint added (preserves old behaviour).
+        self.assertNotIn("tensor_parallel_size", self._hint(param_count=""))
+
+    def test_param_count_none_skips_tp(self) -> None:
+        self.assertNotIn("tensor_parallel_size", self._hint())
+
+    def test_unparseable_param_count_falls_back_to_tp1(self) -> None:
+        # E.g. "unknown", "TBD"
+        self.assertEqual(self._hint(param_count="unknown")["tensor_parallel_size"], 1)
+
+
 class TestEngineSelectArtifactShape(unittest.TestCase):
     """engine.json gets the new PR#23 fields; downstream stages
     (Panel, agent_runner consumers) parse them positionally so a

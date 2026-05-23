@@ -461,19 +461,37 @@ def _vllm_args_hint(metadata: dict[str, Any]) -> dict[str, Any]:
 
     Not authoritative — cc-agent can still adapt at runtime (e.g. lower
     gpu-memory-utilization to fit alongside glm-51, like it did in T11).
+
+    PR#23 hardening: tensor_parallel_size estimation must handle
+    fractional param strings ("72.7B", "1.5B", "236.5B") because
+    HF model cards usually report the precise total, not a rounded
+    integer. The old substring-match heuristic missed e.g. "72.7B"
+    (no "72b" substring) and silently fell through to tp=1, which
+    then bypassed the INV-23 oversize gate. Now we extract the
+    leading numeric component with a regex.
     """
+    import re
     ctx = metadata.get("context_length")
     param_str = (metadata.get("param_count") or "").lower()
     hint: dict[str, Any] = {}
     if ctx and isinstance(ctx, int) and ctx > 0:
-        # cap to 32k unless explicitly long-context model
         hint["max_model_len"] = min(ctx, 32_768)
-    # crude size heuristic for tp
     if param_str:
-        if any(s in param_str for s in ("70b", "72b", "100b", "180b", "405b")):
-            hint["tensor_parallel_size"] = 4
-        elif any(s in param_str for s in ("30b", "32b", "34b")):
-            hint["tensor_parallel_size"] = 2
+        # Extract the leading "<num>b" amount in billions; tolerate
+        # decimals and stray surrounding text. e.g.:
+        #   "72.7B"     -> 72.7
+        #   "405B"      -> 405
+        #   "1.5b"      -> 1.5
+        #   "MoE-236.5B-A21B" -> 236.5 (we take the FIRST match)
+        m = re.search(r"(\d+(?:\.\d+)?)\s*b\b", param_str)
+        if m:
+            b = float(m.group(1))
+            if b >= 65:
+                hint["tensor_parallel_size"] = 4
+            elif b >= 28:
+                hint["tensor_parallel_size"] = 2
+            else:
+                hint["tensor_parallel_size"] = 1
         else:
             hint["tensor_parallel_size"] = 1
     return hint
