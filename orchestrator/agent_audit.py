@@ -2,14 +2,22 @@
 
 The agent (heyi-eval-agent) cannot reach /var/log/heyi-eval-agent/
 directly — INV-18 ACL keeps it `---`. To record a command into the
-audit DB anyway, the agent invokes the setuid wrapper
-``/usr/local/sbin/heyi-eval-agent-audit-record`` via the sudoers
-NOPASSWD whitelist; the wrapper imports THIS module as root and calls
-``record_command``/``record_result`` on its behalf.
+audit DB anyway, the agent connects to the unix socket served by
+``heyi-eval-audit.service`` (the daemon imports THIS module and calls
+``record_command`` / ``record_result`` on its behalf, after
+SO_PEERCRED-validating the peer uid).
+
+History note
+============
+M1 (commit 508b639) shipped a setuid wrapper fronted by sudoers, but
+that path is incompatible with the agent unit's
+``NoNewPrivileges=true`` (sudo refuses to setuid under no_new_privs).
+M2 replaced the wrapper with a unix-socket daemon — same DB, same
+schema, same INV-21 guarantee, different transport.
 
 Trust boundary
 ==============
-- THIS module runs as root inside the wrapper. It must not import
+- THIS module runs as root inside the daemon. It must not import
   user-controlled code beyond stdlib (no orchestrator stages, no
   pickle, no yaml.full_load on user payload).
 - The DB file is root:adm 0640. Group `adm` can read for analytics;

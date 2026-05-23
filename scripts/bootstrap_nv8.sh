@@ -199,26 +199,33 @@ if [[ -d "$SANDBOX_DIR" ]]; then
   # is a no-op when the file is byte-identical.
   run "sudo bash '${SANDBOX_DIR}/setup_agent_user.sh'"
   run "sudo bash '${SANDBOX_DIR}/acl_install.sh'"
-  # Audit wrapper (PR#22b-M1). Owned root:root 0750 so the agent
-  # cannot read its source either — the wrapper is reached only via
-  # the sudoers whitelist below.
-  if [[ -f "${SANDBOX_DIR}/heyi-eval-agent-audit-record" ]]; then
-    if ! cmp -s "${SANDBOX_DIR}/heyi-eval-agent-audit-record" \
-                /usr/local/sbin/heyi-eval-agent-audit-record 2>/dev/null; then
-      log "installing heyi-eval-agent-audit-record"
-      # 0755 not 0750: the agent MUST be able to exec the wrapper
-      # script body so that the script's own $EUID check fires and
-      # produces the "must run via sudo" error (drill 6a relies on
-      # this). With 0750 the agent gets EACCES at exec() time and
-      # the wrapper's defensive logic is unreachable — same end
-      # state, but drill 6 cannot distinguish wrapper-policy from
-      # filesystem-policy. 0755 keeps the two layers testable.
-      run "sudo install -m 0755 -o root -g root '${SANDBOX_DIR}/heyi-eval-agent-audit-record' /usr/local/sbin/heyi-eval-agent-audit-record"
-    else
-      log "heyi-eval-agent-audit-record (unchanged)"
+  # Audit daemon + CLI client (PR#22b-M2). The setuid wrapper from M1
+  # was removed because NoNewPrivileges=true in the agent unit blocks
+  # `sudo`'s setuid — the daemon takes its place via a unix socket.
+  if [[ -f "${SANDBOX_DIR}/heyi-eval-agent-audit-client.py" ]]; then
+    run "sudo install -m 0755 -o root -g root '${SANDBOX_DIR}/heyi-eval-agent-audit-client.py' /usr/local/bin/heyi-eval-agent-audit-client"
+  fi
+  if [[ -f "${SANDBOX_DIR}/heyi-eval-agent-prepare" ]]; then
+    run "sudo install -m 0755 -o root -g root '${SANDBOX_DIR}/heyi-eval-agent-prepare' /usr/local/sbin/heyi-eval-agent-prepare"
+  fi
+  if [[ -f "${SANDBOX_DIR}/heyi-eval-agent-run" ]]; then
+    run "sudo install -m 0755 -o root -g root '${SANDBOX_DIR}/heyi-eval-agent-run' /usr/local/bin/heyi-eval-agent-run"
+  fi
+  # Install + enable the audit daemon. It must be listening BEFORE any
+  # agent unit is started; ordering is also encoded as `Before=` in the
+  # agent template unit.
+  if [[ -f "${REPO_ROOT}/deploy/systemd/heyi-eval-audit.service" ]]; then
+    if ! cmp -s "${REPO_ROOT}/deploy/systemd/heyi-eval-audit.service" \
+                /etc/systemd/system/heyi-eval-audit.service 2>/dev/null; then
+      log "installing heyi-eval-audit.service"
+      run "sudo install -m 0644 '${REPO_ROOT}/deploy/systemd/heyi-eval-audit.service' /etc/systemd/system/heyi-eval-audit.service"
+      run "sudo systemctl daemon-reload"
     fi
-    # Initialise the audit DB schema (idempotent).
-    run "sudo /usr/local/sbin/heyi-eval-agent-audit-record init"
+    run "sudo systemctl enable --now heyi-eval-audit.service"
+    # Quick health probe: socket must exist and respond.
+    if ! sudo test -S /run/heyi-eval-agent-audit.sock; then
+      die "heyi-eval-audit.service did not produce /run/heyi-eval-agent-audit.sock"
+    fi
   fi
   if ! cmp -s "${SANDBOX_DIR}/sudoers.d/heyi-eval-agent" \
               /etc/sudoers.d/heyi-eval-agent 2>/dev/null; then

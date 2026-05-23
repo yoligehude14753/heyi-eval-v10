@@ -1,0 +1,69 @@
+[Unit]
+Description=heyi-eval-v10 append-only audit daemon (INV-21)
+Documentation=https://github.com/yoligehude14753/heyi-eval-v10/blob/main/docs/INVARIANTS.md
+Before=heyi-eval-agent@.service
+# heyi-eval-orchestrator does not require this daemon at boot, but if
+# the daemon is enabled it MUST come up before any agent unit tries to
+# connect.
+After=local-fs.target
+
+[Service]
+Type=simple
+# Daemon runs as root because it owns /run/heyi-eval-agent-audit.sock
+# and writes the root-owned audit DB. Hardening below keeps this from
+# being a high-value target: it is the SOLE producer of audit rows.
+User=root
+Group=root
+
+# Module entry point. Reads --socket / --db / --agent-user from CLI.
+ExecStart=/usr/bin/python3 -m orchestrator.agent_audit_daemon \
+    --socket /run/heyi-eval-agent-audit.sock \
+    --db /var/log/heyi-eval-agent/audit.sqlite \
+    --agent-user heyi-eval-agent
+
+WorkingDirectory=/home/ai/heyi-eval-v10
+
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/home/ai/heyi-eval-v10
+
+# Hardening — narrow because the daemon only needs:
+#   read   $PYTHONPATH (source tree)
+#   write  /run/heyi-eval-agent-audit.sock
+#   write  /var/log/heyi-eval-agent/audit.sqlite (+ -journal/-wal)
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @cpu-emulation @debug @raw-io @reboot @swap @module @obsolete
+# `~@privileged` would block chown/chmod that the daemon needs ONCE at
+# startup to set socket ownership (root:heyi-eval-agent, 0660). Re-add
+# the minimum subset (the @chown group covers chown/fchown/fchownat/
+# lchown; chmod needs its own enumeration).
+SystemCallFilter=@chown chmod fchmod fchmodat
+
+ReadWritePaths=/run /var/log/heyi-eval-agent
+
+Restart=on-failure
+RestartSec=2s
+
+# Log to journal under a stable identifier so RUNBOOK §13 examples
+# work verbatim.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=heyi-eval-audit
+
+[Install]
+WantedBy=multi-user.target

@@ -14,16 +14,23 @@ Group=heyi-eval-agent
 
 Slice=heyi-eval-agent.slice
 
-# Working dir is the per-run dir; orchestrator creates it BEFORE
-# starting this service. The path layout is fixed by Store (see
-# orchestrator/store.py): DATA_ROOT/runs/<run_id>/.
-WorkingDirectory=/home/ai/heyi-eval-data/runs/%i
+# WorkingDirectory points at the agent's HOME (always present after
+# setup_agent_user.sh). The per-run workdir lives under
+# $HOME/runs/<id>/workdir and is materialised by ExecStartPre below,
+# then the runner cd's into it. We can NOT set WorkingDirectory to
+# the per-run workdir directly because systemd resolves it BEFORE
+# running ExecStartPre, which would fail with exit code 200/CHDIR.
+WorkingDirectory=/var/lib/heyi-eval-agent
 
-# PR#22a ships a *placeholder* ExecStart so the unit is parseable and
-# fork-bomb / RuntimeMaxSec drills have something to start. PR#22b
-# replaces this with `/usr/local/bin/heyi-eval-agent-run %i` which
-# launches Claude Code with the constrained prompt + MCP config.
-ExecStart=/usr/bin/sleep 60
+# Materialise per-run dirs as root BEFORE dropping to the agent user.
+# The leading `+` runs prepare with full root privileges, then ExecStart
+# drops to User=heyi-eval-agent.
+ExecStartPre=+/usr/local/sbin/heyi-eval-agent-prepare %i
+
+# Real ExecStart (PR#22b-M2). Replaces the PR#22a `sleep 60`
+# placeholder. The runner records audit, runs the spec payload, writes
+# outbox files for the orchestrator (M3) to harvest.
+ExecStart=/usr/local/bin/heyi-eval-agent-run %i
 
 # Hard wall-clock budget per agent run. 30 min covers a generous
 # DISCOVER→CURATE→DEPLOY→CAPABILITY→PERF_BENCH→SHOWCASE→CLEANUP cycle
@@ -56,7 +63,14 @@ NoNewPrivileges=true
 PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
-ProtectHome=true
+# read-only (not true): the agent MUST be able to read its source tree
+# (/home/ai/heyi-eval-v10) and the per-run spec file
+# (/home/ai/heyi-eval-data/runs/%i/spec.json). `ProtectHome=true` would
+# replace /home with an empty tmpfs and silently break both. The
+# defence here is that POSIX ACL + the ReadOnlyPaths line below make
+# the entire /home subtree read-only at the mount layer — the agent
+# cannot mutate any other user's home regardless of ACL drift.
+ProtectHome=read-only
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectKernelLogs=true
@@ -80,10 +94,10 @@ SystemCallFilter=~@privileged @resources @mount @cpu-emulation @debug @raw-io @r
 CapabilityBoundingSet=
 AmbientCapabilities=
 
-# Read-only access to source tree + per-run scratch dir + audit dir
-# (which it can list-only-via-deny-acl... i.e. not at all, INV-18).
+# Read-only access to source tree + read-only run-spec dir + RW agent
+# HOME (where workdir + outbox live) + audit dir is unreachable.
 ReadOnlyPaths=/home/ai/heyi-eval-v10
-ReadWritePaths=/home/ai/heyi-eval-data/runs/%i
+ReadOnlyPaths=/home/ai/heyi-eval-data/runs/%i
 ReadWritePaths=/var/lib/heyi-eval-agent
 InaccessiblePaths=/var/log/heyi-eval-agent
 

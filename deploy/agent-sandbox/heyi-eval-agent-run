@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+# heyi-eval-agent-run <run-id>
+#
+# The ExecStart of heyi-eval-agent@<run-id>.service. Runs as
+# `heyi-eval-agent` (NOT root) under the systemd security profile defined
+# in deploy/systemd/heyi-eval-agent@.service.
+#
+# Responsibilities (INV-22 — agent runner contract):
+#   1. Sanity-check the run-id against the same regex as the prepare hook.
+#   2. Locate the per-run spec under /home/ai/heyi-eval-data/runs/<id>/.
+#      The spec is read-only to the agent (INV-16) — that's the design.
+#   3. Open an audit row via the setuid wrapper (sudo NOPASSWD;
+#      `heyi-eval-agent-audit-record begin ...`). Save the returned
+#      audit_id so the matching `end` row can reference it.
+#   4. Execute the payload according to spec.mode:
+#        - "smoke"        : run a fixed deterministic shell command (M2)
+#                           — used by drill 7 to prove the loop works
+#                           end-to-end with no external dependencies.
+#        - "claude_code"  : exec Claude Code CLI with the prompt+mcp_config
+#                           from spec (LANDS IN M3; here only validates
+#                           that the mode is recognised and exits 64 so
+#                           the orchestrator sees an explicit "not yet").
+#   5. Capture the payload's exit code and write a closing audit row.
+#
+# The runner does NOT decide what model to evaluate; that is the
+# orchestrator's job. The runner only carries out an already-frozen spec
+# inside the sandbox. This boundary is INV-22.
+set -uo pipefail
+
+PROG="heyi-eval-agent-run"
+AGENT_HOME="${AGENT_HOME:-/var/lib/heyi-eval-agent}"
+DATA_ROOT="${HEYI_EVAL_DATA_ROOT:-/home/ai/heyi-eval-data}"
+AUDIT_SOCKET="${HEYI_EVAL_AUDIT_SOCKET:-/run/heyi-eval-agent-audit.sock}"
+SRC_ROOT="${HEYI_EVAL_SRC_ROOT:-/home/ai/heyi-eval-v10}"
+
+log()  { printf '[%s] %s\n' "$PROG" "$*" >&2; }
+die()  { printf '[%s] ERROR: %s\n' "$PROG" "$*" >&2; exit 64; }
+
+[[ $# -eq 1 ]] || die "usage: $PROG <run-id>"
+RUN_ID="$1"
+
+# 1. validate run-id (mirrors prepare hook)
+if ! [[ "$RUN_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
+  die "invalid run-id $(printf %q "$RUN_ID")"
+fi
+
+# 2. paths
+RUN_DIR="$AGENT_HOME/runs/$RUN_ID"
+WORKDIR="$RUN_DIR/workdir"
+OUTBOX="$RUN_DIR/outbox"
+SPEC="$DATA_ROOT/runs/$RUN_ID/spec.json"
+
+[[ -d "$WORKDIR" ]] || die "workdir missing: $WORKDIR (prepare hook should have run)"
+[[ -d "$OUTBOX"  ]] || die "outbox missing: $OUTBOX (prepare hook should have run)"
+
+if [[ ! -r "$SPEC" ]]; then
+  # M2 fallback: when no spec is provided we run an empty smoke probe.
+  # This is how drill 7 exercises the scaffolding without staging real
+  # orchestrator data on the test host. The drill is responsible for
+  # supplying a spec when it wants to test a specific payload.
+  log "no spec at $SPEC — using built-in smoke probe"
+  mode="smoke"
+  smoke_cmd='printf "heyi-eval-agent smoke probe run_id=%s host=%s pid=%s\n" "$RUN_ID" "$(hostname)" "$$"'
+else
+  log "loading spec from $SPEC"
+  if ! command -v python3 >/dev/null; then
+    die "python3 missing inside sandbox PATH"
+  fi
+  mode=$(python3 -c '
+import json, sys
+spec = json.load(open(sys.argv[1]))
+m = spec.get("mode", "")
+if m not in ("smoke", "claude_code"):
+    sys.stderr.write(f"unknown mode: {m!r}\n")
+    sys.exit(65)
+print(m)
+' "$SPEC") || die "spec parse failed"
+
+  if [[ "$mode" == "smoke" ]]; then
+    smoke_cmd=$(python3 -c '
+import json, sys
+spec = json.load(open(sys.argv[1]))
+c = spec.get("command", "")
+if not isinstance(c, str) or not c.strip():
+    sys.stderr.write("smoke spec missing string command\n")
+    sys.exit(65)
+# IMPORTANT: do not allow shell metachar injection beyond what the agent
+# user can already do; we still bound the command to a single string
+# that bash -c will run in the workdir.
+print(c)
+' "$SPEC") || die "spec command parse failed"
+  fi
+fi
+
+# 3. audit begin via the unix-socket audit daemon (INV-21)
+#
+# The agent CANNOT use `sudo` here because the systemd unit sets
+# NoNewPrivileges=true (which refuses setuid escalation). Instead it
+# connects to /run/heyi-eval-agent-audit.sock — a 0660
+# root:heyi-eval-agent socket served by heyi-eval-audit.service. The
+# tiny client below is just argv-to-JSON glue, no privilege change.
+audit_client=/usr/local/bin/heyi-eval-agent-audit-client
+audit_id=$("$audit_client" --socket "$AUDIT_SOCKET" begin \
+              --run-id "$RUN_ID" \
+              --cwd    "$WORKDIR" \
+              -- "$PROG" "$RUN_ID" "$mode") || {
+  log "BEGIN audit failed (see stderr above)"
+  exit 65
+}
+if ! [[ "$audit_id" =~ ^[0-9]+$ ]]; then
+  log "BEGIN audit returned non-numeric id: $audit_id"
+  exit 65
+fi
+log "audit begin run_id=$RUN_ID audit_id=$audit_id mode=$mode"
+
+# 4. run payload
+cd "$WORKDIR"
+start_ns=$(date +%s%N)
+payload_exit=0
+case "$mode" in
+  smoke)
+    # M2: deterministic, cheap, no network. RUN_ID is exported so
+    # `bash -c` subshells (which don't inherit shell-local vars) can
+    # reference it from the spec command without surprise.
+    export RUN_ID HEYI_EVAL_RUN_ID="$RUN_ID"
+    bash -c "$smoke_cmd" > "$OUTBOX/payload.stdout" 2> "$OUTBOX/payload.stderr"
+    payload_exit=$?
+    ;;
+  claude_code)
+    # M3 will wire `claude` here. For M2 we surface a clear "not yet
+    # implemented" exit code so any orchestrator integration test fails
+    # loudly instead of silently treating "no claude installed" as 0.
+    log "mode=claude_code not implemented in M2; landing in M3"
+    payload_exit=66
+    ;;
+esac
+end_ns=$(date +%s%N)
+duration_ms=$(( (end_ns - start_ns) / 1000000 ))
+
+# Heartbeat manifest so the orchestrator (root, M3) can rsync the outbox
+# back to /home/ai/heyi-eval-data/runs/<id>/outbox/ without having to
+# parse the journal.
+cat > "$OUTBOX/run_meta.json" <<EOF
+{
+  "run_id":      "$RUN_ID",
+  "mode":        "$mode",
+  "audit_id":    $audit_id,
+  "exit_code":   $payload_exit,
+  "duration_ms": $duration_ms,
+  "hostname":    "$(hostname)",
+  "workdir":     "$WORKDIR",
+  "outbox":      "$OUTBOX"
+}
+EOF
+
+# 5. audit end via the same socket. Failure here is logged but the
+# payload's exit code is still returned — we never want the audit
+# transport to mask the actual result of the agent's work.
+if ! "$audit_client" --socket "$AUDIT_SOCKET" end \
+        --audit-id    "$audit_id" \
+        --exit-code   "$payload_exit" \
+        --duration-ms "$duration_ms" > /dev/null; then
+  log "WARNING: end audit failed (see stderr); payload exit=$payload_exit"
+fi
+
+log "done run_id=$RUN_ID audit_id=$audit_id mode=$mode exit=$payload_exit ms=$duration_ms"
+exit "$payload_exit"

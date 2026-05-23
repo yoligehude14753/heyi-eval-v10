@@ -180,7 +180,14 @@ class TestServiceTemplate(unittest.TestCase):
 
     def test_protect_system_strict(self) -> None:
         self.assertEqual(_value(self.text, "ProtectSystem"), "strict")
-        self.assertEqual(_value(self.text, "ProtectHome"), "true")
+        # PR#22b-M2: must be `read-only` (was `true` in PR#22a). `true`
+        # mounts an empty tmpfs over /home which silently breaks the
+        # agent's reads of /home/ai/heyi-eval-v10 (source tree) and the
+        # per-run spec under /home/ai/heyi-eval-data/runs/<id>/.
+        # `read-only` keeps the contents visible but still prevents
+        # any write into another user's home — POSIX ACLs already do
+        # that, and this is belt-and-suspenders.
+        self.assertEqual(_value(self.text, "ProtectHome"), "read-only")
 
     # ── plumbing ─────────────────────────────────────────────────
     def test_docker_host_points_to_agent_proxy(self) -> None:

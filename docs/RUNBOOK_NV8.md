@@ -511,13 +511,20 @@ docker stop tf-runner-asr-smoke && docker rm tf-runner-asr-smoke
 transformers 5.8),我们只 layer 真正缺的 `diffusers / soundfile /
 librosa` 三个包。任何后续 base 升级需要重跑 §12.3 + §12.6 矩阵。
 
-## 13 · Agent sandbox 部署(PR#22a + PR#22b-M1)
+## 13 · Agent sandbox 部署(PR#22a + PR#22b-M2)
 
 PR#22a 在 nv8 上落地了一个用来跑 Claude Code agent 的隔离沙箱(详见
 `docs/INVARIANTS.md` §INV-16~21 与 `deploy/agent-sandbox/README.md`)。
-PR#22b-M1 在沙箱里加了**追加式审计写入通道**:setuid 包装脚本 +
-sudoers 白名单 + INV-21 静态守护,保证 agent 既不能伪造审计记录也
-不能擦掉已记录的命令。
+PR#22b-M2 在沙箱里加了**追加式审计写入通道**:root daemon (`heyi-eval-audit.service`)
+监听 `/run/heyi-eval-agent-audit.sock`,agent 通过 unix socket 写入,
+`SO_PEERCRED` 强制校验 peer uid + INV-21 静态守护 + INV-18 deny-all
+ACL 保护 DB 文件,保证 agent 既不能伪造审计记录也不能擦掉已记录的命令。
+
+> **历史注**:M1 (commit 508b639) 曾经走 setuid 包装脚本路径,但
+> `NoNewPrivileges=true` 与 `sudo` 不兼容(sudo 在 no_new_privs 下
+> 拒绝 setuid),所以 M1 在 ad-hoc `sudo -u` 测试里能过、在 agent
+> unit 内 100% 失败。M2 通过 daemon socket 绕过 setuid,这是唯一
+> 与现有 systemd 硬化共存的设计。详见 `INVARIANTS.md` §INV-21。
 v9 时代 agent 直接以 `ai` 用户跑——而 `ai` 在 `docker` + `sudo` 组,
 导致 `docker exec minimax bash -c 'rm -rf /'` 等事故可以一行命令发起。
 v10 的 PR#22a 把 agent 钉死在 `heyi-eval-agent` 这个无 docker / 无
@@ -547,10 +554,14 @@ sudo install -m 0644 ../systemd/heyi-eval-agent@.service /etc/systemd/system/
 sudo systemd-analyze verify /etc/systemd/system/heyi-eval-agent@.service \
     /etc/systemd/system/heyi-eval-agent.slice
 sudo systemctl daemon-reload
-# PR#22b-M1
-sudo install -m 0755 -o root -g root \
-    heyi-eval-agent-audit-record /usr/local/sbin/heyi-eval-agent-audit-record
-sudo /usr/local/sbin/heyi-eval-agent-audit-record init
+# PR#22b-M2 (audit daemon + agent runner)
+sudo install -m 0755 -o root -g root heyi-eval-agent-audit-client.py /usr/local/bin/heyi-eval-agent-audit-client
+sudo install -m 0755 -o root -g root heyi-eval-agent-prepare         /usr/local/sbin/heyi-eval-agent-prepare
+sudo install -m 0755 -o root -g root heyi-eval-agent-run             /usr/local/bin/heyi-eval-agent-run
+sudo install -m 0644 ../systemd/heyi-eval-audit.service              /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now heyi-eval-audit.service
+# socket appears at /run/heyi-eval-agent-audit.sock (mode 0660 root:heyi-eval-agent)
 ```
 
 ### 13.2 验证沙箱六层
@@ -596,7 +607,8 @@ ALL 6 DRILLS PASSED — INV-16/17/18/19/20/21 hold end-to-end
 - [x] `curl http://127.0.0.1:2377/_ping` 返回 `OK`,`curl -X POST .../containers/minimax/stop` 返回 `403`
 - [x] `systemctl list-unit-files heyi-eval-agent@.service` 显示 `static`
 - [x] `bash deploy/agent-sandbox/drills/run_all.sh` 退出 0,6/6 BLOCKED OK
-- [x] PR#22b-M1: `/usr/local/sbin/heyi-eval-agent-audit-record` 安装且 0755 root:root,`sudo` 它的 `init` / `begin` / `end` 在 sudoers 白名单内
-- [x] PR#22b-M1: drill-6 真机绿(`run_all.sh` 末尾"drill-6 rc=0")
-- [ ] (推迟到 PR#22b-M2)`heyi-eval-agent-run` ExecStart 脚本接入(替换 `@.service` 里的 `sleep 60` 占位)
-- [ ] (推迟到 PR#22b-M3)orchestrator 主 loop 通过 `systemctl start heyi-eval-agent@<run-id>` 拉起 agent + 回收结果
+- [x] PR#22b-M2: `heyi-eval-audit.service` active 且 `/run/heyi-eval-agent-audit.sock` 存在且 mode 0660 root:heyi-eval-agent
+- [x] PR#22b-M2: drill-6 真机绿(`run_all.sh` 末尾"drill-6 rc=0")
+- [x] PR#22b-M2: `systemctl start heyi-eval-agent@m2demo.service` 完整 lifecycle 通过(prepare→audit-begin→smoke→audit-end),`/var/lib/heyi-eval-agent/runs/m2demo/outbox/run_meta.json` 有内容
+- [ ] (推迟到 PR#22b-M3)orchestrator 主 loop 通过 `systemctl start heyi-eval-agent@<run-id>` 拉起 agent + 回收 outbox
+- [ ] (推迟到 PR#23)LLM-judge 接 M2.7 API + eval_gpus 默认 (5,6,7) + ENGINE_SELECT oversize gating

@@ -16,7 +16,7 @@ and `drills/` contains the adversarial verification scripts.
 | audit log no-access         | INV-18    | `drills/attack_evade_audit.sh`              |
 | cgroup + watchdog           | INV-19    | `drills/attack_resource_budget.sh`          |
 | sudoers + identity          | INV-20    | `drills/attack_sudo_escalate.sh`            |
-| audit write append-only     | INV-21    | `drills/attack_evade_audit_writes.sh`       |
+| audit write append-only     | INV-21    | `drills/attack_evade_audit_writes.sh` (daemon socket; M1 setuid wrapper was removed — see PR#22b-M2 note in INVARIANTS.md) |
 
 All `drills/*.sh` MUST run as `heyi-eval-agent` (use `sudo -u heyi-eval-agent`)
 and MUST exit non-zero when the protection works (i.e. the attack is blocked).
@@ -45,17 +45,30 @@ sudo -u heyi-eval-agent bash drills/attack_exec_prod.sh
 sudo -u heyi-eval-agent bash drills/attack_evade_audit.sh
 # expect: "BLOCKED OK — INV-18 holds" (6/6 access attempts EACCES)
 
-# PR#22b-M1 — append-only audit write path (INV-21)
-# Wrapper is owned root:root 0755 so the agent can exec it and hit
-# the EUID check, but the actual append is gated by sudo NOPASSWD.
-sudo install -m 0755 -o root -g root heyi-eval-agent-audit-record /usr/local/sbin/
-sudo /usr/local/sbin/heyi-eval-agent-audit-record init
-# expect: "audit schema initialised at /var/log/heyi-eval-agent/audit.sqlite"
+# PR#22b-M2 — append-only audit write path via daemon socket (INV-21)
+# M1 setuid wrapper was REMOVED — `NoNewPrivileges=true` in the agent
+# unit blocks sudo's setuid, so the wrapper could never have worked from
+# inside heyi-eval-agent@%i.service. M2 replaces it with a unix-socket
+# daemon (heyi-eval-audit.service) that the agent connects to directly,
+# no privilege change needed.
+sudo install -m 0755 -o root -g root heyi-eval-agent-audit-client.py /usr/local/bin/heyi-eval-agent-audit-client
+sudo install -m 0755 -o root -g root heyi-eval-agent-prepare         /usr/local/sbin/heyi-eval-agent-prepare
+sudo install -m 0755 -o root -g root heyi-eval-agent-run             /usr/local/bin/heyi-eval-agent-run
+sudo install -m 0644 ../systemd/heyi-eval-audit.service              /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now heyi-eval-audit.service
+# expect: socket /run/heyi-eval-agent-audit.sock with mode 0660 root:heyi-eval-agent
 sudo -u heyi-eval-agent bash drills/attack_evade_audit_writes.sh
-# expect: "BLOCKED OK — INV-21 holds"
-#   4 wrapper-policy attacks (no-sudo / update / delete / drop) blocked
+# expect: "BLOCKED OK — INV-21 holds (append-only audit write path, daemon-fronted)"
+#   4 socket-protocol attacks (unknown op / missing fields / non-JSON / end without begin) blocked
 #   5 INV-18 ACL attacks (cat / dd / tee / truncate / rm) blocked
-#   2 happy-path writes (begin/end via sudo wrapper) succeed
+#   2 happy-path writes (client begin / client end via socket) succeed
+
+# Verify the end-to-end agent unit:
+sudo systemctl start heyi-eval-agent@m2demo.service
+# expect: completes in <1s, journal shows prepare→audit-begin→smoke→audit-end
+sudo cat /var/lib/heyi-eval-agent/runs/m2demo/outbox/run_meta.json
+# expect: {"run_id":"m2demo","mode":"smoke","audit_id":N,"exit_code":0,...}
 
 # M4
 sudo install -m 0644 ../systemd/heyi-eval-agent.slice    /etc/systemd/system/

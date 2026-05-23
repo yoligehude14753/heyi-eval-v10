@@ -141,7 +141,7 @@ class TestInv19Sudoers(unittest.TestCase):
             1,
             f"expected exactly 1 NOPASSWD line, got {len(nopasswd)}: {nopasswd}",
         )
-        ALLOWED_NOPASSWD_ALIASES = {"HEYI_EVAL_ORCH_BOUNCE", "HEYI_EVAL_AUDIT_RECORD"}
+        ALLOWED_NOPASSWD_ALIASES = {"HEYI_EVAL_ORCH_BOUNCE"}
         line = nopasswd[0]
         # extract token list after "NOPASSWD:" — must consist only of
         # known aliases or comma whitespace.

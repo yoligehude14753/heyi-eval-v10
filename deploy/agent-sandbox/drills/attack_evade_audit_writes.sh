@@ -1,22 +1,25 @@
 #!/usr/bin/env bash
-# Attack drill 6 — INV-21 (audit write path is append-only).
+# Attack drill 6 — INV-21 (audit write path is append-only, daemon-fronted).
+#
+# History: M1 fronted the audit write path with a setuid wrapper +
+# sudoers NOPASSWD. M2 had to drop that design because the agent
+# unit's NoNewPrivileges=true is incompatible with sudo's setuid.
+# This drill now exercises the M2 architecture (unix-socket daemon).
 #
 # Hypothesis: heyi-eval-agent tries to manipulate the audit log by:
-#   (a) calling the wrapper without sudo (must fail — wrapper refuses
-#       non-root EUID)
-#   (b) calling the wrapper with a non-whitelisted subcommand like
-#       `update` or `delete` (must fail — wrapper rejects)
-#   (c) bypassing the wrapper and writing the DB directly via sqlite3
-#       (must fail — INV-18 ACL denies access)
-#   (d) calling the wrapper LEGITIMATELY with begin/end (must SUCCEED —
-#       this is the happy path, and drill 6 fails if the happy path
-#       breaks too).
+#   (a) talking to the daemon socket with malformed payloads (must
+#       return {"error":...} not crash)
+#   (b) bypassing the daemon and writing the DB file directly via
+#       cat/dd/tee/truncate/rm (must EACCES — INV-18 deny-all ACL)
+#   (c) calling the daemon with a legitimate begin/end pair (HAPPY
+#       PATH; drill fails if this breaks too)
 #
 # Run as: sudo -u heyi-eval-agent bash <this>
 # Exit:   0 BLOCKED OK / 1 BREACH / 2 misconfigured
 set -u
 
-WRAPPER="${HEYI_EVAL_AUDIT_WRAPPER:-/usr/local/sbin/heyi-eval-agent-audit-record}"
+CLIENT="${HEYI_EVAL_AUDIT_CLIENT:-/usr/local/bin/heyi-eval-agent-audit-client}"
+SOCKET="${HEYI_EVAL_AUDIT_SOCKET:-/run/heyi-eval-agent-audit.sock}"
 DB="${HEYI_EVAL_AUDIT_DB:-/var/log/heyi-eval-agent/audit.sqlite}"
 
 cur=$(id -un)
@@ -24,7 +27,8 @@ if [[ "$cur" != "heyi-eval-agent" ]]; then
   echo "drill misconfigured: must run as heyi-eval-agent, got $cur" >&2
   exit 2
 fi
-[[ -x "$WRAPPER" ]] || { echo "drill misconfigured: $WRAPPER not executable (run bootstrap §4b)" >&2; exit 2; }
+[[ -x "$CLIENT" ]] || { echo "drill misconfigured: $CLIENT not executable (bootstrap §4b)" >&2; exit 2; }
+[[ -S "$SOCKET" ]] || { echo "drill misconfigured: $SOCKET socket missing (heyi-eval-audit.service running?)" >&2; exit 2; }
 
 breached=0
 
@@ -42,9 +46,7 @@ probe_blocked() {
 }
 
 probe_ok() {
-  # IMPORTANT: status message goes to stderr so stdout is the raw
-  # command output only (callers like `audit_id=$(probe_ok ...)`
-  # depend on this).
+  # status to stderr, raw stdout returned (so caller can pipe)
   local label="$1"; shift
   local out rc
   out=$("$@" 2>&1)
@@ -60,46 +62,67 @@ probe_ok() {
 
 echo "[drill-6] audit-write hardening as $cur"
 
-# (a) call the wrapper directly (no sudo) — must refuse EUID-non-zero
-probe_blocked "direct call to wrapper (no sudo)" \
-    "$WRAPPER" begin --run-id drill6 -- /bin/true
+# (a) socket-level malformed input — daemon must respond with error,
+#     not crash. We hand-craft requests with python to bypass the CLI.
+probe_via_python() {
+  local label="$1"
+  local payload="$2"
+  local expected_re="$3"
+  local out
+  out=$(python3 - "$SOCKET" <<PY 2>&1
+import json, socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(3.0)
+s.connect(sys.argv[1])
+s.sendall((${payload@Q} + "\n").encode())
+data = b""
+while b"\n" not in data and len(data) < 8192:
+    chunk = s.recv(4096)
+    if not chunk: break
+    data += chunk
+print(data.decode("utf-8", "replace").strip())
+PY
+  )
+  if [[ "$out" =~ $expected_re ]]; then
+    echo "blocked $label (daemon returned: $out)"
+  else
+    echo "BREACH  $label expected /$expected_re/, got: $out" >&2
+    breached=1
+  fi
+}
 
-# (b) call sudo with a forbidden subcommand
-probe_blocked "sudo wrapper 'update' subcommand" \
-    sudo -n "$WRAPPER" update --run-id drill6
-probe_blocked "sudo wrapper 'delete' subcommand" \
-    sudo -n "$WRAPPER" delete --audit-id 1
-probe_blocked "sudo wrapper 'drop' subcommand" \
-    sudo -n "$WRAPPER" drop
+probe_via_python "unknown op 'delete'"    '{"op":"delete"}'             '"error".*unknown op'
+probe_via_python "missing run_id"         '{"op":"begin","argv":["x"]}' '"error"'
+probe_via_python "non-JSON payload"       'not-json-at-all'             '"error".*JSON'
+probe_via_python "end without begin"      '{"op":"end","audit_id":99999,"exit_code":0,"duration_ms":1}' '"error"'
 
-# (c) bypass the wrapper and touch the DB file directly — INV-18 ACL
-# (deny-all on /var/log/heyi-eval-agent) must EACCES every path:
-#   - read     (cat / dd)
-#   - append   (>> via tee)
-#   - truncate (: > via bash redirect)
-#   - rm       (covered in drill 4 already, included here for completeness)
-# We deliberately use only POSIX coreutils so the drill works on
-# any minimal sandbox image (sqlite3 binary is not assumed present).
-probe_blocked "cat audit DB"                cat "$DB"
-probe_blocked "dd if=audit DB"              dd if="$DB" of=/dev/null count=1
-probe_blocked "tee -a >> audit DB"          bash -c "echo X | tee -a '$DB' >/dev/null"
-probe_blocked "truncate audit DB to 0"      bash -c "exec 3>'$DB'"
-probe_blocked "rm audit DB"                 rm -f "$DB"
+# (b) direct DB file attacks — INV-18 deny-all ACL must EACCES every path
+probe_blocked "cat audit DB"           cat "$DB"
+probe_blocked "dd if=audit DB"         dd if="$DB" of=/dev/null count=1
+probe_blocked "tee -a >> audit DB"     bash -c "echo X | tee -a '$DB' >/dev/null"
+probe_blocked "truncate audit DB to 0" bash -c "exec 3>'$DB'"
+probe_blocked "rm audit DB"            rm -f "$DB"
 
-# (d) HAPPY PATH — drill 6 must verify the legitimate write still works
-audit_id=$(probe_ok "sudo wrapper begin" \
-    sudo -n "$WRAPPER" begin --run-id drill6 --cwd /tmp -- echo drill6-probe)
+# (c) HAPPY PATH — drill fails if legitimate begin/end stops working
+audit_id=$(probe_ok "client begin" \
+    "$CLIENT" --socket "$SOCKET" begin \
+        --run-id drill6 \
+        --cwd /tmp \
+        -- echo drill6-probe)
 if [[ -z "$audit_id" || ! "$audit_id" =~ ^[0-9]+$ ]]; then
   echo "BREACH  happy-path begin did not return numeric audit_id (got: ${audit_id@Q})" >&2
   breached=1
 else
   echo "  begin returned audit_id=$audit_id"
-  probe_ok "sudo wrapper end" \
-      sudo -n "$WRAPPER" end --audit-id "$audit_id" --exit-code 0 --duration-ms 5 >/dev/null
+  probe_ok "client end" \
+      "$CLIENT" --socket "$SOCKET" end \
+          --audit-id "$audit_id" \
+          --exit-code 0 \
+          --duration-ms 5 >/dev/null
 fi
 
 if [[ $breached -eq 0 ]]; then
-  echo "BLOCKED OK — INV-21 holds (append-only audit write path)"
+  echo "BLOCKED OK — INV-21 holds (append-only audit write path, daemon-fronted)"
   exit 0
 else
   echo "BREACH — INV-21 broken" >&2
