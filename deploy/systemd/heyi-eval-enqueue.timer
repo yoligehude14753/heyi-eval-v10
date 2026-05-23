@@ -1,0 +1,17 @@
+[Unit]
+Description=heyi-eval-v10 hourly auto-enqueue trigger for newly discovered models
+Documentation=https://github.com/yoligehude14753/heyi-eval-v10/blob/main/docs/PR7b_TEST_PLAN.md
+
+[Timer]
+# First shot 5 min after boot to let discover finish its initial sweep.
+OnBootSec=5min
+# Then every hour. The discover loop itself runs every 4h, so most of
+# these ticks will be no-ops; the cheap re-check is intentional so that
+# any newly-curated model can be evaluated within ~1h of HF Hub publication.
+OnUnitActiveSec=1h
+# Randomize by 60s to avoid round-the-hour bursts hitting the orchestrator.
+RandomizedDelaySec=60s
+Unit=heyi-eval-enqueue.service
+
+[Install]
+WantedBy=timers.target

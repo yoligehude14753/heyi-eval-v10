@@ -1,0 +1,33 @@
+[Unit]
+Description=heyi-eval-v10 auto-enqueue newest discovered models into orchestrator queue
+Documentation=https://github.com/yoligehude14753/heyi-eval-v10/blob/main/docs/PR7b_TEST_PLAN.md
+After=network-online.target heyi-eval-discover.service
+Wants=network-online.target
+# PR#30 supersedes the v9-era unit that pointed at ~/heyi-eval-v9/.venv —
+# v10 owns the same data root + curated.json, so all paths now live under
+# /home/ai/heyi-eval-v10.
+ConditionPathExists=/home/ai/heyi-eval-v10/.venv/bin/python
+
+[Service]
+Type=oneshot
+User=ai
+Group=ai
+WorkingDirectory=/home/ai/heyi-eval-v10
+EnvironmentFile=-/etc/heyi-eval-v10/env
+Environment=PYTHONUNBUFFERED=1
+Environment=HEYI_EVAL_DATA=/home/ai/heyi-eval-data
+Environment=HF_ENDPOINT=https://hf-mirror.com
+# Defaults: pick up to 3 new ≥10k-download or ≥50-like candidates per hour.
+# discover.tracker already filters by from_date=2026-01-01, so anything
+# enqueued here is guaranteed to be a 2026-or-newer model.
+ExecStart=/home/ai/heyi-eval-v10/.venv/bin/python -m discover.main enqueue \
+    --limit 3 \
+    --min-downloads 10000 \
+    --min-likes 50
+Nice=10
+MemoryHigh=1G
+MemoryMax=2G
+TasksMax=128
+
+[Install]
+WantedBy=multi-user.target

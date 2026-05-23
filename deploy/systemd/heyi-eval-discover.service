@@ -13,7 +13,9 @@ Group=ai
 WorkingDirectory=/home/ai/heyi-eval-v10
 EnvironmentFile=-/etc/heyi-eval-v10/env
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/home/ai/heyi-eval-v10/.venv/bin/python -m discover loop
+Environment=HF_ENDPOINT=https://hf-mirror.com
+# `discover` is a package, must invoke the CLI module directly (PR#30 fix).
+ExecStart=/home/ai/heyi-eval-v10/.venv/bin/python -m discover.main loop --interval 14400
 Restart=on-failure
 RestartSec=30s
 # discover is HF-Hub-bound, lower priority than orchestrator main loop.

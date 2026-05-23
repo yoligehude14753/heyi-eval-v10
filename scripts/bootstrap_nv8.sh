@@ -22,16 +22,18 @@ SYSTEMD_DIR="/etc/systemd/system"
 UNITS_SERVICES=(
   heyi-eval-orchestrator.service
   heyi-eval-discover.service
+  heyi-eval-enqueue.service
   heyi-eval-panel.service
   heyi-eval-notify-sync.service
   heyi-eval-backup.service
 )
-UNITS_TIMERS=(heyi-eval-backup.timer)
+UNITS_TIMERS=(heyi-eval-backup.timer heyi-eval-enqueue.timer)
 UNITS_TO_ENABLE=(
   heyi-eval-orchestrator.service
   heyi-eval-discover.service
   heyi-eval-panel.service
   heyi-eval-backup.timer
+  heyi-eval-enqueue.timer
 )
 
 DRY_RUN="${DRY_RUN:-0}"
