@@ -86,13 +86,29 @@ def main() -> int:
             OR failure_reason LIKE '%incomplete_after_download%'
           )
     """).fetchall()
+    # PR#32 race guard: any hf_id currently being processed by the
+    # orchestrator (in_progress run) MUST NOT have its cache touched.
+    # Without this, a cleanup invocation during an active download
+    # would rmtree the dir under the orchestrator's feet.
+    in_flight_hfids = {
+        r[0] for r in cur.execute(
+            "SELECT DISTINCT hf_id FROM runs WHERE status IN ('in_progress','queued')"
+        ).fetchall()
+    }
     conn.close()
 
     # Group by hf_id since many runs of the same model failed together;
     # we only want to look at each cache dir once.
     by_hfid: dict[str, list[tuple[str, str, str]]] = {}
     for run_id, hf_id, status, reason in rows:
+        if hf_id in in_flight_hfids:
+            # Skip; will report below.
+            continue
         by_hfid.setdefault(hf_id, []).append((run_id, status, reason or ""))
+
+    for hf_id in sorted(in_flight_hfids):
+        print(f"[skip-in-flight] {hf_id}  has an in_progress/queued run — "
+              f"refusing to touch cache")
 
     total_freed = 0
     inspected = 0
@@ -144,10 +160,14 @@ def main() -> int:
     if args.narrow_gguf:
         print()
         print("=== --narrow-gguf: trim multi-quant GGUF caches ===")
+        # Pass in-flight hf_ids → narrow-gguf will skip caches whose
+        # hf_id is being downloaded right now (race guard).
+        in_flight_dir_names = {cfg.hf_local_dir(h) for h in in_flight_hfids}
         gguf_freed = _narrow_gguf_caches(
             cfg.model_cache_root,
             preferred_quant=GGUF_PREFERRED_QUANT,
             dry_run=args.dry_run,
+            skip_dir_names=in_flight_dir_names,
         )
         print(f"narrow-gguf {'would-free' if args.dry_run else 'freed'} "
               f"= {gguf_freed / 1e9:.1f} GB")
@@ -157,7 +177,8 @@ def main() -> int:
 def _narrow_gguf_caches(cache_root: Path,
                         *,
                         preferred_quant: str,
-                        dry_run: bool) -> int:
+                        dry_run: bool,
+                        skip_dir_names: set[str] | None = None) -> int:
     """Find any cache dir whose content is predominantly ``.gguf`` and
     that contains multiple quantization variants. Keep only files
     matching ``*preferred_quant*.gguf`` (plus tokenizer/config/etc.);
@@ -172,8 +193,13 @@ def _narrow_gguf_caches(cache_root: Path,
     if not cache_root.exists():
         return 0
     total_freed = 0
+    skip = skip_dir_names or set()
     for entry in sorted(cache_root.iterdir()):
         if not entry.is_dir():
+            continue
+        if entry.name in skip:
+            print(f"[gguf-skip-in-flight] {entry.name}: in_progress/queued "
+                  f"run touches this cache — refusing to narrow")
             continue
         # Quick GGUF-ish probe: count .gguf files in this top-level dir.
         try:
