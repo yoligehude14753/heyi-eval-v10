@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# heyi-eval-agent-harvest <run-id>
+#
+# Root-owned helper invoked via sudoers NOPASSWD by the orchestrator
+# (`ai` user). Copies the per-run agent outbox out of the sandboxed
+# agent HOME (root-readable 0750 heyi-eval-agent:heyi-eval-agent) into
+# the run dir under /home/ai/heyi-eval-data/runs/<run-id>/outbox/ and
+# hands ownership to ai:ai so the rest of the orchestrator + Panel can
+# read it without further sudo.
+#
+# Why a dedicated helper instead of teaching orchestrator to `sudo rsync`?
+#   - rsync arg parsing is footgun-prone; harvest enforces an exact
+#     source/dest pattern that cannot be coerced into "rsync -r / /tmp".
+#   - We need the SAME run-id allow-list regex used everywhere else
+#     (heyi-eval-agent-prepare, heyi-eval-agent-run, agent_runner.py)
+#     to keep the chain consistent — easier to read inside one script.
+#
+# Idempotent. Safe to re-run; the second invocation overwrites files
+# that are byte-different and leaves equal files alone.
+set -euo pipefail
+
+PROG="heyi-eval-agent-harvest"
+AGENT_HOME="${AGENT_HOME:-/var/lib/heyi-eval-agent}"
+DATA_ROOT="${HEYI_EVAL_DATA_ROOT:-/home/ai/heyi-eval-data}"
+ORCH_USER="${HEYI_EVAL_ORCH_USER:-ai}"
+ORCH_GROUP="${HEYI_EVAL_ORCH_GROUP:-ai}"
+
+log() { printf '[%s] %s\n' "$PROG" "$*" >&2; }
+die() { printf '[%s] ERROR: %s\n' "$PROG" "$*" >&2; exit 2; }
+
+[[ $EUID -eq 0 ]] || die "must be invoked as root (sudoers NOPASSWD)"
+[[ $# -eq 1   ]] || die "usage: $PROG <run-id>"
+
+RUN_ID="$1"
+if ! [[ "$RUN_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
+  die "invalid run-id $(printf %q "$RUN_ID")"
+fi
+
+SRC="$AGENT_HOME/runs/$RUN_ID/outbox"
+DST="$DATA_ROOT/runs/$RUN_ID/outbox"
+
+if [[ ! -d "$SRC" ]]; then
+  log "no outbox at $SRC (agent never produced one); nothing to harvest"
+  exit 0
+fi
+
+install -d -o "$ORCH_USER" -g "$ORCH_GROUP" -m 0755 "$DATA_ROOT/runs/$RUN_ID"
+install -d -o "$ORCH_USER" -g "$ORCH_GROUP" -m 0755 "$DST"
+
+# Use cp -r --update --no-clobber? No — we WANT to overwrite stale
+# results from a previous attempt with the same run-id. Use plain
+# `cp -a` and then chown the result so the orchestrator can read.
+cp -a "$SRC"/. "$DST"/
+chown -R "$ORCH_USER:$ORCH_GROUP" "$DST"
+
+count=$(find "$DST" -type f | wc -l)
+log "harvested $count files from $SRC -> $DST"

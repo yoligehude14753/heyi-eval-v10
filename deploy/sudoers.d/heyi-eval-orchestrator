@@ -1,0 +1,59 @@
+# Sudoers entries for the orchestrator's `ai` user (PR#22b-M3).
+#
+# The orchestrator main loop runs as `ai` and needs to drive
+# heyi-eval-agent@<run-id>.service units + reach into the agent's
+# 0750 HOME to harvest outbox files. Both require root in our threat
+# model: agent HOME is owned root-readable-only on purpose (so a
+# compromised orchestrator can't fake an outbox from outside the
+# sandbox), and starting/stopping a unit needs PID 1 cooperation.
+#
+# We grant the bare minimum:
+#   - `systemctl start|stop|status|show heyi-eval-agent@*.service`
+#     so invoke_agent() can launch + poll + tear down individual runs.
+#     `start` is the operative one; `stop` is for cancellation; `show`
+#     for polling ActiveState / ExecMainStatus (read-only).
+#   - `/usr/local/sbin/heyi-eval-agent-harvest <run-id>` — a tiny
+#     root-owned helper that copies the per-run outbox out of the
+#     agent's HOME into the data root with ownership ai:ai.
+#   - Nothing else. ALL other systemctl actions, restart of any
+#     non-agent unit, and direct invocation of the audit DB are
+#     refused. Conventional Linux ACLs + sudoers grammar handle the
+#     "default deny" automatically.
+#
+# Validation: `sudo visudo -c -f /etc/sudoers.d/heyi-eval-orchestrator`
+
+# Read-only systemctl probes need no special escape; the wildcard
+# matches ONLY units in the heyi-eval-agent@*.service template.
+Cmnd_Alias HEYI_EVAL_AGENT_LIFECYCLE = \
+    /bin/systemctl     start   heyi-eval-agent@*.service, \
+    /bin/systemctl     stop    heyi-eval-agent@*.service, \
+    /bin/systemctl     status  heyi-eval-agent@*.service, \
+    /bin/systemctl     show    --property=ActiveState --value heyi-eval-agent@*.service, \
+    /bin/systemctl     show    --property=ExecMainStatus --value heyi-eval-agent@*.service, \
+    /usr/bin/systemctl start   heyi-eval-agent@*.service, \
+    /usr/bin/systemctl stop    heyi-eval-agent@*.service, \
+    /usr/bin/systemctl status  heyi-eval-agent@*.service, \
+    /usr/bin/systemctl show    --property=ActiveState --value heyi-eval-agent@*.service, \
+    /usr/bin/systemctl show    --property=ExecMainStatus --value heyi-eval-agent@*.service
+
+# Helper that copies outbox/ out of the sandbox HOME (root-owned 0750)
+# into the run dir (ai-owned 0755). Arg is run-id; the helper itself
+# re-validates against the same regex as the agent runner.
+Cmnd_Alias HEYI_EVAL_AGENT_HARVEST = \
+    /usr/local/sbin/heyi-eval-agent-harvest *
+
+# Defence-in-depth: refuse anything that mentions the production stack
+# or that could let `ai` move sideways into root for non-sandbox tasks.
+Cmnd_Alias HEYI_EVAL_ORCH_FORBIDDEN = \
+    /bin/su, /usr/bin/su, /bin/su -, /usr/bin/su -, \
+    /usr/sbin/visudo, /usr/bin/visudo, \
+    /bin/passwd, /usr/bin/passwd, \
+    /bin/systemctl stop  minimax,    /usr/bin/systemctl stop  minimax, \
+    /bin/systemctl restart minimax,  /usr/bin/systemctl restart minimax, \
+    /bin/systemctl stop  heyi-engine.service, \
+    /usr/bin/systemctl stop  heyi-engine.service, \
+    /bin/systemctl restart docker.service, \
+    /usr/bin/systemctl restart docker.service
+
+ai ALL=(root) NOPASSWD: HEYI_EVAL_AGENT_LIFECYCLE, HEYI_EVAL_AGENT_HARVEST
+ai ALL=(ALL)       !HEYI_EVAL_ORCH_FORBIDDEN

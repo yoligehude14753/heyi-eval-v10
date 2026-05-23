@@ -610,5 +610,81 @@ ALL 6 DRILLS PASSED — INV-16/17/18/19/20/21 hold end-to-end
 - [x] PR#22b-M2: `heyi-eval-audit.service` active 且 `/run/heyi-eval-agent-audit.sock` 存在且 mode 0660 root:heyi-eval-agent
 - [x] PR#22b-M2: drill-6 真机绿(`run_all.sh` 末尾"drill-6 rc=0")
 - [x] PR#22b-M2: `systemctl start heyi-eval-agent@m2demo.service` 完整 lifecycle 通过(prepare→audit-begin→smoke→audit-end),`/var/lib/heyi-eval-agent/runs/m2demo/outbox/run_meta.json` 有内容
-- [ ] (推迟到 PR#22b-M3)orchestrator 主 loop 通过 `systemctl start heyi-eval-agent@<run-id>` 拉起 agent + 回收 outbox
+- [x] PR#22b-M3: orchestrator `ai` 用户可通过 sudoers NOPASSWD 调 `systemctl start heyi-eval-agent@<id>.service` + `heyi-eval-agent-harvest <id>`(见 §14)
 - [ ] (推迟到 PR#23)LLM-judge 接 M2.7 API + eval_gpus 默认 (5,6,7) + ENGINE_SELECT oversize gating
+
+## 14 · Orchestrator 接入 sandbox(PR#22b-M3)
+
+PR#22b-M3 在 M2 沙箱基础上加了**两段桥接管线**,让 `ai` 用户跑的
+orchestrator 主 loop 可以"无密码、最小权限"地拉起一次沙箱 agent
+run,然后把 agent 在 root-only 0750 HOME 里写的 outbox 拿回到
+`/home/ai/heyi-eval-data/runs/<id>/outbox/`:
+
+- `Python` 端:`orchestrator/agent_runner.py::invoke_agent(run_id, AgentSpec)`
+  - 把 spec.json 写到 `<DATA_ROOT>/runs/<id>/spec.json`(ai 可写)
+  - `sudo -n systemctl start heyi-eval-agent@<id>.service` 拉起 agent
+  - 轮询 `ActiveState != active|activating|deactivating|reloading`,过 1800+60 s 报 timeout
+  - 读 `ExecMainStatus`(unit 退码)+ `agent_audit.query_recent` 查 begin/end 配对
+  - `sudo -n /usr/local/sbin/heyi-eval-agent-harvest <id>` 把 outbox 拷出 + chown ai:ai
+  - 把以上写成 `<DATA_ROOT>/runs/<id>/agent_summary.json` 供 Panel
+- `Shell` 端:`/usr/local/sbin/heyi-eval-agent-harvest <run-id>`
+  - 仅接受 run-id(同一份正则:`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+  - 固定 src=`$AGENT_HOME/runs/<id>/outbox` / 固定 dst=`$DATA_ROOT/runs/<id>/outbox`
+  - 不接受任意路径,不调用 rsync,杜绝路径注入
+
+### 14.1 一次性部署(已并入 bootstrap)
+
+```bash
+sudo -u ai bash /home/ai/heyi-eval-v10/scripts/bootstrap_nv8.sh
+# 第 4b 阶段会:
+#   - install -m 0755 heyi-eval-agent-harvest -> /usr/local/sbin/
+#   - install -m 0440 sudoers.d/heyi-eval-orchestrator -> /etc/sudoers.d/
+#   - visudo -c -f /etc/sudoers.d/heyi-eval-orchestrator
+```
+
+仅升级 M3 部分(不动 M1/M2):
+
+```bash
+cd /home/ai/heyi-eval-v10
+sudo install -m 0755 -o root -g root deploy/agent-sandbox/heyi-eval-agent-harvest /usr/local/sbin/heyi-eval-agent-harvest
+sudo install -m 0440 deploy/sudoers.d/heyi-eval-orchestrator /etc/sudoers.d/heyi-eval-orchestrator
+sudo visudo -c -f /etc/sudoers.d/heyi-eval-orchestrator
+```
+
+### 14.2 端到端验证 smoke
+
+```bash
+sudo -u ai bash -lc '
+  set -euo pipefail
+  cd /home/ai/heyi-eval-v10
+  run_id="m3demo-$(date +%s)"
+  .venv/bin/python -m orchestrator.agent_runner "$run_id" --mode smoke
+  echo "--- summary ---"
+  cat /home/ai/heyi-eval-data/runs/$run_id/agent_summary.json
+  echo "--- harvested outbox ---"
+  ls -la /home/ai/heyi-eval-data/runs/$run_id/outbox/
+  cat /home/ai/heyi-eval-data/runs/$run_id/outbox/run_meta.json
+'
+```
+
+期望:`agent_summary.json::ok == true`,`unit_exit_code == 0`,
+outbox 至少有 `run_meta.json` + `payload.stdout`,且 `payload.stdout`
+头一行是 `agent-runner smoke run_id=m3demo-...`。
+
+### 14.3 常见排错
+
+| 症状 | 根因 / 处理 |
+|---|---|
+| `sudo: a password is required` | sudoers 没安装或 visudo 报错;手跑 §14.1 末段 visudo -c |
+| `start_failed rc=5 stderr='Unit heyi-eval-agent@xxx.service not found'` | unit 模板没装;`sudo systemctl daemon-reload && systemctl list-unit-files heyi-eval-agent@.service` |
+| `outbox_files: []` 且 unit_exit_code=0 | harvest 帮助脚本权限错;`sudo getfacl /var/lib/heyi-eval-agent/runs/<id>/outbox`,正确状态 owner 是 heyi-eval-agent;然后 `sudo -u ai sudo -n /usr/local/sbin/heyi-eval-agent-harvest <id>` 看 stderr |
+| `AgentRunnerError(kind=timeout)` | smoke 跑 1800 s+ 不正常,先 `systemctl status heyi-eval-agent@<id>.service` 看是否卡在 `ExecStartPre=` |
+| summary `ok==False` 但 `unit_exit_code==0` | audit `end` 行没回写;最常见原因是 audit daemon 崩溃,`journalctl -u heyi-eval-audit.service -n 50` |
+
+### 14.4 §14 核对清单
+
+- [x] `sudo visudo -c -f /etc/sudoers.d/heyi-eval-orchestrator` 退 0
+- [x] `sudo -u ai sudo -n /usr/local/sbin/heyi-eval-agent-harvest m3demo-X` 不弹密码(可能空 outbox)
+- [x] `sudo -u ai .venv/bin/python -m orchestrator.agent_runner m3demo-Y --mode smoke` ok=True
+- [x] `agent_summary.json` 中 `audit.end_exit == 0` 且 `audit.begin_id != null`
+- [x] `outbox/run_meta.json` 由 ai 用户可读(ownership ai:ai)

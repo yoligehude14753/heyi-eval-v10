@@ -235,6 +235,22 @@ if [[ -d "$SANDBOX_DIR" ]]; then
   else
     log "sudoers.d/heyi-eval-agent (unchanged)"
   fi
+  # PR#22b-M3: harvest helper + orchestrator sudoers. The helper is a
+  # tiny root script the `ai` user can invoke via NOPASSWD sudo to copy
+  # the agent's per-run outbox out of the 0750 HOME and chown it to ai:ai.
+  if [[ -f "${SANDBOX_DIR}/heyi-eval-agent-harvest" ]]; then
+    run "sudo install -m 0755 -o root -g root '${SANDBOX_DIR}/heyi-eval-agent-harvest' /usr/local/sbin/heyi-eval-agent-harvest"
+  fi
+  ORCH_SUDOERS_SRC="${REPO_ROOT}/deploy/sudoers.d/heyi-eval-orchestrator"
+  if [[ -f "$ORCH_SUDOERS_SRC" ]]; then
+    if ! cmp -s "$ORCH_SUDOERS_SRC" /etc/sudoers.d/heyi-eval-orchestrator 2>/dev/null; then
+      log "installing sudoers.d/heyi-eval-orchestrator"
+      run "sudo install -m 0440 '${ORCH_SUDOERS_SRC}' /etc/sudoers.d/heyi-eval-orchestrator"
+      run "sudo visudo -c -f /etc/sudoers.d/heyi-eval-orchestrator"
+    else
+      log "sudoers.d/heyi-eval-orchestrator (unchanged)"
+    fi
+  fi
   # Agent-side docker-socket-proxy. We use the orchestrator's docker
   # daemon (the user is in `docker`), but the agent will reach it via
   # 127.0.0.1:2377 read-only — see INV-17.
