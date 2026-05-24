@@ -328,6 +328,49 @@ class OrphanSweepTests(unittest.TestCase):
             self.assertIsNotNone(unblocked,
                                  "must work once orphan is aborted")
 
+    # PR#44: force_all kwarg for the startup-time path
+    def test_force_all_sweeps_even_when_fresh(self):
+        """PR#44: at orchestrator startup, anything still in_progress
+        is necessarily orphaned because the orchestrator is the only
+        process that writes that column. ``force_all=True`` bypasses
+        the time check.
+
+        Live nv8 motivation: restarting the orchestrator while
+        STAGE_MODEL was downloading mistralai/Voxtral-Mini-3B-2507
+        left the row in_progress with last_touch=7min ago — below
+        the 30-min threshold, so the run stayed orphaned forever.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            store = Store(Path(td))
+            # Fresh — 1-minute-old, well under stale_after_s=1800
+            self._make_run(store, "r-fresh", "x/y",
+                           status=RunStatus.IN_PROGRESS, age_s=60.0)
+            # Time-based path would NOT sweep this
+            n_time = _sweep_orphan_in_progress(store, stale_after_s=1800.0)
+            self.assertEqual(n_time, 0)
+            # force_all=True must sweep it regardless
+            n_force = _sweep_orphan_in_progress(
+                store, stale_after_s=1800.0, force_all=True,
+            )
+            self.assertEqual(n_force, 1)
+            self.assertEqual(
+                store.get_run("r-fresh").status, RunStatus.ABORTED,
+            )
+
+    def test_force_all_still_skips_terminal_states(self):
+        """Regression: force_all only affects the time-check; OK /
+        FAILED / ABORTED rows must NOT be touched."""
+        with tempfile.TemporaryDirectory() as td:
+            store = Store(Path(td))
+            self._make_run(store, "r-ok", "x/y",
+                           status=RunStatus.OK, age_s=10.0)
+            self._make_run(store, "r-fail", "x/y",
+                           status=RunStatus.FAILED, age_s=10.0)
+            n = _sweep_orphan_in_progress(
+                store, stale_after_s=1800.0, force_all=True,
+            )
+            self.assertEqual(n, 0)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

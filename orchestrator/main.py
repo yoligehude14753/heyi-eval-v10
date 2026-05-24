@@ -547,7 +547,8 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def _sweep_orphan_in_progress(
-    store: Store, *, stale_after_s: float = 1800.0
+    store: Store, *, stale_after_s: float = 1800.0,
+    force_all: bool = False,
 ) -> int:
     """Mark stale 'in_progress' runs as aborted on orchestrator startup.
 
@@ -559,6 +560,15 @@ def _sweep_orphan_in_progress(
     any in_progress run that hasn't seen a heartbeat update for
     longer than `stale_after_s` and re-mark it ABORTED with reason
     'orchestrator_restart_orphan'.
+
+    PR#44 (2026-05-24 nv8): the 30-min stale_after_s default was too
+    conservative — restarting the orchestrator within 7 min of an
+    in-flight STAGE_MODEL left the row in_progress, which blocked
+    PR#38 dedup from re-enqueuing the model. ``force_all=True`` (the
+    startup-time path) skips the time check entirely: by definition,
+    anything still ``in_progress`` when the orchestrator process has
+    just started cannot be making progress, because the orchestrator
+    is the only writer.
 
     Returns the number of runs swept.
     """
@@ -574,7 +584,7 @@ def _sweep_orphan_in_progress(
             r.get("started_at") or 0.0,
         ]
         last_touch = max(float(x) for x in candidates if x)
-        if last_touch and (now - last_touch) < stale_after_s:
+        if not force_all and last_touch and (now - last_touch) < stale_after_s:
             continue  # still fresh, leave alone
         run = store.get_run(r["run_id"])
         if run is None:
@@ -584,9 +594,11 @@ def _sweep_orphan_in_progress(
         run.ended_at = now
         store.save_run(run)
         swept += 1
+        age = f"stale_for={now - last_touch:.0f}s" if last_touch else "no-touch"
         print(
-            f"[sweep] orphan in_progress -> aborted: {r['run_id']} ({r['hf_id']}) "
-            f"stale_for={now - last_touch:.0f}s"
+            f"[sweep] orphan in_progress -> aborted: {r['run_id']} "
+            f"({r['hf_id']}) {age}"
+            + (" [force_all]" if force_all else "")
         )
     return swept
 
@@ -599,8 +611,13 @@ def cmd_loop(args: argparse.Namespace) -> int:
     heartbeat_interval = float(os.environ.get("HEYI_HEARTBEAT_INTERVAL", "14400"))  # 4h
     engine_remind_interval = float(os.environ.get("HEYI_ENGINE_REMIND_INTERVAL", "3600"))  # 1h
 
+    # PR#44: at process startup nothing else can be writing in_progress,
+    # so unconditionally sweep all of them. The `stale_after_s` knob is
+    # kept for any future in-loop sweep call (none today).
     stale_after = float(os.environ.get("HEYI_ORPHAN_STALE_S", "1800"))
-    n_swept = _sweep_orphan_in_progress(store, stale_after_s=stale_after)
+    n_swept = _sweep_orphan_in_progress(
+        store, stale_after_s=stale_after, force_all=True,
+    )
     if n_swept:
         print(f"[startup] swept {n_swept} orphan in_progress run(s)")
 
