@@ -702,10 +702,28 @@ def execute_deploy(
             # the engine just doesn't serve text. Read capability_tags
             # from <run>/_meta/curated.json and only fire the probe
             # when "text" or "code" is among them.
+            #
+            # PR#47 (post-speecht5 nv8 21:52 run): the original gate
+            # asked "any text/code tag present?" but missed that
+            # TTS / image-gen models legitimately have ``text`` in
+            # capability_tags because the INPUT is text. The fix is
+            # to check for *output* tags that don't serve chat/
+            # completions; if ANY of those are present, skip the
+            # probe regardless of whether "text" is also there.
             probe_enabled = getattr(
                 cfg, "deploy_inference_probe_enabled", True
             )
             probe_applicable = False
+            # Capability tags that indicate the model's OUTPUT is not
+            # text. Even if "text" appears alongside, the model still
+            # cannot serve chat/completions, so the probe must be
+            # skipped or it would false-flag.
+            _non_chat_output_tags = {
+                "tts", "asr",
+                "image_gen", "video_gen", "music_gen",
+                "embedding",
+            }
+            _text_like = {"text", "code"}
             if probe_enabled and models_listed:
                 cap_tags: list[str] = []
                 try:
@@ -717,22 +735,25 @@ def execute_deploy(
                             cap_tags = [str(t).lower() for t in raw]
                 except Exception:
                     cap_tags = []
-                # Text/code models: always probe.
-                # Audio/vision/image-gen models: skip probe.
-                # No tags / mixed: probe (default safe).
-                text_like = {"text", "code"}
-                audio_visual_only = {"audio", "asr", "tts", "image-gen",
-                                     "video-gen", "music-gen", "vision",
-                                     "ocr", "video-understanding",
-                                     "music-understanding"}
                 if cap_tags:
-                    if any(t in text_like for t in cap_tags):
-                        probe_applicable = True
-                    elif all(t in audio_visual_only for t in cap_tags):
+                    if any(t in _non_chat_output_tags for t in cap_tags):
+                        # TTS / ASR / image_gen / etc — output is non-text,
+                        # chat/completions is not the right endpoint.
                         probe_applicable = False
-                    else:
+                    elif any(t in _text_like for t in cap_tags):
+                        # Pure text/code model — probe.
                         probe_applicable = True
+                    else:
+                        # vision / audio only (no non-chat-output tag,
+                        # no text-like tag): probably an audio-understanding
+                        # or vision-understanding model. Skip the probe to
+                        # be safe; those endpoints aren't chat/completions
+                        # either.
+                        probe_applicable = False
                 else:
+                    # No tags emitted at all — defaultsafely probe (vllm
+                    # default routing is text-gen so chat/completions is
+                    # the expected endpoint).
                     probe_applicable = True
             if probe_applicable:
                 probe_timeout = float(

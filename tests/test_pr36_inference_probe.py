@@ -240,6 +240,89 @@ class InferenceProbeInTryOnceTests(unittest.TestCase):
         finally:
             td.cleanup()
 
+    # PR#47: speecht5 lesson — "text" in capability_tags means the INPUT
+    # is text; if a non-chat output tag (tts/asr/image_gen/etc) is also
+    # present, chat/completions is still the wrong endpoint and we must
+    # skip the probe.
+    def test_pr47_probe_skipped_for_tts_even_with_text_tag(self):
+        """Live regression: ``microsoft/speecht5_tts`` curator emitted
+        ``capability_tags=["text", "tts"]`` because the INPUT is text.
+        Old gate fired on ``"text"``-presence and flagged 501 on
+        chat/completions as inference_broken — but the transformers-
+        runner correctly serves T2S on /v1/audio/speech, not chat.
+
+        The right behaviour: skip the probe whenever a non-chat output
+        tag is present, regardless of whether ``text`` is also there.
+        """
+        td, cfg, run, client = self._setup(501, TRANSFORMERS_501_BODY)
+        self._write_curated(cfg, run, ["text", "tts"])
+        try:
+            with _patch_docker(client), \
+                 patch.object(stages_py, "_http_get_json",
+                              return_value=(200, {"data": [{"id": "x"}]})), \
+                 patch.object(stages_py, "_http_post_json") as probe:
+                r = stages_py.execute_deploy(
+                    run, cfg, sleep=_NOP_SLEEP, enable_repair=False,
+                )
+            probe.assert_not_called()
+            self.assertTrue(r.ok,
+                            "TTS models must not be probed on chat/completions "
+                            "just because they consume text input")
+        finally:
+            td.cleanup()
+
+    def test_pr47_probe_skipped_for_asr_even_with_text_tag(self):
+        """ASR equivalent: ``capability_tags=["text", "asr"]`` (whisper
+        / mms-300m families when curator picks both). Probe must skip."""
+        td, cfg, run, client = self._setup(501, TRANSFORMERS_501_BODY)
+        self._write_curated(cfg, run, ["text", "asr"])
+        try:
+            with _patch_docker(client), \
+                 patch.object(stages_py, "_http_get_json",
+                              return_value=(200, {"data": [{"id": "x"}]})), \
+                 patch.object(stages_py, "_http_post_json") as probe:
+                r = stages_py.execute_deploy(
+                    run, cfg, sleep=_NOP_SLEEP, enable_repair=False,
+                )
+            probe.assert_not_called()
+            self.assertTrue(r.ok)
+        finally:
+            td.cleanup()
+
+    def test_pr47_probe_skipped_for_image_gen_even_with_text_tag(self):
+        """Diffusers SD pipelines: curator commonly emits
+        ``["text", "image_gen"]`` (prompt is text). Must skip."""
+        td, cfg, run, client = self._setup(501, TRANSFORMERS_501_BODY)
+        self._write_curated(cfg, run, ["text", "image_gen"])
+        try:
+            with _patch_docker(client), \
+                 patch.object(stages_py, "_http_get_json",
+                              return_value=(200, {"data": [{"id": "x"}]})), \
+                 patch.object(stages_py, "_http_post_json") as probe:
+                r = stages_py.execute_deploy(
+                    run, cfg, sleep=_NOP_SLEEP, enable_repair=False,
+                )
+            probe.assert_not_called()
+        finally:
+            td.cleanup()
+
+    def test_pr47_probe_skipped_for_embedding_even_with_text_tag(self):
+        """Sentence-transformer embedding models: ``["text", "embedding"]``.
+        Serves /v1/embeddings, not chat/completions. Must skip."""
+        td, cfg, run, client = self._setup(501, TRANSFORMERS_501_BODY)
+        self._write_curated(cfg, run, ["text", "embedding"])
+        try:
+            with _patch_docker(client), \
+                 patch.object(stages_py, "_http_get_json",
+                              return_value=(200, {"data": [{"id": "x"}]})), \
+                 patch.object(stages_py, "_http_post_json") as probe:
+                r = stages_py.execute_deploy(
+                    run, cfg, sleep=_NOP_SLEEP, enable_repair=False,
+                )
+            probe.assert_not_called()
+        finally:
+            td.cleanup()
+
     def test_probe_fires_when_no_curated_json(self):
         """No curated.json (unusual) → default to probing.
         Backward compat: same behaviour as PR#36a's initial impl."""
