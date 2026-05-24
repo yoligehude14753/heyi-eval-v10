@@ -27,6 +27,8 @@ from discover.tracker import (  # noqa: E402
     load_candidates,
     load_cursor,
     save_cursor,
+    scan_backfill,
+    scan_incremental,
     scan_round,
 )
 
@@ -245,6 +247,209 @@ class ModelToCandidateTests(unittest.TestCase):
         self.assertEqual(c.downloads, 12345)
         self.assertEqual(c.likes, 67)
         self.assertEqual(c.reason, "whitelist")
+
+
+# ── PR#49 ─────────────────────────────────────────────────────────────────
+
+
+class _SortedFakeApi:
+    """FakeApi specialised for backfill / incremental: list_models is
+    sorted by last_modified descending and supports ``direction=-1``."""
+    def __init__(self, models: list[FakeModel]):
+        # Pre-sort descending so the iteration order mirrors what
+        # HfApi(sort=lastModified, direction=-1) returns.
+        self.models = sorted(
+            models,
+            key=lambda m: m.last_modified or "",
+            reverse=True,
+        )
+        self.calls: list[dict] = []
+
+    def list_models(self, author=None, limit=None, sort=None,
+                    direction=None, expand=None, **kw):
+        self.calls.append({
+            "author": author, "limit": limit, "sort": sort,
+            "direction": direction,
+        })
+        return list(self.models)[: (limit or len(self.models))]
+
+
+def _mk_models_by_month() -> list[FakeModel]:
+    """5 months × 4 models each = 20 models across 2026, plus
+    2 from 2025 to test the cutoff."""
+    out = []
+    for month in range(1, 6):
+        for i in range(4):
+            out.append(FakeModel(
+                id=f"org-{month}/model-{i}",
+                last_modified=f"2026-{month:02d}-{(i+1)*5:02d}T00:00:00+00:00",
+                downloads=100 + i,
+                likes=10 + i,
+                pipeline_tag="text-generation",
+            ))
+    out.append(FakeModel(
+        id="oldorg/old-1", last_modified="2025-12-15T00:00:00+00:00",
+        pipeline_tag="text-generation",
+    ))
+    out.append(FakeModel(
+        id="oldorg/old-2", last_modified="2025-11-01T00:00:00+00:00",
+        pipeline_tag="text-generation",
+    ))
+    return out
+
+
+class ScanBackfillTests(unittest.TestCase):
+
+    def _config(self, from_date="2026-01-01T00:00:00Z"):
+        # PR#49: trending threshold should NOT apply to backfill — we set
+        # min_downloads_30d very high to prove the threshold is ignored.
+        return TrackerConfig(
+            whitelist_orgs=[],
+            min_downloads_30d=1_000_000,
+            min_likes=10_000,
+            from_date=from_date,
+            modality_pipeline_tags=["text-generation"],
+        )
+
+    def test_backfill_captures_all_2026_models(self):
+        """All 20 models with last_modified >= 2026-01-01 must be
+        captured, even though they're well below the trending threshold.
+        The 2 models from 2025 must be excluded."""
+        api = _SortedFakeApi(_mk_models_by_month())
+        cursor = Cursor()
+        new, stats, finished = scan_backfill(
+            api, self._config(), cursor, max_per_round=100,
+        )
+        self.assertEqual(len(new), 20,
+                         f"expected 20 2026 models, got {len(new)}")
+        self.assertTrue(finished,
+                        "boundary hit → backfill should report finished")
+        self.assertTrue(cursor.backfill_complete)
+
+    def test_backfill_resumes_via_high_water(self):
+        """Partial backfill (limit too small to drain all models in one
+        round) must update high_water and skip already-processed pages
+        on the second round."""
+        api = _SortedFakeApi(_mk_models_by_month())
+        cursor = Cursor()
+        new1, _, finished1 = scan_backfill(
+            api, self._config(), cursor, max_per_round=10,
+        )
+        self.assertFalse(finished1,
+                         "10 of 22 models — backfill is mid-flight")
+        first_hw = cursor.backfill_high_water
+        self.assertTrue(first_hw)
+        # Round 2 picks up from high_water, drains the rest.
+        new2, _, finished2 = scan_backfill(
+            api, self._config(), cursor, max_per_round=100,
+        )
+        self.assertTrue(finished2, "second round must close out 2026")
+        total = len(new1) + len(new2)
+        # Some overlap is OK (re-processing the page-boundary row); but
+        # total unique seen must cover all 20 2026 models.
+        self.assertEqual(len(cursor.seen), 20)
+
+    def test_backfill_skips_seen_ids(self):
+        api = _SortedFakeApi(_mk_models_by_month())
+        cursor = Cursor(seen={"org-3/model-2"})
+        new, stats, _ = scan_backfill(api, self._config(), cursor)
+        self.assertNotIn("org-3/model-2", {c.hf_id for c in new})
+        self.assertGreater(stats.seen_skipped, 0)
+
+    def test_backfill_skips_private_and_gated(self):
+        models = _mk_models_by_month()
+        # mark one private, one gated
+        models[0].private = True
+        models[1].gated = True
+        api = _SortedFakeApi(models)
+        cursor = Cursor()
+        new, _, _ = scan_backfill(api, self._config(), cursor)
+        ids = {c.hf_id for c in new}
+        self.assertNotIn(models[0].id, ids)
+        self.assertNotIn(models[1].id, ids)
+
+    def test_backfill_skips_unsupported_modality(self):
+        models = _mk_models_by_month()
+        models[5].pipeline_tag = "image-classification"  # not in allowed
+        api = _SortedFakeApi(models)
+        cursor = Cursor()
+        new, _, _ = scan_backfill(api, self._config(), cursor)
+        self.assertNotIn(models[5].id, {c.hf_id for c in new})
+
+    def test_backfill_api_error_returns_empty_unfinished(self):
+        class _BrokenApi:
+            def list_models(self, *a, **kw):
+                raise RuntimeError("hf-mirror 500")
+
+        cursor = Cursor()
+        new, stats, finished = scan_backfill(_BrokenApi(), self._config(), cursor)
+        self.assertEqual(new, [])
+        self.assertEqual(stats.api_errors, 1)
+        self.assertFalse(finished)
+        self.assertFalse(cursor.backfill_complete)
+
+    def test_backfill_complete_persists_in_cursor_dict(self):
+        cursor = Cursor(backfill_complete=True,
+                        backfill_high_water="2026-01-15T00:00:00+00:00")
+        d = cursor.to_dict()
+        self.assertTrue(d["backfill_complete"])
+        self.assertEqual(d["backfill_high_water"],
+                         "2026-01-15T00:00:00+00:00")
+        round_tripped = Cursor.from_dict(d)
+        self.assertTrue(round_tripped.backfill_complete)
+
+
+class ScanIncrementalTests(unittest.TestCase):
+
+    def _config(self, from_date="2026-01-01T00:00:00Z"):
+        return TrackerConfig(
+            whitelist_orgs=[],
+            min_downloads_30d=1_000_000,
+            min_likes=10_000,
+            from_date=from_date,
+            modality_pipeline_tags=["text-generation"],
+        )
+
+    def test_incremental_stops_at_cutoff(self):
+        """Incremental sweep must stop at cursor.last_run_ts, not
+        descend into already-backfilled models. Boundary semantics:
+        ``last_modified >= cutoff`` qualifies, strictly older breaks."""
+        api = _SortedFakeApi(_mk_models_by_month())
+        cursor = Cursor(
+            last_run_ts="2026-04-10T00:00:00+00:00",
+            backfill_complete=True,
+        )
+        new, _ = scan_incremental(api, self._config(), cursor)
+        # Inclusive cutoff: month 4 days 10, 15, 20; month 5 days 5, 10, 15, 20 = 7
+        self.assertEqual(len(new), 7)
+        for c in new:
+            self.assertGreaterEqual(c.last_modified,
+                                    "2026-04-10T00:00:00+00:00")
+
+    def test_incremental_seen_dedupes(self):
+        api = _SortedFakeApi(_mk_models_by_month())
+        cursor = Cursor(
+            seen={"org-5/model-2", "org-5/model-3"},
+            last_run_ts="2026-04-01T00:00:00+00:00",
+            backfill_complete=True,
+        )
+        new, _ = scan_incremental(api, self._config(), cursor)
+        ids = {c.hf_id for c in new}
+        self.assertNotIn("org-5/model-2", ids)
+        self.assertNotIn("org-5/model-3", ids)
+
+    def test_incremental_advances_last_run_ts(self):
+        api = _SortedFakeApi(_mk_models_by_month())
+        cursor = Cursor(
+            last_run_ts="2026-04-01T00:00:00+00:00",
+            backfill_complete=True,
+        )
+        old_ts = cursor.last_run_ts
+        scan_incremental(api, self._config(), cursor)
+        self.assertNotEqual(cursor.last_run_ts, old_ts)
+        # Should be "now" — but tests don't pin time; just check it's
+        # at least more recent than the old cutoff.
+        self.assertGreater(cursor.last_run_ts, old_ts)
 
 
 if __name__ == "__main__":

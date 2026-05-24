@@ -20,6 +20,8 @@ from .tracker import (
     load_candidates,
     load_cursor,
     save_cursor,
+    scan_backfill,
+    scan_incremental,
     scan_round,
 )
 
@@ -67,24 +69,50 @@ def _resolve_hf_token() -> str | None:
 
 
 def cmd_once(args: argparse.Namespace) -> int:
+    """One discover pass. PR#49: auto-routes to backfill or incremental
+    based on cursor state, unless the user forces a legacy ``scan_round``
+    via ``--mode legacy``.
+    """
     data_root = _default_data_root()
     config = TrackerConfig.from_yaml(args.whitelist or _whitelist_path())
     cursor = load_cursor(_cursor_path(data_root))
     api = _make_api(args.hf_endpoint, token=_resolve_hf_token())
 
-    new, stats = scan_round(api, config, cursor)
+    mode = getattr(args, "mode", "auto") or "auto"
+
+    if mode == "legacy":
+        new, stats = scan_round(api, config, cursor)
+        kind = "legacy"
+        finished = None
+    elif mode == "backfill" or (mode == "auto" and not cursor.backfill_complete):
+        new, stats, finished = scan_backfill(
+            api, config, cursor,
+            max_per_round=getattr(args, "backfill_batch", 5000),
+        )
+        kind = "backfill"
+    else:
+        new, stats = scan_incremental(api, config, cursor)
+        kind = "incremental"
+        finished = None
+
     n_written = append_candidates(_candidates_path(data_root), new)
     save_cursor(_cursor_path(data_root), cursor)
 
+    extra = ""
+    if kind == "backfill":
+        extra = (
+            f" backfill_complete={cursor.backfill_complete} "
+            f"high_water={cursor.backfill_high_water[:19] or '-'}"
+        )
     print(
-        f"[discover.once] new={n_written} seen_skipped={stats.seen_skipped} "
+        f"[discover.{kind}] new={n_written} seen_skipped={stats.seen_skipped} "
         f"excluded_old={stats.excluded_old} excluded_modality={stats.excluded_modality} "
         f"excluded_trending_threshold={stats.excluded_trending_threshold} "
-        f"api_errors={stats.api_errors}"
+        f"api_errors={stats.api_errors}{extra}"
     )
     if new:
         sample = new[: min(5, len(new))]
-        print("[discover.once] sample new candidates:")
+        print(f"[discover.{kind}] sample new candidates:")
         for c in sample:
             print(
                 f"  + {c.hf_id}  reason={c.reason}  pipe={c.pipeline_tag} "
@@ -94,7 +122,21 @@ def cmd_once(args: argparse.Namespace) -> int:
 
 
 def cmd_loop(args: argparse.Namespace) -> int:
-    print(f"[discover.loop] interval={args.interval}s, ctrl-c to stop", file=sys.stderr)
+    """PR#49: backfill-then-daily-incremental loop.
+
+    While ``cursor.backfill_complete`` is False, run a backfill round
+    every ``--backfill-interval`` seconds (default 300s, so a fresh
+    install drains 50-100k HF entries in a few hours rather than
+    weeks). Once backfill is complete, switch to ``--interval`` (default
+    86400s = daily) of ``scan_incremental``.
+    """
+    backfill_interval = getattr(args, "backfill_interval", 300)
+    incr_interval = args.interval
+    print(
+        f"[discover.loop] backfill_interval={backfill_interval}s "
+        f"incremental_interval={incr_interval}s, ctrl-c to stop",
+        file=sys.stderr,
+    )
     while True:
         try:
             rc = cmd_once(args)
@@ -104,17 +146,24 @@ def cmd_loop(args: argparse.Namespace) -> int:
             return 130
         except Exception as e:
             print(f"[discover.loop] UNHANDLED: {type(e).__name__}: {e}", file=sys.stderr)
-        time.sleep(args.interval)
+        # Decide sleep based on cursor state (re-load after cmd_once which
+        # may have flipped backfill_complete).
+        data_root = _default_data_root()
+        cursor = load_cursor(_cursor_path(data_root))
+        sleep_s = incr_interval if cursor.backfill_complete else backfill_interval
+        time.sleep(sleep_s)
 
 
 def cmd_status(args: argparse.Namespace) -> int:
     data_root = _default_data_root()
     cursor = load_cursor(_cursor_path(data_root))
     cands = load_candidates(_candidates_path(data_root))
-    print(f"data_root         : {data_root}")
-    print(f"candidates total  : {len(cands)}")
-    print(f"cursor.last_run_ts: {cursor.last_run_ts or '(never)'}")
-    print(f"cursor.seen size  : {len(cursor.seen)}")
+    print(f"data_root              : {data_root}")
+    print(f"candidates total       : {len(cands)}")
+    print(f"cursor.last_run_ts     : {cursor.last_run_ts or '(never)'}")
+    print(f"cursor.seen size       : {len(cursor.seen)}")
+    print(f"cursor.backfill_complete: {cursor.backfill_complete}")
+    print(f"cursor.backfill_high_water: {cursor.backfill_high_water or '(none)'}")
 
     by_reason: dict[str, int] = {}
     by_modality: dict[str, int] = {}
@@ -122,8 +171,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         by_reason[c.reason] = by_reason.get(c.reason, 0) + 1
         if c.pipeline_tag:
             by_modality[c.pipeline_tag] = by_modality.get(c.pipeline_tag, 0) + 1
-    print(f"by_reason         : {by_reason}")
-    print(f"by_modality (top 6): {sorted(by_modality.items(), key=lambda x: -x[1])[:6]}")
+    print(f"by_reason              : {by_reason}")
+    print(f"by_modality (top 6)    : {sorted(by_modality.items(), key=lambda x: -x[1])[:6]}")
     return 0
 
 
@@ -246,10 +295,39 @@ def main(argv: list[str] | None = None) -> int:
     sp = p.add_subparsers(dest="cmd")
 
     p_once = sp.add_parser("once", help="single scan round")
+    p_once.add_argument(
+        "--mode",
+        choices=["auto", "backfill", "incremental", "legacy"],
+        default="auto",
+        help=("PR#49: auto = cursor-driven (backfill until complete, then "
+              "incremental); backfill / incremental force one mode; legacy "
+              "= the pre-PR#49 whitelist+trending sweep"),
+    )
+    p_once.add_argument(
+        "--backfill-batch", type=int, default=5000,
+        help="max models per backfill page",
+    )
     p_once.set_defaults(func=cmd_once)
 
     p_loop = sp.add_parser("loop", help="periodic daemon")
-    p_loop.add_argument("--interval", type=int, default=14400, help="seconds between scans")
+    p_loop.add_argument(
+        "--interval", type=int, default=86400,
+        help="seconds between scans once backfill is complete (default 24h)",
+    )
+    p_loop.add_argument(
+        "--backfill-interval", type=int, default=300,
+        help="seconds between scans while backfilling (default 5min)",
+    )
+    p_loop.add_argument(
+        "--mode",
+        choices=["auto", "backfill", "incremental", "legacy"],
+        default="auto",
+        help="see `once --mode`",
+    )
+    p_loop.add_argument(
+        "--backfill-batch", type=int, default=5000,
+        help="max models per backfill page",
+    )
     p_loop.set_defaults(func=cmd_loop)
 
     p_status = sp.add_parser("status", help="show cursor + candidate counts")

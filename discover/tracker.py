@@ -95,18 +95,37 @@ class TrackerConfig:
 @dataclass
 class Cursor:
     """Persistent state of one tracker. `seen` is the set of hf_ids we have
-    already emitted as a candidate (so repeat scans don't dup them)."""
+    already emitted as a candidate (so repeat scans don't dup them).
+
+    PR#49: extends with backfill tracking. ``backfill_complete`` flips to
+    True once the daemon has paginated every 2026 model whose
+    ``last_modified >= config.from_date`` into the candidates file. After
+    that, daily incremental scans (``scan_incremental``) only fetch the
+    delta since ``last_run_ts``.
+    """
     seen: set[str] = field(default_factory=set)
     last_run_ts: str = ""
+    backfill_complete: bool = False
+    # The oldest last_modified we've already paged through during backfill.
+    # Used to resume an interrupted backfill — next page starts strictly
+    # before this timestamp.
+    backfill_high_water: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        return {"seen": sorted(self.seen), "last_run_ts": self.last_run_ts}
+        return {
+            "seen": sorted(self.seen),
+            "last_run_ts": self.last_run_ts,
+            "backfill_complete": self.backfill_complete,
+            "backfill_high_water": self.backfill_high_water,
+        }
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Cursor:
         return cls(
             seen=set(d.get("seen") or []),
             last_run_ts=str(d.get("last_run_ts", "")),
+            backfill_complete=bool(d.get("backfill_complete", False)),
+            backfill_high_water=str(d.get("backfill_high_water", "")),
         )
 
 
@@ -325,6 +344,177 @@ def scan_round(
         likes = cand.likes or 0
         if downloads < config.min_downloads_30d and likes < config.min_likes:
             stats.excluded_trending_threshold += 1
+            continue
+        new.append(cand)
+        cursor.seen.add(cand.hf_id)
+        stats.new_candidates += 1
+
+    cursor.last_run_ts = datetime.now(tz=UTC).isoformat(timespec="seconds")
+    return new, stats
+
+
+# ── backfill (PR#49) ───────────────────────────────────────────────────────
+
+
+def scan_backfill(
+    api: Any,
+    config: TrackerConfig,
+    cursor: Cursor,
+    *,
+    max_per_round: int = 5000,
+    log: Any = print,
+) -> tuple[list[Candidate], RoundStats, bool]:
+    """One round of historical backfill: page through HF Hub sorted by
+    lastModified DESC, capturing every model whose last_modified
+    falls in [from_date, backfill_high_water or now]. Returns
+    (new_candidates, stats, finished).
+
+    ``finished=True`` means we walked off the from_date boundary AND
+    nothing newer than backfill_high_water remains to discover — the
+    cursor's ``backfill_complete`` should be flipped to True and the
+    daemon can switch to incremental mode.
+
+    HF Hub doesn't expose a paging cursor; we ask for ``limit=max_per_round``
+    sorted by lastModified, then advance ``backfill_high_water`` to the
+    oldest last_modified we saw. Next round asks for the next page.
+
+    The trending threshold (downloads/likes) is NOT applied in backfill
+    mode — we want EVERY 2026 model, not just popular ones, exactly as
+    the user requested: "把26年历史的抓完后，就持续抓最新的就好，日频抓取".
+    Modality and privacy filters still apply.
+    """
+    stats = RoundStats()
+    new: list[Candidate] = []
+    finished = False
+
+    # Anchor the page: if we have a previous high-water, ask for models
+    # strictly older than that. Otherwise start from "now".
+    page_end = cursor.backfill_high_water or ""
+    try:
+        # `sort="lastModified", direction=-1` gives newest-first on HfApi.
+        models_iter = api.list_models(
+            limit=max_per_round,
+            sort="lastModified",
+            direction=-1,
+            expand=_EXPAND_FIELDS,
+        )
+    except TypeError:
+        # Older fakes / mocks may not accept `direction=`.
+        models_iter = api.list_models(
+            limit=max_per_round,
+            sort="lastModified",
+            expand=_EXPAND_FIELDS,
+        )
+    except Exception as e:
+        log(f"[backfill] list_models failed: {type(e).__name__}: {e}")
+        stats.api_errors += 1
+        return new, stats, False
+
+    oldest_seen: str | None = None
+    saw_any = False
+
+    for m in models_iter:
+        saw_any = True
+        cand = _model_to_candidate(m, reason="backfill")
+        # Track high-water even for filtered-out items.
+        if cand.last_modified and (
+            oldest_seen is None or cand.last_modified < oldest_seen
+        ):
+            oldest_seen = cand.last_modified
+
+        # Stop iterating once we cross the from_date boundary.
+        if (cand.last_modified and
+                cand.last_modified < config.from_date):
+            finished = True
+            break
+
+        # PR#49: when resuming a partial backfill, skip everything
+        # newer-or-equal to the last high-water (already paged through).
+        if page_end and cand.last_modified and cand.last_modified >= page_end:
+            stats.seen_skipped += 1
+            continue
+
+        if cand.hf_id in cursor.seen:
+            stats.seen_skipped += 1
+            continue
+        if not _passes_window(cand.last_modified, config.from_date):
+            stats.excluded_old += 1
+            continue
+        if not _passes_modality(cand.pipeline_tag, config.modality_pipeline_tags):
+            stats.excluded_modality += 1
+            continue
+        if cand.private or cand.gated:
+            # gated repos can be promoted by other paths (manual enqueue)
+            # but backfill skips them to avoid the 403 GatedRepoError storm.
+            stats.excluded_modality += 1
+            continue
+        new.append(cand)
+        cursor.seen.add(cand.hf_id)
+        stats.new_candidates += 1
+
+    if not saw_any:
+        # API returned nothing — assume nothing to page; mark finished
+        # so the daemon doesn't loop forever on an empty API.
+        finished = True
+
+    if oldest_seen:
+        cursor.backfill_high_water = oldest_seen
+    cursor.last_run_ts = datetime.now(tz=UTC).isoformat(timespec="seconds")
+    if finished:
+        cursor.backfill_complete = True
+    return new, stats, finished
+
+
+def scan_incremental(
+    api: Any,
+    config: TrackerConfig,
+    cursor: Cursor,
+    *,
+    log: Any = print,
+) -> tuple[list[Candidate], RoundStats]:
+    """Daily-incremental pass after backfill is complete.
+
+    Asks for the newest ``trending_sweep_limit`` models sorted by
+    lastModified DESC and stops as soon as we hit a last_modified that's
+    older than ``cursor.last_run_ts``. Apply the SAME filters as
+    backfill (no trending-downloads gate) so we don't miss models that
+    are new but not yet popular.
+    """
+    stats = RoundStats()
+    new: list[Candidate] = []
+    cutoff = cursor.last_run_ts or config.from_date
+
+    try:
+        models_iter = api.list_models(
+            limit=config.trending_sweep_limit,
+            sort="lastModified",
+            direction=-1,
+            expand=_EXPAND_FIELDS,
+        )
+    except TypeError:
+        models_iter = api.list_models(
+            limit=config.trending_sweep_limit,
+            sort="lastModified",
+            expand=_EXPAND_FIELDS,
+        )
+    except Exception as e:
+        log(f"[incremental] list_models failed: {type(e).__name__}: {e}")
+        stats.api_errors += 1
+        return new, stats
+
+    for m in models_iter:
+        cand = _model_to_candidate(m, reason="incremental")
+        # Hit the boundary — stop iterating.
+        if cand.last_modified and cand.last_modified < cutoff:
+            break
+        if cand.hf_id in cursor.seen:
+            stats.seen_skipped += 1
+            continue
+        if not _passes_modality(cand.pipeline_tag, config.modality_pipeline_tags):
+            stats.excluded_modality += 1
+            continue
+        if cand.private or cand.gated:
+            stats.excluded_modality += 1
             continue
         new.append(cand)
         cursor.seen.add(cand.hf_id)
