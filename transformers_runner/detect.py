@@ -45,13 +45,36 @@ class ModelDetection:
 
 # Conservative: only list types known to be in widespread use as of 2026.
 # Unknown types fall through to "text" via "architectures".
+#
+# PR#41: expanded TTS coverage to catch 2025-Q3+ releases. The previous
+# v9 set (speecht5/bark/vits) was 2023-era; 2025 saw a cambrian
+# explosion of TTS architectures, most of which use bespoke
+# ``model_type`` strings. Live nv8 batch (2026-05-24) failed every
+# new TTS model precisely because detect() returned ``unknown`` and the
+# transformers-runner 501'd on /v1/audio/speech.
 _MODEL_TYPE_MAP: dict[str, Capability] = {
     # ASR
     "whisper": "asr",
-    # TTS
+    "wav2vec2": "asr",
+    "hubert": "asr",
+    "moonshine": "asr",
+    "qwen2_audio": "asr",          # also vlm-like; ASR is the dominant path
+    "voxtral": "asr",              # Mistral 2025-Q4 audio-in family
+    # TTS — PR#41 expansion
     "speecht5": "tts",
     "bark": "tts",
     "vits": "tts",
+    "parler_tts": "tts",
+    "fish_speech": "tts",
+    "fastspeech2_conformer": "tts",
+    "xtts": "tts",
+    "styletts2": "tts",
+    "melo_tts": "tts",
+    "chatterbox": "tts",
+    "kokoro": "tts",
+    "f5_tts": "tts",
+    "csm": "tts",                  # Sesame CSM 2025
+    "orpheus": "tts",              # Canopy Orpheus 2025
     # VLM
     "qwen2_vl": "vlm",
     "qwen2_5_vl": "vlm",
@@ -104,6 +127,70 @@ _DIFFUSERS_CLASS_MAP: dict[str, Capability] = {
 }
 
 
+def _fingerprint_audio_model(p: Path) -> ModelDetection | None:
+    """PR#41: filesystem-fingerprint TTS/ASR repos that ship custom
+    architectures without a transformers-style ``config.json``.
+
+    Live nv8 saw:
+      * ``ResembleAI/chatterbox`` — bare ``.pt`` / ``.safetensors`` and
+        an ``mtl_tokenizer.json``; no ``config.json``.
+      * ``apple/starflow`` — only ``.pth`` weight files.
+      * ``k2-fsa/OmniVoice`` — bespoke layout.
+
+    Strategy: look for fingerprint files that almost always indicate a
+    TTS pipeline:
+      * ``conds.pt`` / ``s3gen.pt`` / ``t3_cfg.pt`` — chatterbox family.
+      * ``vocoder*`` / ``*hifigan*`` / ``*vocos*`` — neural vocoder.
+      * ``speaker*.json`` + ``*tokenizer.json`` — multi-speaker TTS.
+
+    Returns ``None`` when no fingerprint matches, letting the caller
+    fall back to the original ``unknown`` path. The transformers-runner
+    cannot actually run these (each needs a model-specific entrypoint),
+    so the right outcome is to surface ``capability="tts"`` so the
+    pipeline can ROUTE the failure correctly and CAPABILITY can mark it
+    as a real TTS failure rather than masquerading as a text model that
+    answered nothing.
+    """
+    try:
+        names = {f.name.lower() for f in p.iterdir() if f.is_file()}
+    except OSError:
+        return None
+
+    # Strong chatterbox fingerprint
+    chatterbox_hits = {"conds.pt", "s3gen.pt", "t3_cfg.pt"}
+    if chatterbox_hits.issubset(names):
+        return ModelDetection(
+            capability="tts", framework="unknown",
+            detail="audio fingerprint: chatterbox (conds.pt + s3gen.pt + t3_cfg.pt)",
+        )
+
+    # Generic TTS hints
+    has_tokenizer = any(
+        n.endswith("tokenizer.json") or n.endswith("tokenizer.model")
+        for n in names
+    )
+    has_voice = any(
+        ("speaker" in n and n.endswith(".json"))
+        or n.startswith("voice")
+        or n.endswith("_voices.json")
+        for n in names
+    )
+    has_vocoder = any(
+        "vocoder" in n or "hifigan" in n or "vocos" in n or "bigvgan" in n
+        for n in names
+    )
+    if has_tokenizer and (has_voice or has_vocoder):
+        return ModelDetection(
+            capability="tts", framework="unknown",
+            detail=(
+                f"audio fingerprint: tokenizer={has_tokenizer} "
+                f"voice={has_voice} vocoder={has_vocoder}"
+            ),
+        )
+
+    return None
+
+
 def detect(model_path: str | Path) -> ModelDetection:
     """Inspect ``model_path`` on disk and pick the single best capability.
 
@@ -111,7 +198,8 @@ def detect(model_path: str | Path) -> ModelDetection:
       1) diffusers model_index.json::_class_name
       2) transformers config.json::model_type via _MODEL_TYPE_MAP
       3) architectures suffix heuristics
-      4) "unknown"
+      4) PR#41: filesystem-fingerprint TTS detection
+      5) "unknown"
     """
     p = Path(model_path)
     if not p.is_dir():
@@ -173,11 +261,30 @@ def detect(model_path: str | Path) -> ModelDetection:
                         detail=f"arch suffix match: {arch!r} → {cap}",
                     )
 
+        # PR#41: audio fingerprint also valid alongside an unknown
+        # config.json (e.g. some TTS repos ship a config.json scoped to
+        # only the text-encoder sub-module, with the real TTS pipeline
+        # files alongside).
+        fp = _fingerprint_audio_model(p)
+        if fp is not None:
+            return ModelDetection(
+                capability=fp.capability,
+                framework=fp.framework,
+                model_type=mt, architectures=archs,
+                detail=f"{fp.detail}; config.json unrecognised "
+                       f"(mt={mt!r} archs={archs})",
+            )
+
         return ModelDetection(
             capability="unknown", framework="transformers",
             model_type=mt, architectures=archs,
             detail=f"no rule matched model_type={mt!r} archs={archs}",
         )
+
+    # PR#41: no config.json at all — try filesystem fingerprint.
+    fp = _fingerprint_audio_model(p)
+    if fp is not None:
+        return fp
 
     return ModelDetection(
         capability="unknown", framework="unknown",

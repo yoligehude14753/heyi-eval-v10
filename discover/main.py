@@ -44,16 +44,33 @@ def _whitelist_path() -> Path:
     return Path(__file__).resolve().parent / "whitelist.yaml"
 
 
-def _make_api(endpoint: str):
+def _make_api(endpoint: str, token: str | None = None):
+    """PR#40: forward HF_TOKEN (or HUGGING_FACE_HUB_TOKEN) so list_models
+    can hit gated repos and benefit from higher per-account rate limits
+    on hf-mirror. ``token=None`` is the anonymous default and matches
+    the pre-PR#40 behaviour."""
     from huggingface_hub import HfApi  # type: ignore[import-not-found]
+    if token:
+        return HfApi(endpoint=endpoint, token=token)
     return HfApi(endpoint=endpoint)
+
+
+def _resolve_hf_token() -> str | None:
+    """Read HF token from the standard env var pair, returning ``None``
+    when neither is set or both are empty. Centralised here so every
+    discover.* entry point uses the same resolution policy."""
+    return (
+        os.environ.get("HF_TOKEN")
+        or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        or None
+    ) or None
 
 
 def cmd_once(args: argparse.Namespace) -> int:
     data_root = _default_data_root()
     config = TrackerConfig.from_yaml(args.whitelist or _whitelist_path())
     cursor = load_cursor(_cursor_path(data_root))
-    api = _make_api(args.hf_endpoint)
+    api = _make_api(args.hf_endpoint, token=_resolve_hf_token())
 
     new, stats = scan_round(api, config, cursor)
     n_written = append_candidates(_candidates_path(data_root), new)

@@ -27,6 +27,7 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from . import notify
@@ -244,8 +245,22 @@ def _execute_metadata_stage(
     hf_info: dict[str, Any] = {}
     try:
         from huggingface_hub import HfApi  # type: ignore[import-not-found]
-        api = HfApi(endpoint=cfg.hf_endpoint)
+        token = getattr(cfg, "hf_token", None) or None
+        api = (
+            HfApi(endpoint=cfg.hf_endpoint, token=token)
+            if token else HfApi(endpoint=cfg.hf_endpoint)
+        )
         info = api.model_info(run.hf_id, files_metadata=False)
+        # PR#43: also pull the file list so ENGINE_SELECT can reject
+        # "not actually a model" repos (e.g. kyutai/tts-voices, which
+        # is 8.7 GB of voice embeddings without any inference entry
+        # point). Cheap single-HEAD-like call; failures are tolerated.
+        siblings: list[str] = []
+        try:
+            siblings = list(api.list_repo_files(run.hf_id))
+        except Exception as fe:  # noqa: BLE001
+            print(f"  [metadata] list_repo_files non-fatal: "
+                  f"{type(fe).__name__}: {fe}")
         hf_info = {
             "id": info.id,
             "author": getattr(info, "author", None),
@@ -256,6 +271,7 @@ def _execute_metadata_stage(
             "library_name": getattr(info, "library_name", None),
             "pipeline_tag": getattr(info, "pipeline_tag", None),
             "tags": list(getattr(info, "tags", []) or []),
+            "siblings": siblings,
             "last_modified": str(getattr(info, "last_modified", None) or ""),
         }
     except Exception as e:
@@ -332,10 +348,52 @@ def _execute_engine_select_stage(
             metadata = {}
 
     modality = (metadata.get("modality") or "unknown").lower()
-    pipeline_tag = ((metadata.get("hf_info") or {}).get("pipeline_tag") or "").lower()
+    hf_info = metadata.get("hf_info") or {}
+    pipeline_tag = (hf_info.get("pipeline_tag") or "").lower()
+
+    # PR#43: reject "not a model" repos before STAGE_MODEL wastes GBs
+    # on voice embedding packs etc. Only fires when we actually have a
+    # sibling list (METADATA may have failed to fetch it — in that case
+    # we let the run through and rely on DEPLOY / PR#36 honesty gate).
+    siblings = hf_info.get("siblings") or []
+    if siblings:
+        runnable, why = _is_runnable_model_repo(siblings)
+        if not runnable:
+            plan = {
+                "stage": "ENGINE_SELECT",
+                "hf_id": run.hf_id,
+                "engine": "metadata_only",
+                "engine_image": None,
+                "reason": f"not_a_model: {why}",
+                "fallback_engine": None,
+                "vllm_args": {},
+                "eval_pool_size": len(cfg.eval_gpus),
+                "eval_pool_gpus": list(cfg.eval_gpus),
+                "not_a_model": True,
+                "siblings_sample": siblings[:8],
+            }
+            (meta_dir / "engine.json").write_text(
+                json.dumps(plan, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            skip_reason = (
+                f"not_a_model: HF repo lacks any runnable model entry "
+                f"point ({why}); siblings sample={siblings[:5]}; "
+                f"metadata captured at _meta/metadata.json + "
+                f"_meta/engine.json, no DEPLOY"
+            )
+            return StageResult(
+                ok=False, duration_s=time.time() - t0,
+                artifacts=["_meta/engine.json"],
+                payload={"engine": "metadata_only", "not_a_model": True},
+                rc=0,
+                error=f"not_a_model_skip: {skip_reason}",
+                error_kind="not_a_model_skip",
+                extra={"aborted": True, "reason": skip_reason},
+            )
 
     engine, image, reason, fallback = _pick_engine(modality, pipeline_tag,
-                                                   library_name=(metadata.get("hf_info") or {}).get("library_name"))
+                                                   library_name=hf_info.get("library_name"))
 
     vllm_args = _vllm_args_hint(metadata)
 
@@ -437,6 +495,7 @@ def _execute_stage_model_stage(
             "HF_ENDPOINT",
             getattr(cfg, "hf_endpoint", None) or "https://hf-mirror.com",
         ),
+        hf_token=getattr(cfg, "hf_token", None),
         download_timeout_s=float(
             getattr(cfg, "stage_model_download_timeout_s", 0.0)
         ) or None,
@@ -481,6 +540,79 @@ def _execute_stage_model_stage(
         error=result.error or "stage_model failed",
         error_kind=result.error_kind or "stage_model_failed",
     )
+
+
+def _is_runnable_model_repo(siblings: list[str]) -> tuple[bool, str]:
+    """PR#43: is this HF repo actually an inference-able model, or just
+    a collection of voice embeddings / weights without a runtime entry?
+
+    Returns ``(runnable, reason)``. Conservative — we'd rather attempt
+    a borderline repo and let DEPLOY fail clearly (PR#36 honesty gate
+    will catch it) than reject a real model by mistake.
+
+    A repo is "runnable" if ANY of:
+      * has a transformers ``config.json``
+      * has a diffusers ``model_index.json``
+      * has any ``*.gguf`` (GGUF inference)
+      * has any ``*.mlpackage`` directory (CoreML)
+      * has any ``*.onnx`` (ONNX runtime)
+      * has chatterbox-style fingerprint (3 specific weight files)
+      * has any of: ``tokenizer.json`` + at least one ``*.safetensors``
+        / ``*.bin`` / ``*.pth`` / ``*.pt`` weight file (bespoke layouts
+        like ``apple/starflow`` ship .pth + tokenizer; transformers-
+        runner can sometimes detect via PR#41 fingerprint, but the
+        right behavior is to LET IT TRY)
+
+    Rejected when there are weight files but NO config + NO tokenizer +
+    NO recognisable runtime entry point — that's typically a voice
+    embedding pack, a LoRA adapter without base, or a model card with
+    raw artifacts only (kyutai/tts-voices is the canonical example).
+    """
+    if not siblings:
+        # No file list available (likely API failure) — let it through.
+        return True, "no siblings list available"
+
+    names = {Path(s).name.lower() for s in siblings}
+    paths_lower = [s.lower() for s in siblings]
+
+    # Strong positive signals
+    if "config.json" in names:
+        return True, "has config.json"
+    if "model_index.json" in names:
+        return True, "has model_index.json (diffusers)"
+    if any(n.endswith(".gguf") for n in names):
+        return True, "has .gguf"
+    if any(".mlpackage/" in p or p.endswith(".mlpackage") for p in paths_lower):
+        return True, "has .mlpackage (CoreML)"
+    if any(n.endswith(".onnx") for n in names):
+        return True, "has .onnx"
+    # Chatterbox fingerprint
+    if {"conds.pt", "s3gen.pt", "t3_cfg.pt"}.issubset(names):
+        return True, "chatterbox fingerprint"
+
+    has_tokenizer = any(
+        n.endswith("tokenizer.json") or n.endswith("tokenizer.model")
+        or n == "tokenizer_config.json"
+        for n in names
+    )
+    has_weight = any(
+        n.endswith(".safetensors") or n.endswith(".bin")
+        or n.endswith(".pth") or n.endswith(".pt")
+        or n.endswith(".ckpt") or n.endswith(".msgpack")
+        for n in names
+    )
+    if has_tokenizer and has_weight:
+        return True, "has tokenizer + weight (bespoke layout)"
+
+    # Weights without ANY runtime metadata — almost certainly not
+    # something an inference container can boot. kyutai/tts-voices is
+    # the canonical case: 200+ ``.pt`` voice embeddings, no config,
+    # no tokenizer, no manifest.
+    if has_weight:
+        return False, "weight files present but no config/tokenizer/manifest"
+
+    # No weights at all — definitely not a model.
+    return False, "no weight files in repo"
 
 
 def _pipeline_to_modalities(tag: str) -> list[str]:
@@ -540,6 +672,16 @@ def _pick_engine(modality: str, pipeline_tag: str,
     if (library_name or "").lower() in ("diffusers", "sentence-transformers"):
         return ("transformers", "heyi-eval/transformers-runner:v10",
                 f"library={library_name}", None)
+
+    # PR#42: audio modality with no pipeline_tag (e.g. kyutai/tts-voices,
+    # hf entries that forgot to set the tag, or fingerprint-detected
+    # TTS repos) MUST go to transformers-runner. The previous code sent
+    # them to vllm with a "default" reason which then crashed at DEPLOY
+    # because vllm cannot serve /v1/audio/speech.
+    if modality == "audio":
+        return ("transformers", "heyi-eval/transformers-runner:v10",
+                f"audio modality (pipeline_tag={pipeline_tag or 'unknown'})",
+                None)
 
     # default: vllm with transformers fallback (handbook decides the actual command)
     return ("vllm", "vllm/vllm-openai:v0.11.0",

@@ -145,6 +145,21 @@ class OrchestratorConfig:
     # HF mirror endpoint
     hf_endpoint: str = os.environ.get("HF_ENDPOINT", "https://hf-mirror.com")
 
+    # PR#40: HF auth token for gated repos (gemma-3, llama-3+, voxtral,
+    # mistralai/Magistral, etc) and for higher mirror rate limits.
+    # Reads both env var names because:
+    #   - huggingface_hub legacy: HUGGING_FACE_HUB_TOKEN
+    #   - huggingface_hub current: HF_TOKEN
+    # If both are set, HF_TOKEN wins. Empty string is treated as None
+    # (so `unset HF_TOKEN` and `export HF_TOKEN=` behave identically).
+    hf_token: str | None = field(
+        default_factory=lambda: (
+            os.environ.get("HF_TOKEN")
+            or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+            or None
+        ) or None
+    )
+
     # vllm provider
     model_cache_root: Path = field(
         default_factory=lambda: _env_path("HEYI_EVAL_MODEL_CACHE", "/DATA/Model/_eval-cache")

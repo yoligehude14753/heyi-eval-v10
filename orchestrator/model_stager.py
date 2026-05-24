@@ -368,14 +368,22 @@ class StageModelResult:
 
 
 class Downloader(Protocol):
-    """Match the subset of ``huggingface_hub.snapshot_download`` we use."""
+    """Match the subset of ``huggingface_hub.snapshot_download`` we use.
+
+    PR#40: ``token`` is forwarded to huggingface_hub so gated repos
+    (gemma-3, llama-3+, voxtral, mistralai/Magistral, etc) can be
+    fetched. ``None`` preserves the unauthenticated path used by all
+    pre-PR#40 callers and by the test fakes.
+    """
     def __call__(self, *, repo_id: str, local_dir: str,
-                 max_workers: int, allow_patterns: list[str] | None) -> str: ...
+                 max_workers: int, allow_patterns: list[str] | None,
+                 token: str | None = None) -> str: ...
 
 
 def _default_downloader(*, repo_id: str, local_dir: str,
                         max_workers: int,
-                        allow_patterns: list[str] | None) -> str:
+                        allow_patterns: list[str] | None,
+                        token: str | None = None) -> str:
     """Production path: invoke huggingface_hub. Imported lazily so the
     unit tests don't need the package."""
     from huggingface_hub import snapshot_download  # type: ignore
@@ -386,6 +394,11 @@ def _default_downloader(*, repo_id: str, local_dir: str,
     }
     if allow_patterns is not None:
         kwargs["allow_patterns"] = allow_patterns
+    if token:
+        # PR#40: only forward when set; empty / None preserves the
+        # huggingface_hub default of "anonymous" access (which still
+        # works for the bulk of 2025-era public models).
+        kwargs["token"] = token
     return snapshot_download(**kwargs)
 
 
@@ -400,6 +413,7 @@ def _run_downloader_with_timeout(
     max_workers: int,
     allow_patterns: list[str] | None,
     timeout_s: float | None,
+    token: str | None = None,
 ) -> None:
     """Invoke ``dl`` with a wall-clock budget.
 
@@ -416,9 +430,22 @@ def _run_downloader_with_timeout(
     we accept this trade-off because Python lacks a portable way to
     interrupt a blocking I/O call from another thread.
     """
+    # PR#40: only forward `token=` when explicitly set so legacy test
+    # fakes whose signatures predate token plumbing keep working.
+    # huggingface_hub.snapshot_download accepts token=None or absent
+    # identically, but custom downloader fakes used in tests typically
+    # do not.
+    def _invoke() -> None:
+        kw: dict[str, Any] = dict(
+            repo_id=repo_id, local_dir=local_dir,
+            max_workers=max_workers, allow_patterns=allow_patterns,
+        )
+        if token:
+            kw["token"] = token
+        dl(**kw)
+
     if timeout_s is None or timeout_s <= 0:
-        dl(repo_id=repo_id, local_dir=local_dir, max_workers=max_workers,
-           allow_patterns=allow_patterns)
+        _invoke()
         return
 
     import threading
@@ -426,10 +453,7 @@ def _run_downloader_with_timeout(
 
     def _worker() -> None:
         try:
-            dl(
-                repo_id=repo_id, local_dir=local_dir,
-                max_workers=max_workers, allow_patterns=allow_patterns,
-            )
+            _invoke()
             holder["ok"] = True
         except BaseException as e:
             holder["err"] = e
@@ -452,6 +476,7 @@ def ensure_model_staged(
     metadata: dict[str, Any] | None = None,
     engine_plan: dict[str, Any] | None = None,
     hf_endpoint: str | None = None,
+    hf_token: str | None = None,
     downloader: Downloader | None = None,
     headroom_factor: float = 1.2,
     headroom_floor_bytes: int = 5 * 1024 * 1024 * 1024,
@@ -542,6 +567,7 @@ def ensure_model_staged(
             max_workers=max_workers,
             allow_patterns=effective_allow,
             timeout_s=download_timeout_s,
+            token=hf_token,
         )
     except TimeoutError as e:
         # Wall-clock budget exhausted (PR#34c). Treat exactly like a
