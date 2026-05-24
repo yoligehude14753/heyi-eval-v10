@@ -284,6 +284,181 @@ def discover_summary() -> dict:
     }
 
 
+def candidates_lifecycle(limit: int = 500) -> dict:
+    """PR#50: per-candidate lifecycle view that joins three data sources:
+      - discover/candidates.jsonl  (everything we know exists on HF Hub)
+      - store/queue.jsonl          (pending runs)
+      - runs/<run_id>/state.json   (in_progress / terminal runs)
+
+    The result is a flat list of ``{hf_id, candidate_*, status, run_id,
+    pass_rate, score, failure_reason}`` with status in:
+      "discovered"   — known but never enqueued
+      "queued"       — in queue.jsonl, awaiting orchestrator
+      "in_progress"  — run is mid-pipeline
+      "ok" / "failed" / "aborted"
+      "skipped"      — manually skipped (future)
+
+    The newest discovered_at wins for sort order (descending).
+    """
+    cands = _read_jsonl(DATA_ROOT / "discover" / "candidates.jsonl")
+    cand_by_id: dict[str, dict] = {}
+    for c in cands:
+        hf_id = c.get("hf_id")
+        if not hf_id:
+            continue
+        prev = cand_by_id.get(hf_id)
+        if prev is None or (c.get("discovered_at") or "") > (
+            prev.get("discovered_at") or ""
+        ):
+            cand_by_id[hf_id] = c
+
+    queued = _read_jsonl(DATA_ROOT / "store" / "queue.jsonl")
+    queued_ids = {q.get("hf_id") for q in queued if q.get("hf_id")}
+
+    # Walk runs/ once and group by hf_id (keep MOST RECENT only).
+    # run-state stores ``created_at`` / ``ended_at`` as epoch floats;
+    # discover candidates store ISO timestamps. Normalise to ISO here
+    # so the merged rows can be sorted uniformly.
+    runs_root = DATA_ROOT / "runs"
+    by_hf: dict[str, dict] = {}
+
+    def _epoch_to_iso(ts: Any) -> str | None:
+        if ts is None:
+            return None
+        if isinstance(ts, (int, float)):
+            try:
+                from datetime import UTC, datetime
+                return datetime.fromtimestamp(float(ts), tz=UTC).isoformat(
+                    timespec="seconds",
+                )
+            except (OverflowError, OSError, ValueError):
+                return None
+        return str(ts)
+
+    if runs_root.exists():
+        for run_dir in runs_root.iterdir():
+            if not run_dir.is_dir():
+                continue
+            state = _read_json(run_dir / "state.json")
+            if not state:
+                continue
+            hf_id = state.get("hf_id")
+            if not hf_id:
+                continue
+            cur = by_hf.get(hf_id)
+            if (cur is None or
+                    (state.get("created_at") or 0) > (cur.get("_created_raw") or 0)):
+                cap = _read_json(run_dir / "capability.json") or {}
+                by_hf[hf_id] = {
+                    "run_id": state.get("run_id") or run_dir.name,
+                    "status": state.get("status") or "?",
+                    "_created_raw": state.get("created_at"),
+                    "created_at": _epoch_to_iso(state.get("created_at")),
+                    "ended_at": _epoch_to_iso(state.get("ended_at")),
+                    "failure_reason": state.get("failure_reason"),
+                    "pass_rate": cap.get("pass_rate"),
+                    "score": cap.get("score"),
+                }
+
+    # Stitch the three sources together. A row in the queue without an
+    # entry in candidates is also surfaced (manually-enqueued models).
+    rows: list[dict] = []
+    seen_in_rows: set[str] = set()
+    for hf_id, cand in cand_by_id.items():
+        run = by_hf.get(hf_id)
+        if run:
+            status = run["status"]
+        elif hf_id in queued_ids:
+            status = "queued"
+        else:
+            status = "discovered"
+        rows.append({
+            "hf_id": hf_id,
+            "status": status,
+            "discovered_at": cand.get("discovered_at"),
+            "reason": cand.get("reason"),
+            "pipeline_tag": cand.get("pipeline_tag"),
+            "downloads": cand.get("downloads"),
+            "likes": cand.get("likes"),
+            "last_modified": cand.get("last_modified"),
+            "run_id": (run or {}).get("run_id"),
+            "pass_rate": (run or {}).get("pass_rate"),
+            "score": (run or {}).get("score"),
+            "failure_reason": (run or {}).get("failure_reason"),
+            "ended_at": (run or {}).get("ended_at"),
+        })
+        seen_in_rows.add(hf_id)
+
+    # Manual enqueues / runs not from auto-discover.
+    for hf_id, run in by_hf.items():
+        if hf_id in seen_in_rows:
+            continue
+        rows.append({
+            "hf_id": hf_id,
+            "status": run["status"],
+            "discovered_at": None,
+            "reason": "manual",
+            "pipeline_tag": None,
+            "downloads": None,
+            "likes": None,
+            "last_modified": None,
+            "run_id": run["run_id"],
+            "pass_rate": run.get("pass_rate"),
+            "score": run.get("score"),
+            "failure_reason": run.get("failure_reason"),
+            "ended_at": run.get("ended_at"),
+        })
+        seen_in_rows.add(hf_id)
+    for q in queued:
+        hf_id = q.get("hf_id")
+        if not hf_id or hf_id in seen_in_rows:
+            continue
+        rows.append({
+            "hf_id": hf_id,
+            "status": "queued",
+            "discovered_at": None,
+            "reason": "manual",
+            "pipeline_tag": None,
+            "downloads": None,
+            "likes": None,
+            "last_modified": None,
+            "run_id": q.get("run_id"),
+            "pass_rate": None,
+            "score": None,
+            "failure_reason": None,
+            "ended_at": None,
+        })
+        seen_in_rows.add(hf_id)
+
+    # Sort: discovered/queued by discovered_at DESC, completed by ended_at DESC.
+    def _sort_key(r: dict) -> str:
+        # Most-recent first: ended_at if set, else discovered_at.
+        # Both are ISO strings after _epoch_to_iso normalisation, so
+        # lexicographic sort = chronological sort.
+        anchor = r.get("ended_at") or r.get("discovered_at") or ""
+        return str(anchor)
+    rows.sort(key=_sort_key, reverse=True)
+
+    # Status histogram for summary cards.
+    status_counts: Counter = Counter(r["status"] for r in rows)
+
+    # Read backfill state so the panel can render progress.
+    cursor = _read_json(DATA_ROOT / "discover" / "cursor.json") or {}
+    backfill = {
+        "complete": bool(cursor.get("backfill_complete", False)),
+        "high_water": cursor.get("backfill_high_water"),
+        "last_run_ts": cursor.get("last_run_ts"),
+        "seen_size": len(cursor.get("seen") or []),
+    }
+
+    return {
+        "total": len(rows),
+        "status_counts": dict(status_counts),
+        "backfill": backfill,
+        "rows": rows[:limit],
+    }
+
+
 def outbox_recent(limit: int = 20) -> list[dict]:
     return _read_jsonl(DATA_ROOT / "store" / "notify_outbox.jsonl", limit=limit)
 
@@ -487,7 +662,7 @@ INDEX_HTML = """<!doctype html>
   </section>
 
   <section>
-    <h2>discover 候选概览</h2>
+    <h2>discover 候选概览 <a href="/candidates" style="font-size:11px;font-weight:normal;margin-left:8px">查看完整候选生命周期 →</a></h2>
     <div class="grid" id="discover-grid"></div>
     <details><summary>Top 20 by downloads</summary><pre id="discover-top"></pre></details>
   </section>
@@ -659,6 +834,158 @@ setInterval(refresh, 30000);
 </body>
 </html>
 """
+
+
+def render_candidates_page() -> str:
+    """PR#50: lifecycle view of every discovered candidate joined with
+    its current run state. Top half is a backfill-progress card so we
+    can watch the 2026 history-sweep at a glance; bottom is a sortable
+    table of (hf_id, status, pass_rate, last_modified) with status pills.
+    """
+    data = candidates_lifecycle(limit=500)
+    backfill = data.get("backfill") or {}
+    status_counts = data.get("status_counts") or {}
+
+    def _status_color(s: str) -> str:
+        return {
+            "ok": "ok",
+            "failed": "err",
+            "aborted": "warn",
+            "in_progress": "run",
+            "queued": "run",
+            "discovered": "muted",
+        }.get(s, "muted")
+
+    rows_html = []
+    for r in data["rows"]:
+        hf = html.escape(r.get("hf_id") or "-")
+        st = r.get("status") or "?"
+        st_cls = _status_color(st)
+        pipe = html.escape(r.get("pipeline_tag") or "-")
+        reason = html.escape(r.get("reason") or "-")
+        lm = html.escape((r.get("last_modified") or "-")[:10])
+        dl = r.get("downloads")
+        dl_s = f"{dl:,}" if isinstance(dl, int) else "-"
+        likes = r.get("likes")
+        likes_s = f"{likes:,}" if isinstance(likes, int) else "-"
+        pr = r.get("pass_rate")
+        if isinstance(pr, (int, float)):
+            pr_pct = f"{pr * 100:.0f}%"
+            pr_cls = "ok" if pr >= 0.8 else "warn" if pr >= 0.5 else "err"
+        else:
+            pr_pct, pr_cls = "-", "muted"
+        run_id = r.get("run_id")
+        if run_id:
+            run_link = (
+                f"<a href='/run/{html.escape(run_id)}'>"
+                f"{html.escape(run_id[:8])}…</a>"
+            )
+        else:
+            run_link = "<span class='muted'>-</span>"
+        fail = r.get("failure_reason") or ""
+        if len(fail) > 120:
+            fail = fail[:120] + "…"
+        fail_html = (
+            f"<div class='muted' style='font-size:11px;max-width:280px;"
+            f"overflow:hidden;text-overflow:ellipsis'>"
+            f"{html.escape(fail)}</div>"
+            if fail else ""
+        )
+        rows_html.append(
+            f"<tr>"
+            f"<td><strong>{hf}</strong>{fail_html}</td>"
+            f"<td><span class='pill {st_cls}'>{html.escape(st)}</span></td>"
+            f"<td>{pipe}</td>"
+            f"<td>{reason}</td>"
+            f"<td>{lm}</td>"
+            f"<td style='text-align:right'>{dl_s}</td>"
+            f"<td style='text-align:right'>{likes_s}</td>"
+            f"<td class='{pr_cls}' style='text-align:right'>"
+            f"<strong>{pr_pct}</strong></td>"
+            f"<td>{run_link}</td>"
+            f"</tr>"
+        )
+
+    table_body = "".join(rows_html) or (
+        "<tr><td colspan='9' class='muted'>暂无候选 — 等 discover daemon 抓第一轮</td></tr>"
+    )
+
+    bf_complete = backfill.get("complete")
+    bf_badge = (
+        "<span class='pill ok'>backfill 完成</span>"
+        if bf_complete else "<span class='pill run'>backfill 进行中</span>"
+    )
+    bf_water = html.escape((backfill.get("high_water") or "-")[:19])
+    bf_last = html.escape((backfill.get("last_run_ts") or "-")[:19])
+    bf_seen = backfill.get("seen_size") or 0
+
+    sc = {k: status_counts.get(k, 0) for k in (
+        "discovered", "queued", "in_progress", "ok", "failed", "aborted",
+    )}
+
+    return f"""<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>heyi-eval-v10 · 候选模型生命周期</title>
+<style>
+body{{font-family:system-ui,-apple-system,sans-serif;background:#0c0c10;color:#e7e7ea;margin:0;padding:0}}
+header{{padding:16px 24px;background:#14141a;border-bottom:1px solid #26262e}}
+header h1{{margin:0;font-size:18px}} header .sub{{color:#8a8a96;font-size:12px;margin-top:4px}}
+main{{padding:18px 24px 60px;max-width:1700px;margin:0 auto}}
+.grid{{display:grid;grid-template-columns:repeat(7,1fr);gap:12px;margin-bottom:20px}}
+.stat{{padding:12px 16px;background:#14141a;border:1px solid #26262e;border-radius:6px}}
+.stat .label{{color:#8a8a96;font-size:11px;text-transform:uppercase;letter-spacing:0.05em}}
+.stat .value{{font-size:22px;margin-top:6px;font-weight:500}}
+section{{background:#14141a;border:1px solid #26262e;border-radius:8px;padding:14px 18px;margin-bottom:18px}}
+section h2{{margin:0 0 10px;font-size:14px}}
+table{{width:100%;border-collapse:collapse;font-size:13px}}
+th,td{{text-align:left;padding:8px 10px;border-bottom:1px solid #20202a;vertical-align:top}}
+th{{color:#8a8a96;font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:0.05em}}
+tr:hover td{{background:#1a1a22}}
+.ok{{color:#5ad48d}} .err{{color:#ef5f64}} .warn{{color:#e9b870}} .muted{{color:#6a6a76}} .run{{color:#6ec0ff}}
+.pill{{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;background:#20202a;color:#b8b8c4;white-space:nowrap}}
+.pill.ok{{background:#1a3a26;color:#5ad48d}}
+.pill.err{{background:#3a1a1f;color:#ef5f64}}
+.pill.warn{{background:#3a2a18;color:#e9b870}}
+.pill.run{{background:#1a2a3a;color:#6ec0ff}}
+.pill.muted{{background:#1a1a22;color:#6a6a76}}
+a{{color:#6ec0ff;text-decoration:none}} a:hover{{text-decoration:underline}}
+</style></head><body>
+<header><a href="/">← 返回主面板</a> ·
+<h1 style="display:inline">🔭 候选模型生命周期</h1>
+<div class="sub">discover/candidates.jsonl × store/queue.jsonl × runs/* — 完整抓取→测试→结果链路</div></header>
+<main>
+<section>
+  <h2>🛰️ Backfill 进度 {bf_badge}</h2>
+  <div class="grid" style="grid-template-columns:repeat(4,1fr)">
+    <div class="stat"><div class="label">backfill 完成</div>
+      <div class="value {'ok' if bf_complete else 'warn'}">{'是' if bf_complete else '否'}</div></div>
+    <div class="stat"><div class="label">cursor.seen 数</div>
+      <div class="value">{bf_seen:,}</div></div>
+    <div class="stat"><div class="label">high_water (已回填到)</div>
+      <div class="value" style="font-size:14px">{bf_water}</div></div>
+    <div class="stat"><div class="label">last_run_ts</div>
+      <div class="value" style="font-size:14px">{bf_last}</div></div>
+  </div>
+</section>
+<div class="grid">
+  <div class="stat"><div class="label">候选总数</div><div class="value">{data['total']:,}</div></div>
+  <div class="stat"><div class="label">discovered</div><div class="value muted">{sc['discovered']:,}</div></div>
+  <div class="stat"><div class="label">queued</div><div class="value run">{sc['queued']:,}</div></div>
+  <div class="stat"><div class="label">in_progress</div><div class="value run">{sc['in_progress']:,}</div></div>
+  <div class="stat"><div class="label">ok</div><div class="value ok">{sc['ok']:,}</div></div>
+  <div class="stat"><div class="label">failed</div><div class="value err">{sc['failed']:,}</div></div>
+  <div class="stat"><div class="label">aborted</div><div class="value warn">{sc['aborted']:,}</div></div>
+</div>
+<section><table>
+<thead><tr>
+  <th>hf_id / 失败原因</th><th>状态</th><th>pipeline_tag</th><th>reason</th>
+  <th>last_modified</th><th style="text-align:right">downloads</th>
+  <th style="text-align:right">likes</th><th style="text-align:right">pass</th><th>run_id</th>
+</tr></thead><tbody>{table_body}</tbody>
+</table>
+<p class="muted" style="font-size:11px;margin:10px 0 0">显示最近 500 条；reason = discover 来源
+(whitelist / trending / backfill / incremental / manual)；status = discovered → queued → in_progress → ok/failed/aborted</p>
+</section>
+</main></body></html>"""
 
 
 def render_results_page() -> str:
@@ -1071,6 +1398,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(queue_status())
             elif path == "/api/discover":
                 self._json(discover_summary())
+            elif path == "/api/candidates":
+                self._json(candidates_lifecycle(limit=500))
+            elif path == "/candidates":
+                self._html(render_candidates_page())
             elif path == "/api/outbox":
                 self._json(outbox_recent(limit=30))
             elif path == "/api/backup":

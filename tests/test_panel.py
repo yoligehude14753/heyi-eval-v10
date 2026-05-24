@@ -373,3 +373,177 @@ def test_api_backup_route_responds(fake_backups_root):
     parsed = json.loads(body.decode("utf-8"))
     assert "health" in parsed
     assert "backups_root" in parsed
+
+
+# ── PR#50: candidates_lifecycle ───────────────────────────────────────────
+
+
+@pytest.fixture
+def fake_lifecycle_root(tmp_path, monkeypatch):
+    """Layout with all 3 lifecycle states: discovered-only, queued,
+    in_progress, ok, failed, aborted, plus a manual run not in
+    candidates.jsonl."""
+    (tmp_path / "runs").mkdir()
+    (tmp_path / "store").mkdir()
+    (tmp_path / "discover").mkdir()
+
+    # discover/cursor.json — backfill in progress
+    (tmp_path / "discover" / "cursor.json").write_text(json.dumps({
+        "seen": ["org/a", "org/b", "org/c", "org/d", "org/e", "org/manual"],
+        "last_run_ts": "2026-05-24T10:00:00+00:00",
+        "backfill_complete": False,
+        "backfill_high_water": "2026-03-15T00:00:00+00:00",
+    }))
+
+    cands = [
+        # discovered-only
+        {"hf_id": "org/a", "discovered_at": "2026-05-24T00:00:00+00:00",
+         "reason": "backfill", "pipeline_tag": "text-generation",
+         "downloads": 100, "likes": 5, "last_modified": "2026-05-01T00:00:00"},
+        # queued
+        {"hf_id": "org/b", "discovered_at": "2026-05-24T00:01:00+00:00",
+         "reason": "incremental", "pipeline_tag": "text-generation",
+         "downloads": 200, "likes": 10, "last_modified": "2026-05-15T00:00:00"},
+        # in_progress
+        {"hf_id": "org/c", "discovered_at": "2026-05-24T00:02:00+00:00",
+         "reason": "trending", "pipeline_tag": "text-to-speech",
+         "downloads": 300, "likes": 15, "last_modified": "2026-05-20T00:00:00"},
+        # ok
+        {"hf_id": "org/d", "discovered_at": "2026-05-24T00:03:00+00:00",
+         "reason": "whitelist", "pipeline_tag": "text-generation",
+         "downloads": 400, "likes": 20, "last_modified": "2026-05-21T00:00:00"},
+        # failed
+        {"hf_id": "org/e", "discovered_at": "2026-05-24T00:04:00+00:00",
+         "reason": "backfill", "pipeline_tag": "automatic-speech-recognition",
+         "downloads": 500, "likes": 25, "last_modified": "2026-05-22T00:00:00"},
+    ]
+    (tmp_path / "discover" / "candidates.jsonl").write_text(
+        "\n".join(json.dumps(c) for c in cands) + "\n"
+    )
+
+    (tmp_path / "store" / "queue.jsonl").write_text(
+        json.dumps({"run_id": "rq-b", "hf_id": "org/b"}) + "\n"
+    )
+
+    # runs/org-c → in_progress
+    r1 = tmp_path / "runs" / "rid-c"
+    r1.mkdir()
+    (r1 / "state.json").write_text(json.dumps({
+        "run_id": "rid-c", "hf_id": "org/c", "status": "in_progress",
+        "created_at": 1779400000.0,
+    }))
+    # runs/org-d → ok with pass_rate
+    r2 = tmp_path / "runs" / "rid-d"
+    r2.mkdir()
+    (r2 / "state.json").write_text(json.dumps({
+        "run_id": "rid-d", "hf_id": "org/d", "status": "ok",
+        "created_at": 1779400100.0, "ended_at": 1779400900.0,
+    }))
+    (r2 / "capability.json").write_text(json.dumps({
+        "score": "16/20", "pass_rate": 0.8,
+    }))
+    # runs/org-e → failed
+    r3 = tmp_path / "runs" / "rid-e"
+    r3.mkdir()
+    (r3 / "state.json").write_text(json.dumps({
+        "run_id": "rid-e", "hf_id": "org/e", "status": "failed",
+        "created_at": 1779400200.0, "ended_at": 1779400260.0,
+        "failure_reason": "container exited 1: model load failed",
+    }))
+    # runs/manual — present in runs but NOT in candidates.jsonl
+    r4 = tmp_path / "runs" / "rid-manual"
+    r4.mkdir()
+    (r4 / "state.json").write_text(json.dumps({
+        "run_id": "rid-manual", "hf_id": "org/manual", "status": "aborted",
+        "created_at": 1779400300.0, "ended_at": 1779400320.0,
+        "failure_reason": "user aborted",
+    }))
+
+    monkeypatch.setenv("HEYI_EVAL_DATA", str(tmp_path))
+    import importlib
+    import panel.server as srv
+    importlib.reload(srv)
+    return srv, tmp_path
+
+
+def test_pr50_lifecycle_returns_correct_status_for_each_state(fake_lifecycle_root):
+    srv, _ = fake_lifecycle_root
+    data = srv.candidates_lifecycle()
+    by_id = {r["hf_id"]: r for r in data["rows"]}
+    assert by_id["org/a"]["status"] == "discovered"
+    assert by_id["org/b"]["status"] == "queued"
+    assert by_id["org/c"]["status"] == "in_progress"
+    assert by_id["org/d"]["status"] == "ok"
+    assert by_id["org/d"]["pass_rate"] == 0.8
+    assert by_id["org/e"]["status"] == "failed"
+    assert "container exited" in (by_id["org/e"]["failure_reason"] or "")
+    # manual run (no candidate row) still surfaced
+    assert by_id["org/manual"]["status"] == "aborted"
+    assert by_id["org/manual"]["reason"] == "manual"
+
+
+def test_pr50_lifecycle_includes_backfill_card(fake_lifecycle_root):
+    srv, _ = fake_lifecycle_root
+    data = srv.candidates_lifecycle()
+    bf = data["backfill"]
+    assert bf["complete"] is False
+    assert bf["high_water"] == "2026-03-15T00:00:00+00:00"
+    assert bf["seen_size"] == 6
+
+
+def test_pr50_lifecycle_status_counts(fake_lifecycle_root):
+    srv, _ = fake_lifecycle_root
+    data = srv.candidates_lifecycle()
+    sc = data["status_counts"]
+    assert sc["discovered"] == 1
+    assert sc["queued"] == 1
+    assert sc["in_progress"] == 1
+    assert sc["ok"] == 1
+    assert sc["failed"] == 1
+    assert sc["aborted"] == 1
+
+
+def test_pr50_lifecycle_html_renders(fake_lifecycle_root):
+    srv, _ = fake_lifecycle_root
+    html_str = srv.render_candidates_page()
+    assert "Backfill 进度" in html_str
+    assert "org/a" in html_str
+    assert "discovered" in html_str
+    # the failure tooltip text must be present
+    assert "container exited" in html_str
+    # backfill not complete → shows the warn pill, not the OK one
+    assert "backfill 进行中" in html_str
+
+
+def test_pr50_api_candidates_route_serves_json(fake_lifecycle_root):
+    srv, _ = fake_lifecycle_root
+    from io import BytesIO
+    from unittest.mock import MagicMock
+    handler = MagicMock(spec=srv.Handler)
+    handler.path = "/api/candidates"
+    handler.wfile = BytesIO()
+    handler._json = lambda payload, status=200: handler.wfile.write(  # type: ignore[attr-defined]
+        json.dumps(payload).encode("utf-8")
+    )
+    handler._html = lambda *a, **kw: None  # type: ignore[attr-defined]
+    srv.Handler.do_GET(handler)
+    body = handler.wfile.getvalue()
+    parsed = json.loads(body.decode("utf-8"))
+    assert parsed["total"] >= 5
+    assert "rows" in parsed
+    assert "status_counts" in parsed
+    assert "backfill" in parsed
+
+
+def test_pr50_lifecycle_empty_data_root_ok(tmp_path, monkeypatch):
+    """No discover/, no runs/, no queue — must still return a shape
+    that the panel can render without exploding."""
+    monkeypatch.setenv("HEYI_EVAL_DATA", str(tmp_path / "empty"))
+    import importlib
+    import panel.server as srv
+    importlib.reload(srv)
+    data = srv.candidates_lifecycle()
+    assert data["total"] == 0
+    assert data["rows"] == []
+    assert data["status_counts"] == {}
+    assert "backfill" in data
