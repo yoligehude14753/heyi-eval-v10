@@ -1022,16 +1022,70 @@ def _infer_tags_from_modalities(modalities: list[str]) -> list[str]:
     return tags
 
 
+# PR#48: HF Hub pipeline_tags whose serving endpoint is NOT
+# /v1/chat/completions. When a run's pipeline_tag falls in this set,
+# chat-based categories (text_reasoning, code_*, vision-VQA, ocr,
+# video_understanding, music_understanding) are skipped at category
+# selection time, because the model can't serve them and every item
+# would 501 and trip the PR#36b honesty gate on a model that isn't
+# actually broken.
+_SINGLE_PURPOSE_PIPELINE_TAGS_NO_CHAT: frozenset[str] = frozenset({
+    "automatic-speech-recognition",
+    "audio-classification",
+    "text-to-speech",
+    "text-to-audio",
+    "text-to-image",
+    "image-to-image",
+    "inpainting",
+    "text-to-video",
+    "image-to-video",
+    "video-to-video",
+})
+# Categories whose dispatcher targets /v1/chat/completions (or its
+# vision variant).
+_CHAT_BASED_CATEGORIES: frozenset[str] = frozenset({
+    "text_reasoning", "code_gen", "code_repair", "code_complete",
+    "vision", "ocr",
+    "video_understanding", "music_understanding",
+})
+
+
 def _select_applicable_categories(
     tags: list[str], registry: tuple[CategoryConfig, ...] = CATEGORY_REGISTRY,
+    *, pipeline_tag: str | None = None,
 ) -> list[CategoryConfig]:
     """A category is applicable iff *every* required_tag is in the
-    model's capability_tags."""
+    model's capability_tags.
+
+    PR#48 (post-speecht5 nv8 observation): an extra gate excludes
+    chat-based categories (text_reasoning, code_*, vision, ocr,
+    video_understanding, music_understanding) when ``pipeline_tag``
+    is a single-purpose non-chat tag (TTS / ASR / diffusion).
+    Otherwise speecht5_tts (tags=["text", "tts"]) would match
+    text_reasoning via "text" and blast 20 chat/completions items at
+    a TTS-only endpoint, all 501ing — the PR#36b honesty gate then
+    marks the run "failed" for the wrong reason (the model isn't
+    broken, the category was misrouted).
+
+    The pipeline_tag gate is intentionally narrow: ``audio-text-to-text``
+    and other multi-modal chat models pass through and run their chat
+    categories. Only pipelines that HF Hub marks as single-purpose
+    non-chat skip the chat-based set.
+
+    The non-chat-output category itself (tts, image_gen, asr) still
+    runs via its dedicated dispatcher (tts_speech / image_gen /
+    asr_transcribe) — those don't use /v1/chat/completions.
+    """
     tagset = set(tags)
+    pt = (pipeline_tag or "").strip().lower()
+    skip_chat = pt in _SINGLE_PURPOSE_PIPELINE_TAGS_NO_CHAT
     out: list[CategoryConfig] = []
     for cat in registry:
-        if all(t in tagset for t in cat.required_tags):
-            out.append(cat)
+        if not all(t in tagset for t in cat.required_tags):
+            continue
+        if skip_chat and cat.name in _CHAT_BASED_CATEGORIES:
+            continue
+        out.append(cat)
     return out
 
 
@@ -1311,22 +1365,52 @@ def execute_capability(
     # ── PR#15 multimodal path ────────────────────────────────────────────
     else:
         tags = capability_tags_override or _read_capability_tags(rd)
-        applicable = _select_applicable_categories(tags)
+        # PR#48: read pipeline_tag from metadata.json so the selector
+        # can skip chat-based categories on single-purpose pipelines.
+        pipeline_tag_for_select = ""
+        try:
+            metadata_path = rd / "_meta" / "metadata.json"
+            if metadata_path.exists():
+                md = json.loads(metadata_path.read_text(encoding="utf-8"))
+                pipeline_tag_for_select = (
+                    (md.get("hf_info") or {}).get("pipeline_tag") or ""
+                )
+        except (json.JSONDecodeError, OSError):
+            pipeline_tag_for_select = ""
+        applicable = _select_applicable_categories(
+            tags, pipeline_tag=pipeline_tag_for_select,
+        )
         all_categories = list(CATEGORY_REGISTRY)
         applicable_names = {c.name for c in applicable}
+        pt_lc = pipeline_tag_for_select.strip().lower()
+        chat_skipped_by_pipeline = pt_lc in _SINGLE_PURPOSE_PIPELINE_TAGS_NO_CHAT
         # Record non-applicable categories with reason so the panel can
         # show "category greyed out" instead of "missing".
         for cat in all_categories:
             if cat.name in applicable_names:
                 continue
             missing = [t for t in cat.required_tags if t not in tags]
+            if missing:
+                reason = f"missing capability_tags: {','.join(missing)}"
+            elif (chat_skipped_by_pipeline
+                  and cat.name in _CHAT_BASED_CATEGORIES):
+                # PR#48: tags satisfy required_tags, but pipeline_tag
+                # is single-purpose non-chat so chat-based categories
+                # are skipped to avoid blasting 501s at a TTS/diffusion
+                # endpoint.
+                reason = (
+                    f"skipped (chat-based; pipeline_tag="
+                    f"{pipeline_tag_for_select})"
+                )
+            else:
+                reason = "category not applicable"
             categories_out[cat.name] = {
                 "applicable": False,
                 "scorer": cat.scorer,
                 "score": "0/0",
                 "pass_rate": 0.0,
                 "items": [],
-                "reason": f"missing capability_tags: {','.join(missing)}",
+                "reason": reason,
             }
         # Run applicable categories.
         for cat in applicable:

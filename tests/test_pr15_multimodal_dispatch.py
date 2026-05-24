@@ -311,6 +311,77 @@ class TagGatingTests(unittest.TestCase):
         # All 13 categories applicable when all tags are present
         self.assertEqual(len(names), 13)
 
+    # ── PR#48: pipeline_tag-aware chat-category gate ────────────────
+    def test_t4b_pr48_speecht5_skips_chat_categories(self):
+        """Live nv8 motivation: speecht5_tts had
+        ``capability_tags=["text", "tts"]`` and pipeline_tag=
+        text-to-speech. Without PR#48, text_reasoning matched on
+        "text" → 20 chat/completions items blasted at a TTS-only
+        endpoint, all 501ing → PR#36b honesty gate flagged the run
+        failed for the wrong reason."""
+        applicable = cap._select_applicable_categories(
+            ["text", "tts"], pipeline_tag="text-to-speech",
+        )
+        names = {c.name for c in applicable}
+        self.assertIn("tts", names,
+                      "the dedicated TTS dispatcher must still run")
+        self.assertNotIn("text_reasoning", names,
+                         "chat-based categories must be skipped for "
+                         "single-purpose TTS pipeline_tag")
+        self.assertNotIn("code_gen", names)
+
+    def test_t4c_pr48_asr_skips_chat_categories(self):
+        """whisper / mms style: pipeline_tag=automatic-speech-
+        recognition + curator tags=["text", "asr"]. Chat skipped,
+        asr keeps running."""
+        applicable = cap._select_applicable_categories(
+            ["text", "asr"],
+            pipeline_tag="automatic-speech-recognition",
+        )
+        names = {c.name for c in applicable}
+        self.assertIn("asr", names)
+        self.assertNotIn("text_reasoning", names)
+
+    def test_t4d_pr48_multimodal_audio_chat_keeps_chat(self):
+        """Voxtral / Qwen2-Audio: pipeline_tag=audio-text-to-text
+        (or other multi-modal chat tags). These DO serve chat and
+        must NOT have their chat categories skipped even though
+        ``audio`` or ``asr`` may be in capability_tags."""
+        applicable = cap._select_applicable_categories(
+            ["text", "code", "audio", "asr"],
+            pipeline_tag="audio-text-to-text",
+        )
+        names = {c.name for c in applicable}
+        self.assertIn("text_reasoning", names,
+                      "multi-modal audio chat must keep text_reasoning")
+        self.assertIn("code_gen", names)
+        self.assertIn("asr", names)
+
+    def test_t4e_pr48_text_to_image_skips_chat_categories(self):
+        """Stable-diffusion family: pipeline_tag=text-to-image +
+        curator tags=["text", "image_gen"]. Chat skipped, image_gen
+        runs via its dedicated dispatcher."""
+        applicable = cap._select_applicable_categories(
+            ["text", "image_gen"], pipeline_tag="text-to-image",
+        )
+        names = {c.name for c in applicable}
+        self.assertIn("image_gen", names)
+        self.assertNotIn("text_reasoning", names)
+        self.assertNotIn("vision", names)
+
+    def test_t4f_pr48_default_pipeline_tag_no_op(self):
+        """pipeline_tag=None or "" → backward compat (no gate).
+        Existing test_t1/t2/etc. continue to work unchanged."""
+        a1 = cap._select_applicable_categories(["text", "tts"])
+        a2 = cap._select_applicable_categories(
+            ["text", "tts"], pipeline_tag=None,
+        )
+        self.assertEqual({c.name for c in a1}, {c.name for c in a2})
+        # And the resulting set DOES include text_reasoning (no gate)
+        names = {c.name for c in a1}
+        self.assertIn("text_reasoning", names)
+        self.assertIn("tts", names)
+
     def test_t5_unknown_tag_in_input_is_ignored(self):
         # The function doesn't whitelist; it just checks required_tags.
         # Unknown tags don't unlock anything new, so we should still
