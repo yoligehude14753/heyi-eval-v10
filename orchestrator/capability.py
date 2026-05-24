@@ -851,6 +851,20 @@ def _load_jsonl(path: Path) -> list[dict[str, Any]]:
 # ── capability tag selection ──────────────────────────────────────────────
 
 
+_SINGLE_PURPOSE_PIPELINE_TAGS: frozenset[str] = frozenset({
+    "automatic-speech-recognition",
+    "audio-classification",
+    "text-to-speech",
+    "text-to-audio",
+    "text-to-image",
+    "image-to-image",
+    "inpainting",
+    "text-to-video",
+    "image-to-video",
+    "video-to-video",
+})
+
+
 def _read_capability_tags(run_dir: Path) -> list[str]:
     """Resolve capability_tags for a run, tiered:
 
@@ -869,21 +883,35 @@ def _read_capability_tags(run_dir: Path) -> list[str]:
        a last-resort signal when only the curator's modality
        list survives.
     4. Hard default ``["text"]``.
+
+    PR#39 (post-PR#36 nv8 observation): even when the curator emits
+    explicit capability_tags, those tags can be wrong because the LLM
+    misread the model card. ``MahmoudAshraf/mms-300m-1130-forced-aligner``
+    is the canonical case — pipeline_tag was ``automatic-speech-recognition``
+    but the curator tagged it as ``["audio"]``, which selected
+    ``music_understanding`` (5/5 items 501'd). HF Hub's pipeline_tag is
+    authoritative for these "single-purpose" pipelines, so when one is
+    set we **merge** its inferred tags into the curator list (set union
+    + de-dup, preserving curator order so first-impression categories
+    keep priority).
     """
     meta_curated = run_dir / "_meta" / "curated.json"
+    obj: dict[str, Any] = {}
+    curator_tags: list[str] = []
     if meta_curated.exists():
         try:
             obj = json.loads(meta_curated.read_text(encoding="utf-8"))
             tags = obj.get("capability_tags")
-            if isinstance(tags, list) and all(isinstance(t, str) for t in tags) and tags:
-                return tags
+            if (isinstance(tags, list)
+                    and all(isinstance(t, str) for t in tags)
+                    and tags):
+                curator_tags = list(tags)
         except (json.JSONDecodeError, OSError):
             obj = {}
-    else:
-        obj = {}
 
-    # PR#27: pipeline_tag fallback (preferred over modalities since
-    # it's the canonical HF Hub author signal).
+    # PR#39: load pipeline_tag in BOTH branches (curator-present and
+    # curator-empty) so we can merge for the first and fall back for
+    # the second.
     pipeline_tag = ""
     metadata_path = run_dir / "_meta" / "metadata.json"
     if metadata_path.exists():
@@ -893,6 +921,22 @@ def _read_capability_tags(run_dir: Path) -> list[str]:
         except (json.JSONDecodeError, OSError):
             pipeline_tag = ""
     inferred = _pipeline_tag_to_capability_tags(pipeline_tag)
+
+    if curator_tags:
+        # PR#39 merge: when pipeline_tag is single-purpose (ASR/TTS/
+        # diffusion etc.) and its inferred tags are NOT already in the
+        # curator list, add them. We never DROP curator tags here —
+        # subtraction would risk hiding genuine multi-modal capability
+        # the LLM correctly identified from the card.
+        if (pipeline_tag.lower() in _SINGLE_PURPOSE_PIPELINE_TAGS
+                and inferred):
+            merged = list(curator_tags)
+            for t in inferred:
+                if t not in merged:
+                    merged.append(t)
+            return merged
+        return curator_tags
+
     if inferred:
         return inferred
 

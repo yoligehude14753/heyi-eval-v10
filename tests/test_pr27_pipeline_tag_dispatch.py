@@ -144,13 +144,63 @@ class TestReadCapabilityTagsFallbackChain(unittest.TestCase):
     def tearDown(self) -> None:
         self._td.cleanup()
 
-    def test_explicit_capability_tags_win(self) -> None:
-        # Explicit curator output overrides everything else.
+    def test_explicit_capability_tags_win_for_non_single_purpose(self) -> None:
+        # Curator's tags are authoritative when pipeline_tag is NOT
+        # single-purpose (e.g. text-generation). PR#39 only merges for
+        # single-purpose pipelines.
         _write_curated(self.run_dir, capability_tags=["text", "vision"])
-        _write_metadata_pipeline_tag(self.run_dir, "automatic-speech-recognition")
+        _write_metadata_pipeline_tag(self.run_dir, "text-generation")
         self.assertEqual(
             capability._read_capability_tags(self.run_dir),
             ["text", "vision"],
+        )
+
+    def test_pr39_merge_single_purpose_pipeline_into_curator_tags(self) -> None:
+        """PR#39: HF Hub pipeline_tag is authoritative for
+        single-purpose modalities. When curator gave a list missing the
+        pipeline_tag's modality, MERGE rather than override.
+
+        Live nv8 motivation: ``MahmoudAshraf/mms-300m-1130-forced-aligner``
+        — pipeline_tag=automatic-speech-recognition but curator emitted
+        ["audio"], which selected music_understanding (5/5 items 501'd).
+        After PR#39 ["audio"] becomes ["audio", "asr"] so the asr
+        category fires and gets honest pass-rate data.
+        """
+        _write_curated(self.run_dir, capability_tags=["audio"])
+        _write_metadata_pipeline_tag(
+            self.run_dir, "automatic-speech-recognition")
+        tags = capability._read_capability_tags(self.run_dir)
+        self.assertIn("asr", tags)
+        self.assertIn("audio", tags, "curator tag must be preserved")
+
+    def test_pr39_merge_no_op_when_pipeline_tag_already_in_curator(self) -> None:
+        """Idempotency: if the curator already has the pipeline_tag's
+        inferred tag, merge produces no duplicates."""
+        _write_curated(self.run_dir, capability_tags=["asr", "text"])
+        _write_metadata_pipeline_tag(
+            self.run_dir, "automatic-speech-recognition")
+        tags = capability._read_capability_tags(self.run_dir)
+        self.assertEqual(tags.count("asr"), 1)
+
+    def test_pr39_merge_curator_order_preserved(self) -> None:
+        """Curator-order matters for first-impression UI; the merge
+        appends, never reorders."""
+        _write_curated(self.run_dir, capability_tags=["audio"])
+        _write_metadata_pipeline_tag(self.run_dir, "text-to-speech")
+        tags = capability._read_capability_tags(self.run_dir)
+        self.assertEqual(tags[0], "audio")
+        self.assertIn("tts", tags)
+
+    def test_pr39_no_merge_when_pipeline_tag_is_chat_capable(self) -> None:
+        """Regression: a chat-capable pipeline_tag must NOT inject
+        synthetic tags into a curator-tagged audio-only model. For
+        ``automatic-speech-recognition`` the merge fires (above test);
+        for ``text-generation`` it must not (this test)."""
+        _write_curated(self.run_dir, capability_tags=["audio"])
+        _write_metadata_pipeline_tag(self.run_dir, "text-generation")
+        # text-generation is NOT single-purpose → curator wins as-is.
+        self.assertEqual(
+            capability._read_capability_tags(self.run_dir), ["audio"],
         )
 
     def test_whisper_regression_pipeline_tag_fixes_default(self) -> None:
