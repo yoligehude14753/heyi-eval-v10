@@ -648,44 +648,57 @@ def _license_from_tags(tags: list[str]) -> str | None:
 
 def _pick_engine(modality: str, pipeline_tag: str,
                  library_name: str | None = None) -> tuple[str, str, str, str | None]:
-    """Returns (engine, image, reason, fallback). image is what cc-agent docker-runs."""
-    # vllm-compatible modalities
-    if modality in ("text", "code") or pipeline_tag in (
+    """Returns (engine, image, reason, fallback). image is what cc-agent docker-runs.
+
+    Routing precedence (PR#46):
+      1. Single-purpose pipeline_tag (HF Hub authoritative) — TTS, ASR,
+         diffusion. These ALWAYS go to transformers-runner regardless
+         of what curator-derived ``modality`` says. The curator often
+         lists ``modalities=["text", "audio"]`` for TTS models because
+         the *input* is text, which previously misrouted speecht5 et al.
+         to vllm.
+      2. Multi-modal chat pipeline_tag (text-generation et al.) — vllm.
+      3. ``library_name`` hints (diffusers, sentence-transformers).
+      4. Modality fallback for repos without pipeline_tag (kyutai/tts-voices
+         and fingerprint-detected TTS).
+      5. Default vllm + transformers fallback.
+    """
+    pt = (pipeline_tag or "").strip().lower()
+
+    # 1. Single-purpose pipeline_tag — HF Hub trumps curator modalities.
+    if pt in ("automatic-speech-recognition", "audio-classification",
+              "text-to-speech", "text-to-audio"):
+        return ("transformers", "heyi-eval/transformers-runner:v10",
+                f"audio pipeline_tag={pt}", None)
+
+    if pt in ("text-to-image", "image-to-image", "inpainting",
+              "text-to-video", "image-to-video", "video-to-video"):
+        return ("transformers", "heyi-eval/transformers-runner:v10",
+                f"diffusion pipeline_tag={pt}", None)
+
+    # 2. Chat-capable pipeline_tag or curator-confirmed text/code.
+    if modality in ("text", "code") or pt in (
         "text-generation", "text2text-generation", "image-text-to-text",
         "any-to-any",
     ):
         return ("vllm", "vllm/vllm-openai:v0.11.0", "text-generation family", "transformers")
 
-    # Speech in/out — transformers is the safe path
-    if pipeline_tag in ("automatic-speech-recognition", "audio-classification",
-                        "text-to-speech"):
-        return ("transformers", "heyi-eval/transformers-runner:v10",
-                f"audio pipeline_tag={pipeline_tag}", None)
-
-    # Image/Video generation — diffusers via transformers runner
-    if pipeline_tag in ("text-to-image", "image-to-image", "inpainting",
-                        "text-to-video", "image-to-video"):
-        return ("transformers", "heyi-eval/transformers-runner:v10",
-                f"diffusion pipeline_tag={pipeline_tag}", None)
-
-    # library_name hints
+    # 3. library_name hints
     if (library_name or "").lower() in ("diffusers", "sentence-transformers"):
         return ("transformers", "heyi-eval/transformers-runner:v10",
                 f"library={library_name}", None)
 
-    # PR#42: audio modality with no pipeline_tag (e.g. kyutai/tts-voices,
-    # hf entries that forgot to set the tag, or fingerprint-detected
-    # TTS repos) MUST go to transformers-runner. The previous code sent
-    # them to vllm with a "default" reason which then crashed at DEPLOY
-    # because vllm cannot serve /v1/audio/speech.
+    # 4. PR#42: audio modality with no pipeline_tag (e.g. kyutai/tts-voices,
+    #    hf entries that forgot to set the tag, or fingerprint-detected
+    #    TTS repos) MUST go to transformers-runner.
     if modality == "audio":
         return ("transformers", "heyi-eval/transformers-runner:v10",
-                f"audio modality (pipeline_tag={pipeline_tag or 'unknown'})",
+                f"audio modality (pipeline_tag={pt or 'unknown'})",
                 None)
 
-    # default: vllm with transformers fallback (handbook decides the actual command)
+    # 5. default: vllm with transformers fallback (handbook decides the actual command)
     return ("vllm", "vllm/vllm-openai:v0.11.0",
-            f"default (modality={modality}, pipeline_tag={pipeline_tag or 'unknown'})",
+            f"default (modality={modality}, pipeline_tag={pt or 'unknown'})",
             "transformers")
 
 

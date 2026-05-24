@@ -184,6 +184,70 @@ class Pr42PickEngineAudio(unittest.TestCase):
         engine, _, _, _ = _pick_engine("text", "", library_name=None)
         self.assertEqual(engine, "vllm")
 
+    # PR#46: HF Hub single-purpose pipeline_tag must override curator modality
+    def test_pr46_speecht5_text_modality_but_tts_pipeline_routes_to_transformers(self) -> None:
+        """NV8 21:47 live failure: curator emitted
+        ``modalities=["text", "audio"]`` for microsoft/speecht5_tts
+        because the *input* is text. The first modality "text" matched
+        the old early-return on line 653 and the model went to vLLM,
+        which immediately crashed with ``early_exit other_early_exit``
+        because vLLM cannot serve T2S models.
+
+        Fix: pipeline_tag=text-to-speech is HF Hub's authoritative
+        single-modality signal and must be checked BEFORE the
+        modality-based vLLM branch.
+        """
+        from orchestrator.stages import _pick_engine
+        engine, image, reason, fallback = _pick_engine(
+            "text", "text-to-speech", library_name="transformers",
+        )
+        self.assertEqual(engine, "transformers",
+                         "text-to-speech pipeline_tag must beat text modality")
+        self.assertIn("transformers-runner", image)
+        self.assertIn("text-to-speech", reason)
+        self.assertIsNone(fallback,
+                          "no fallback for single-purpose transformers route")
+
+    def test_pr46_asr_with_text_modality_routes_to_transformers(self) -> None:
+        """Same root cause as speecht5 — ASR model whose curator listed
+        ``modalities=["audio", "text"]`` and put "text" first."""
+        from orchestrator.stages import _pick_engine
+        engine, _, reason, _ = _pick_engine(
+            "text", "automatic-speech-recognition",
+            library_name="transformers",
+        )
+        self.assertEqual(engine, "transformers")
+        self.assertIn("automatic-speech-recognition", reason)
+
+    def test_pr46_t2i_with_text_modality_routes_to_transformers(self) -> None:
+        """Same for diffusion: stable-diffusion checkpoints often have
+        curator modality=text (because the prompt is text) and must
+        still go to transformers-runner with the diffusers backend."""
+        from orchestrator.stages import _pick_engine
+        engine, _, reason, _ = _pick_engine(
+            "text", "text-to-image", library_name="diffusers",
+        )
+        self.assertEqual(engine, "transformers")
+        self.assertIn("text-to-image", reason)
+
+    def test_pr46_pipeline_tag_normalises_case(self) -> None:
+        """pipeline_tag from HF Hub is always lowercase, but defensively
+        accept the upper/mixed case too."""
+        from orchestrator.stages import _pick_engine
+        engine, _, _, _ = _pick_engine(
+            "text", "Text-To-Speech", library_name=None,
+        )
+        self.assertEqual(engine, "transformers")
+
+    def test_pr46_image_text_to_text_still_vllm(self) -> None:
+        """Regression: VLM chat models (image-text-to-text) must STILL
+        go to vLLM, not transformers-runner."""
+        from orchestrator.stages import _pick_engine
+        engine, _, _, _ = _pick_engine(
+            "text", "image-text-to-text", library_name="transformers",
+        )
+        self.assertEqual(engine, "vllm")
+
 
 # ── PR#43: not_a_model gate ───────────────────────────────────────────────
 
