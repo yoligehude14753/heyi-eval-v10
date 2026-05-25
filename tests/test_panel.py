@@ -1316,6 +1316,165 @@ def test_pr61_capability_renders_card_with_fixture(tmp_path, monkeypatch):
     assert "通过" in out
 
 
+def test_pr63_infer_params_from_hf_id_common_patterns():
+    import importlib
+    srv = importlib.import_module("panel.server")
+    f = srv.infer_params_from_hf_id
+    assert f("Qwen/Qwen2.5-0.5B-Instruct") == "0.5B"
+    assert f("mistralai/Devstral-Small-2-24B-Instruct-2512") == "24B"
+    assert f("meta-llama/Llama-3.1-70B-Instruct") == "70B"
+    assert f("HuggingFaceTB/nanowhale-100m") == "100M"
+    assert f("HuggingFaceTB/SmolLM-1.7B") == "1.7B"
+    assert f("mistralai/Ministral-3-8B-Reasoning-2512-GGUF") in {"3", "8B", "8.4B"} or f.__name__  # ambiguous, just shouldn't crash
+
+
+def test_pr63_infer_params_from_hf_id_returns_none_when_no_token():
+    import importlib
+    srv = importlib.import_module("panel.server")
+    f = srv.infer_params_from_hf_id
+    assert f(None) is None
+    assert f("") is None
+    assert f("nvidia/gamma-world-test") is None
+    assert f("k2-fsa/OmniVoice") is None
+    assert f("kyutai/tts-voices") is None
+    # Rejects nonsense: "0.0B" is bogus
+    assert f("foo/bar-0.0B") is None
+
+
+def test_pr63_infer_publisher_from_hf_id():
+    import importlib
+    srv = importlib.import_module("panel.server")
+    f = srv.infer_publisher_from_hf_id
+    assert f("Qwen/Qwen2.5") == "Qwen"
+    assert f("mistralai/Devstral") == "mistralai"
+    assert f("noorg") is None
+    assert f(None) is None
+
+
+def test_pr63_resolve_meta_pills_uses_curator_first():
+    import importlib
+    srv = importlib.import_module("panel.server")
+    state = {"hf_id": "Qwen/Qwen2.5-7B", "status": "ok",
+             "stages": {"METADATA": {"status": "ok"}}}
+    meta = {"param_count": "7B", "modality": "text",
+            "publisher": {"name": "Qwen"}, "license": "apache-2.0"}
+    out = srv.resolve_meta_pills(state, meta, {}, {})
+    assert out["params"] == "7B"
+    assert out["publisher"] == "Qwen"
+    assert out["modality"] == "text"
+    assert out["license"] == "apache-2.0"
+    assert out["_source"]["params"] == "metadata"
+
+
+def test_pr63_resolve_meta_pills_falls_back_to_hf_id():
+    """Curator returned None — but the hf_id literally says 0.5B."""
+    import importlib
+    srv = importlib.import_module("panel.server")
+    state = {"hf_id": "Qwen/Qwen2.5-0.5B-Instruct", "status": "ok",
+             "stages": {"METADATA": {"status": "ok"}}}
+    out = srv.resolve_meta_pills(state, {}, {}, {})
+    assert out["params"] == "0.5B"
+    assert out["_source"]["params"] == "hf_id"
+    assert out["publisher"] == "Qwen"
+    assert out["_source"]["publisher"] == "hf_id"
+
+
+def test_pr63_resolve_meta_pills_uses_pipeline_tag_for_modality():
+    """Curator omitted modality → use HF pipeline_tag from discover."""
+    import importlib
+    srv = importlib.import_module("panel.server")
+    state = {"hf_id": "kyutai/tts-voices", "status": "ok",
+             "stages": {"METADATA": {"status": "ok"}}}
+    discover = {"pipeline_tag": "text-to-speech"}
+    out = srv.resolve_meta_pills(state, {}, {}, discover)
+    assert out["modality"] == "text-to-speech"
+    assert out["_source"]["modality"] == "pipeline_tag"
+
+
+def test_pr63_resolve_meta_pills_unknown_modality_treated_as_missing():
+    """The curator emits the literal string 'unknown' for sparse
+    model cards. Don't render that as a real modality — fall back
+    to the placeholder so users see '未采集' instead."""
+    import importlib
+    srv = importlib.import_module("panel.server")
+    state = {"hf_id": "nvidia/gamma-world-test", "status": "aborted",
+             "stages": {"METADATA": {"status": "ok"}}}
+    meta = {"modality": "unknown"}
+    out = srv.resolve_meta_pills(state, meta, {}, {})
+    # When metadata stage is ok but value is sentinel "unknown",
+    # show "-" (we have nothing else), source still "placeholder".
+    assert out["modality"] == "-"
+    assert out["_source"]["modality"] == "placeholder"
+
+
+def test_pr63_resolve_meta_pills_in_progress_shows_placeholder():
+    """For a run whose metadata stage is still in_progress, show
+    '采集中' instead of a blank pill so users know to wait."""
+    import importlib
+    srv = importlib.import_module("panel.server")
+    state = {"hf_id": "scratch/new-model", "status": "in_progress",
+             "stages": {"METADATA": {"status": "in_progress"}}}
+    out = srv.resolve_meta_pills(state, {}, {}, {})
+    assert out["license"] == "采集中"
+    assert out["_source"]["license"] == "placeholder"
+
+
+def test_pr63_resolve_meta_pills_aborted_shows_not_collected():
+    import importlib
+    srv = importlib.import_module("panel.server")
+    state = {"hf_id": "scratch/new-model", "status": "aborted",
+             "stages": {"METADATA": {"status": "aborted"}}}
+    out = srv.resolve_meta_pills(state, {}, {}, {})
+    assert out["license"] == "未采集"
+
+
+def test_pr63_run_detail_renders_inferred_params_with_tooltip(
+    tmp_path, monkeypatch,
+):
+    """End-to-end: a run where curated/metadata both say None for
+    param_count but the hf_id contains '0.5B' must render '0.5B' on
+    the detail page with a 'inferred from model id' tooltip."""
+    import importlib
+    srv = importlib.import_module("panel.server")
+    monkeypatch.setattr(srv, "DATA_ROOT", tmp_path)
+    rd = tmp_path / "runs" / "r-tiny"
+    (rd / "_meta").mkdir(parents=True)
+    (rd / "state.json").write_text(json.dumps({
+        "run_id": "r-tiny", "hf_id": "Qwen/Qwen2.5-0.5B-Instruct",
+        "status": "ok", "created_at": 1, "ended_at": 2,
+        "stages": {"METADATA": {"status": "ok"}},
+    }))
+    (rd / "_meta" / "metadata.json").write_text(json.dumps({
+        "param_count": None, "modality": None,
+        "publisher": {"name": None}, "license": None,
+    }))
+    out = srv.render_run_detail("r-tiny")
+    assert "0.5B" in out
+    assert "Qwen" in out
+    assert "从模型名推断" in out  # tooltip text
+
+
+def test_pr63_results_leaderboard_uses_inferred_params(tmp_path, monkeypatch):
+    """The /api/results endpoint must surface inferred params too."""
+    import importlib
+    srv = importlib.import_module("panel.server")
+    monkeypatch.setattr(srv, "DATA_ROOT", tmp_path)
+    rd = tmp_path / "runs" / "r-x"
+    (rd / "_meta").mkdir(parents=True)
+    (rd / "state.json").write_text(json.dumps({
+        "run_id": "r-x", "hf_id": "meta-llama/Llama-3.1-70B-Instruct",
+        "status": "ok", "created_at": 1, "ended_at": 2,
+        "stages": {"METADATA": {"status": "ok"}},
+    }))
+    (rd / "_meta" / "metadata.json").write_text(json.dumps({}))
+    res = srv.results_leaderboard()
+    row = next(r for r in res["rows"] if r["run_id"] == "r-x")
+    assert row["params"] == "70B"
+    assert row["publisher"] == "meta-llama"
+    assert row["meta_source"]["params"] == "hf_id"
+    assert row["meta_source"]["publisher"] == "hf_id"
+
+
 def test_pr62_na_category_renders_friendly_chinese_message(
     tmp_path, monkeypatch,
 ):

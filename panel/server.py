@@ -333,6 +333,7 @@ main{padding:20px 28px 80px;max-width:1500px;margin:0 auto}
   border-radius:8px;padding:10px 14px;display:flex;flex-direction:column;gap:2px}
 .meta-pill label{font-size:10px;color:var(--text-3);text-transform:uppercase;letter-spacing:0.05em}
 .meta-pill .val{font-size:14px;color:var(--text);font-weight:500}
+.meta-pill .val.val-placeholder{color:var(--text-3);font-style:italic;font-weight:400}
 
 /* Stages table */
 .stages-table{width:100%;border-collapse:collapse;font-size:13px}
@@ -398,6 +399,175 @@ main{padding:20px 28px 80px;max-width:1500px;margin:0 auto}
 .show-comment{background:#2a230f;border:1px solid #5a4322;border-radius:6px;padding:8px 12px;color:#e9b870}
 .show-comment label{color:#e9b870}
 </style>"""
+
+
+# ---------- PR#63: metadata fallback inference ----------
+#
+# User feedback: "这些参数为什么都是空的，你是没跑还是没有同步上"
+# Audit on NV8 found ~25% of run-detail rows have None for `params`
+# (and sometimes publisher/license) because the LLM curator returns
+# null for sparse model cards (e.g. nvidia/gamma-world-test) — even
+# when the parameter count is literally in the hf_id ("Qwen2.5-0.5B"
+# clearly says 0.5B). We deterministically infer these fields below
+# so users see real values instead of "-".
+#
+# Three-step waterfall for each field:
+#   1. metadata.json (LLM-extracted, authoritative when present)
+#   2. curated.json  (publisher / param_count cross-fill)
+#   3. heuristic from hf_id (params + publisher only; modality is
+#      taken from discover.json's pipeline_tag, license has no
+#      reliable heuristic)
+# If even step 3 fails, we report stage-aware status instead of "-":
+#   - "采集中" if the metadata stage is still in_progress/queued
+#   - "未采集" if the run aborted before metadata
+#   - "-"    if we genuinely have nothing
+#
+# This keeps every pill informative even for half-failed runs and
+# eliminates the "all empty" cliff the user is seeing.
+
+# "7B", "0.5B", "1.5B", "100M", "8.4B", "70b" — case-insensitive.
+# We accept a leading dash, underscore, or slash so we don't match
+# arbitrary digits in the org name (e.g. "k2-fsa" → no false match).
+_PARAM_TOKEN_RE = re.compile(
+    r"(?:^|[-_./])(\d+(?:\.\d+)?[bBmM])(?:[-_./]|$)",
+)
+
+
+def infer_params_from_hf_id(hf_id: str | None) -> str | None:
+    """Extract a size token like '7B' / '0.5B' / '100M' from an hf_id.
+    Returns the matched token uppercased ('7B'), or None when no
+    unambiguous size is present in the name.
+    """
+    if not hf_id:
+        return None
+    m = _PARAM_TOKEN_RE.search(hf_id)
+    if not m:
+        return None
+    tok = m.group(1).upper()
+    # Sanity: reject obviously weird captures like '0.0B' or '999M'
+    try:
+        num = float(tok[:-1])
+        unit = tok[-1]
+        if unit == "B" and not (0.001 <= num <= 2000):
+            return None
+        if unit == "M" and not (1 <= num <= 999999):
+            return None
+    except ValueError:
+        return None
+    return tok
+
+
+def infer_publisher_from_hf_id(hf_id: str | None) -> str | None:
+    """Take the org prefix from the hf_id when the curator missed it."""
+    if not hf_id or "/" not in hf_id:
+        return None
+    org = hf_id.split("/", 1)[0].strip()
+    return org or None
+
+
+def metadata_stage_state(state: dict) -> str:
+    """Return one of: 'ok' / 'in_progress' / 'aborted' / 'unknown'.
+    Used to choose a friendly placeholder when a field is genuinely
+    missing — so the user knows whether to wait or to investigate.
+
+    Note: orchestrator writes stage names in UPPERCASE
+    ("METADATA") but legacy tests use lowercase ("metadata").
+    Accept both for back-compat.
+    """
+    stages = (state or {}).get("stages") or {}
+    md = stages.get("METADATA") or stages.get("metadata") or {}
+    st = md.get("status")
+    if st in ("ok",):
+        return "ok"
+    if st in ("in_progress", "queued"):
+        return "in_progress"
+    if st in ("failed", "aborted", "skipped"):
+        return "aborted"
+    overall = (state or {}).get("status")
+    if overall in ("in_progress", "queued"):
+        return "in_progress"
+    if overall in ("failed", "aborted"):
+        return "aborted"
+    return "unknown"
+
+
+def _meta_placeholder(stage_state: str) -> str:
+    return {
+        "in_progress": "采集中",
+        "aborted":     "未采集",
+        "unknown":     "未采集",
+        "ok":          "-",
+    }.get(stage_state, "-")
+
+
+def resolve_meta_pills(
+    state: dict, meta: dict, cur: dict, discover: dict | None = None,
+) -> dict:
+    """Compute the four pills (params, modality, publisher, license)
+    with the heuristic waterfall described above. Returns dict with
+    keys params/modality/publisher/license, all guaranteed non-empty
+    strings (either real value or stage-aware placeholder).
+    Also includes _source.* for tooltip attribution: 'metadata' /
+    'curated' / 'hf_id' / 'pipeline_tag' / 'placeholder'.
+    """
+    discover = discover or {}
+    hf_id = (state or {}).get("hf_id") or ""
+    stage_st = metadata_stage_state(state or {})
+    placeholder = _meta_placeholder(stage_st)
+    out: dict = {"_source": {}}
+
+    # params — metadata → curated → hf_id heuristic → placeholder
+    p = (meta or {}).get("param_count") or (cur or {}).get("param_count")
+    src = "metadata" if (meta or {}).get("param_count") else (
+        "curated" if (cur or {}).get("param_count") else None)
+    if not p:
+        inferred = infer_params_from_hf_id(hf_id)
+        if inferred:
+            p, src = inferred, "hf_id"
+    out["params"] = p or placeholder
+    out["_source"]["params"] = src or "placeholder"
+
+    # modality — metadata → curated → pipeline_tag (discover) → placeholder
+    # Treat the literal "unknown" sentinel as missing — the curator
+    # emits it when the model card is too sparse to classify, but
+    # rendering "unknown" in Chinese UI looks like a bug.
+    m = (meta or {}).get("modality") or (cur or {}).get("modality")
+    src = "metadata" if (meta or {}).get("modality") else (
+        "curated" if (cur or {}).get("modality") else None)
+    if (not m) or m == "unknown":
+        pt = (discover or {}).get("pipeline_tag")
+        if pt:
+            m, src = pt, "pipeline_tag"
+        else:
+            m, src = None, None  # fall through to placeholder
+    out["modality"] = m or placeholder
+    out["_source"]["modality"] = src or "placeholder"
+
+    # publisher — metadata → curated → hf_id org prefix → placeholder
+    pub_raw = (meta or {}).get("publisher") or (cur or {}).get("publisher") or {}
+    pub_name = (
+        pub_raw.get("name") if isinstance(pub_raw, dict) else (pub_raw or None)
+    )
+    src = "metadata" if (
+        (meta or {}).get("publisher") and (
+            (meta["publisher"].get("name") if isinstance(meta["publisher"], dict)
+             else meta["publisher"]))
+    ) else None
+    if not pub_name:
+        pub_name = infer_publisher_from_hf_id(hf_id)
+        if pub_name:
+            src = "hf_id"
+    out["publisher"] = pub_name or placeholder
+    out["_source"]["publisher"] = src or "placeholder"
+
+    # license — metadata → curated → placeholder (no reliable heuristic)
+    lic = (meta or {}).get("license") or (cur or {}).get("license")
+    src = "metadata" if (meta or {}).get("license") else (
+        "curated" if (cur or {}).get("license") else None)
+    out["license"] = lic or placeholder
+    out["_source"]["license"] = src or "placeholder"
+
+    return out
 
 
 def render_fixture_preview(
@@ -509,19 +679,23 @@ def list_runs() -> list[dict]:
             summary_text = strip_think_blocks(summary_text)
         except Exception:
             pass
-        publisher = curated.get("publisher") or meta.get("publisher") or {}
-        if isinstance(publisher, dict):
-            publisher_name = publisher.get("name")
-        else:
-            publisher_name = str(publisher) if publisher else None
+        # PR#63: apply the resolve_meta_pills waterfall so the API and
+        # the dashboard tables get inferred params/publisher/modality
+        # for runs where the curator returned None. resolve_meta_pills
+        # returns either a real value or a stage-aware placeholder
+        # ("采集中" / "未采集"); for the API we want raw real values
+        # only — placeholders become None so client filters work.
+        discover_art = _read_json(run_dir / "_meta" / "discover.json") or {}
+        resolved = resolve_meta_pills(state, meta, curated, discover_art)
+        _src = resolved.get("_source", {})
 
-        modalities = meta.get("modality") or curated.get("modalities") or []
-        if isinstance(modalities, str):
-            modality_str = modalities
-        elif isinstance(modalities, list):
-            modality_str = ",".join(modalities) if modalities else None
-        else:
-            modality_str = None
+        def _real_or_none(field: str):
+            return resolved[field] if _src.get(field) != "placeholder" else None
+
+        publisher_name = _real_or_none("publisher")
+        modality_str = _real_or_none("modality")
+        param_count_resolved = _real_or_none("params")
+        license_resolved = _real_or_none("license")
 
         # PR#18: surface per-category counts so the leaderboard can hint
         # which modalities were actually tested. ``categories`` is the
@@ -571,10 +745,19 @@ def list_runs() -> list[dict]:
             ),
             "engine": eng.get("engine"),
             "engine_image": eng.get("engine_image"),
-            "params_b": curated.get("param_count") or meta.get("param_count"),
-            "license": meta.get("license") or curated.get("license"),
+            "params_b": param_count_resolved,
+            "license": license_resolved,
             "modality": modality_str,
             "publisher": publisher_name,
+            # PR#63: expose the inference source so the panel can show
+            # tooltips like "由模型名推断" instead of misleading users
+            # into thinking we measured this number.
+            "meta_source": {
+                "params":    _src.get("params", "placeholder"),
+                "modality":  _src.get("modality", "placeholder"),
+                "publisher": _src.get("publisher", "placeholder"),
+                "license":   _src.get("license", "placeholder"),
+            },
         })
     return summaries
 
@@ -610,6 +793,7 @@ def results_leaderboard() -> dict:
             "ended_at": r.get("ended_at"),
             "failure_reason": r.get("failure_reason"),
             "failure_reason_zh": r.get("failure_reason_zh") or failure_zh(r.get("failure_reason")),
+            "meta_source": r.get("meta_source") or {},
         })
     # PR#58: time-DESC ordering — newest run on top. The user explicitly
     # asked for chronological ordering with the freshest evaluations
@@ -830,13 +1014,19 @@ def candidates_lifecycle(limit: int = 500) -> dict:
                 # 是得有，比如模型参数量大小啥的").
                 meta_art = _read_json(run_dir / "_meta" / "metadata.json") or {}
                 cur_art = _read_json(run_dir / "_meta" / "curated.json") or {}
+                disc_art = _read_json(run_dir / "_meta" / "discover.json") or {}
+                # PR#63: use the heuristic waterfall so candidates rows
+                # also benefit from hf_id-inferred params and pipeline_tag
+                # modality when curator returned None.
+                resolved = resolve_meta_pills(state, meta_art, cur_art, disc_art)
+                _src_can = resolved.get("_source", {})
                 params_b = (
-                    meta_art.get("param_count")
-                    or cur_art.get("param_count")
+                    resolved["params"]
+                    if _src_can.get("params") != "placeholder" else None
                 )
                 modality = (
-                    meta_art.get("modality")
-                    or (meta_art.get("modalities") or [None])[0]
+                    resolved["modality"]
+                    if _src_can.get("modality") != "placeholder" else None
                 )
                 by_hf[hf_id] = {
                     "run_id": state.get("run_id") or run_dir.name,
@@ -2428,25 +2618,45 @@ def render_run_detail(run_id: str) -> str:
         + "</div>"
     )
 
-    params_pill = meta.get("param_count") or cur.get("param_count") or "-"
-    modality_pill = meta.get("modality") or "-"
-    publisher_dict = cur.get("publisher") or meta.get("publisher") or {}
-    publisher_name = (
-        publisher_dict.get("name") if isinstance(publisher_dict, dict)
-        else (publisher_dict or None)
+    # PR#63: read discover.json too so we can fall back to HF's
+    # pipeline_tag when the LLM curator didn't fill `modality`.
+    discover_art = _read_json(DATA_ROOT / "runs" / run_id / "_meta" / "discover.json") or {}
+
+    pills = resolve_meta_pills(state, meta, cur, discover_art)
+    src = pills["_source"]
+    src_zh = {
+        "metadata": "由元数据阶段采集",
+        "curated":  "由 LLM 解读阶段提取",
+        "hf_id":    "从模型名推断（curator 未提供）",
+        "pipeline_tag": "从 HF pipeline_tag 推断",
+        "placeholder":  "未采集",
+    }
+
+    def _pill(label: str, val: str, key: str, val_html: str | None = None):
+        tip = html.escape(src_zh.get(src.get(key, "placeholder"), ""), quote=True)
+        body = val_html if val_html is not None else html.escape(str(val))
+        cls = (
+            " val-placeholder" if src.get(key) == "placeholder" else ""
+        )
+        return (
+            f"<span class='meta-pill' title='{tip}'>"
+            f"<label>{label}</label>"
+            f"<span class='val{cls}'>{body}</span></span>"
+        )
+
+    publisher_link_html = (
+        hf_publisher_link(pills["publisher"])
+        if src.get("publisher") != "placeholder"
+        else html.escape(str(pills["publisher"]))
     )
-    license_pill = meta.get("license") or cur.get("license") or "-"
     metadata_pills = (
         "<div class='meta-pills'>"
-        f"<span class='meta-pill'><label>参数量</label>"
-        f"<span class='val'>{html.escape(str(params_pill))}</span></span>"
-        f"<span class='meta-pill'><label>模态</label>"
-        f"<span class='val'>{html.escape(str(modality_pill))}</span></span>"
-        f"<span class='meta-pill'><label>厂商</label>"
-        f"<span class='val'>{hf_publisher_link(publisher_name)}</span></span>"
-        f"<span class='meta-pill'><label>许可证</label>"
-        f"<span class='val'>{html.escape(str(license_pill))}</span></span>"
-        "</div>"
+        + _pill("参数量", pills["params"], "params")
+        + _pill("模态", pills["modality"], "modality")
+        + _pill("厂商", pills["publisher"], "publisher",
+                val_html=publisher_link_html)
+        + _pill("许可证", pills["license"], "license")
+        + "</div>"
     )
 
     hf_link_header = hf_link(
