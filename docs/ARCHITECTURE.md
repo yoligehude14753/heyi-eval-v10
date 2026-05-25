@@ -10,7 +10,7 @@
 
 ## 0 · 一句话概述
 
-NV8 (`192.168.199.179`，8×6000) 上常驻的自动化 LLM 评测流水线：HuggingFace Hub 发现 → **11 阶段** 评测 → Panel 展示。产线 LLM（MiniMax-M2.7，GPU 0–3）与评测引擎（`e9-*` 容器，GPU 5–7）物理隔离，靠 23 条不变量守护边界。
+NV8 (`<NV8_HOST_IP>`，8×6000) 上常驻的自动化 LLM 评测流水线：HuggingFace Hub 发现 → **11 阶段** 评测 → Panel 展示。产线 LLM（MiniMax-M2.7，GPU 0–3）与评测引擎（`e9-*` 容器，GPU 5–7）物理隔离，靠 23 条不变量守护边界。
 
 ```
 HF Hub ──► discover daemon ──► candidates.jsonl ──► enqueue.timer (15 min)
@@ -366,7 +366,7 @@ JSON Schema 在 [`sops/schemas/`](../sops/schemas/)，受 `tests/` 校验：
 
 ## 12 · 常见运维快速链接
 
-- 面板：`http://192.168.199.179:8090`（Tailnet）
+- 面板：`http://<NV8_HOST_IP>:8090`（Tailnet）
 - 产线 LLM：`http://127.0.0.1:10814/v1`
 - 评测 LLM（运行时）：`http://127.0.0.1:18200/v1`（仅 DEPLOY 后存在）
 - 缓存逐出：`python tools/evict_eval_cache.py --quota-gb 200 --apply`

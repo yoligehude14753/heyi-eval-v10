@@ -155,7 +155,7 @@ PR#23 + PR#25 + PR#26 后，v10 评测管线在 nv8 上的真实表现：
 ## 7 · 复现命令
 
 ```bash
-ssh ai@heyi-sh-nv8
+ssh ai@<NV8_HOSTNAME>
 cd ~/heyi-eval-v10
 .venv/bin/python -m orchestrator.main enqueue Qwen/Qwen2.5-0.5B-Instruct
 .venv/bin/python -m orchestrator.main enqueue openai/whisper-tiny

@@ -1,6 +1,6 @@
 # PR#36 honesty experiment report
 
-> 部署位置：nv8 (`192.168.199.179`)，分支 `feat/pr22b-agent-runner`，commits `ccf82ae..77bb917`。
+> 部署位置：nv8 (`<NV8_HOST_IP>`)，分支 `feat/pr22b-agent-runner`，commits `ccf82ae..77bb917`。
 > 测试方法：在 PR#33 + PR#35 之上叠加 PR#36，重新跑 PR#33 报告里列出的两类「说谎」案例（`unsloth/Qwen3.6-27B-GGUF` + `MahmoudAshraf/mms-300m-1130-forced-aligner`），看是否把 `status=ok` 变成 honest `failed/repaired`。
 
 ## 背景：PR#33+PR#35 报告里识别出的两个 honest failure

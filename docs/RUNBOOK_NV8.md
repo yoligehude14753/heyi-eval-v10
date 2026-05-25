@@ -1,6 +1,6 @@
 # RUNBOOK · NV8 真机演练 (PR#8 D 层)
 
-> 这是 PR#8 唯一需要在 nv8-6000 真机上跑的部分。CI/mac 不能验,只能在 `100.127.173.85` ssh 上手动执行。
+> 这是 PR#8 唯一需要在 nv8-6000 真机上跑的部分。CI/mac 不能验,只能在 `<NV8_TAILNET_IP>` ssh 上手动执行。
 > 每一步含"通过标准"和"失败时怎么办"。建议在 ≥ 2 个清醒小时的窗口执行,中间不要并行做产线动作。
 
 ## 0 · 演练前置
@@ -715,11 +715,11 @@ PR#23 把 v10 评估管线对齐到 2026-05 的 nv8 实际拓扑:
 - 静态守护 `tests/test_pr23_m27_api_and_oversize.py::TestJudgeModelName::test_no_auto_literal_anywhere` 拦截任何回归把 `"model": "auto"` 提交回来。
 
 三条访问路径见 `rules/42-heyi-m27-api.md`:
-本机 `http://127.0.0.1:10814/v1` / Tailscale `http://100.127.173.85:10814/v1` / 公网 `cat /home/ai/cf-m27-url.txt`。
+本机 `http://127.0.0.1:10814/v1` / Tailscale `http://<NV8_TAILNET_IP>:10814/v1` / 公网 `cat /home/ai/cf-m27-url.txt`。
 nv8 上 orchestrator 默认走本机;mac 开发箱跑 e2e 时:
 
 ```bash
-export HEYI_ENGINE_URL=http://100.127.173.85:10814
+export HEYI_ENGINE_URL=http://<NV8_TAILNET_IP>:10814
 export HEYI_EVAL_JUDGE_MODEL=MiniMax-M2.7
 ```
 

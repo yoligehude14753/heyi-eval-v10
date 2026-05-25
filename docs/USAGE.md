@@ -45,7 +45,7 @@ HEYI_EVAL_E2E_ALLOW=1 \
 ```
 
 要求：
-- 主机名以 `heyi-sh-nv8` 开头（dev 机想干跑可加 `HEYI_EVAL_E2E_FORCE=1`，但 docker / nvidia-smi 仍必须可用）
+- 主机名以 `<NV8_HOSTNAME>` 开头（dev 机想干跑可加 `HEYI_EVAL_E2E_FORCE=1`，但 docker / nvidia-smi 仍必须可用）
 - heyi_engine 在 `:10814` 健康（pipeline 的 metadata + showcase 阶段会调它）
 - 至少 1 张 GPU 空闲 ≥ 8 GiB
 

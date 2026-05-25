@@ -232,7 +232,7 @@ m3pulse-3-1779502591  ok=True  dur=1.08 s  audit={begin_id:30, end_exit:0, end_d
 ## 7 · 复现命令（操作员视角）
 
 ```bash
-ssh ai@heyi-sh-nv8
+ssh ai@<NV8_HOSTNAME>
 cd ~/heyi-eval-v10
 
 # 一次评估真模型

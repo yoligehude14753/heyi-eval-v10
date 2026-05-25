@@ -1,6 +1,6 @@
 # heyi-eval-v10
 
-自动化模型评测 pipeline，在 nv8-6000 (`100.127.173.85` / `192.168.199.179` / `heyi-sh-nv8`) 上常驻运行。
+自动化模型评测 pipeline，在 nv8-6000 (`<NV8_TAILNET_IP>` / `<NV8_HOST_IP>` / `<NV8_HOSTNAME>`) 上常驻运行。
 
 > **想直接看现状架构？** → [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)（11 阶段流水线、信任域、daemon 拓扑、GPU 拓扑、不变量索引、文档索引）
 > **红线 / 不变量**：[`docs/INVARIANTS.md`](docs/INVARIANTS.md)
@@ -107,7 +107,7 @@ PR 序列见 [docs/PLAN.md § 7 PR 序列](docs/PLAN.md#7--pr-序列每个-pr--4
 
 ## 运维入口
 
-- 管理面板：`http://192.168.199.179:8090`（或 Tailnet `http://100.127.173.85:8090`）
+- 管理面板：`http://<NV8_HOST_IP>:8090`（或 Tailnet `http://<NV8_TAILNET_IP>:8090`）
 - 产线 LLM 端点：`http://127.0.0.1:10814/v1`（heyi_engine）
 - 评测 LLM 端点：`http://127.0.0.1:18200/v1`（仅 DEPLOY 后存在）
 - 手动 enqueue：`python -m discover.main enqueue --limit 5`，或面板 `POST /api/enqueue`
@@ -118,4 +118,6 @@ PR 序列见 [docs/PLAN.md § 7 PR 序列](docs/PLAN.md#7--pr-序列每个-pr--4
 
 ## License
 
-私有项目，未开源。
+MIT — 见 [LICENSE](LICENSE)。
+
+> 部署位置 / 主机 IP 在文档与脚本里以占位符出现（`<NV8_HOST_IP>` / `<NV8_TAILNET_IP>` / `<NV8_HOSTNAME>`）。本仓库不预设具体的部署网络拓扑，复用时按你自己的环境替换或通过环境变量覆盖（见 `deploy/env.example`）。

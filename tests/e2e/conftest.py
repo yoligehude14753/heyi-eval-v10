@@ -25,7 +25,7 @@ import pytest
 
 
 def _on_nv8() -> bool:
-    return socket.gethostname().startswith("heyi-sh-nv8")
+    return "nv8" in socket.gethostname().lower()
 
 
 def _e2e_allowed() -> bool:
@@ -42,7 +42,7 @@ def _require_nv8() -> None:
         )
     if not _on_nv8():
         pytest.skip(
-            "E2E tests should only run on hostname starting with heyi-sh-nv8 "
+            "E2E tests should only run on a host whose hostname contains 'nv8' "
             "(or set HEYI_EVAL_E2E_FORCE=1 for a dry-run on another host).",
             allow_module_level=True,
         )

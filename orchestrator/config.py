@@ -77,7 +77,7 @@ class OrchestratorConfig:
     # vLLM container `minimax` serving on port 10814 (TP=4, GPU 0-3).
     # Three reachable paths per `rules/42-heyi-m27-api.md`:
     #   (A) nv8-local       http://127.0.0.1:10814    (this default)
-    #   (B) Tailscale       http://100.127.173.85:10814
+    #   (B) Tailscale       http://<NV8_TAILNET_IP>:10814
     #   (C) trycloudflare   read /home/ai/cf-m27-url.txt (URL is dynamic)
     # When you're on the mac dev box, export HEYI_ENGINE_URL to (B) or (C).
     engine_url: str = os.environ.get("HEYI_ENGINE_URL", "http://127.0.0.1:10814")

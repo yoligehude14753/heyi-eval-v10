@@ -68,7 +68,7 @@ tests/
 幂等脚本，按顺序：
 
 1. **前置检查**：
-   - `uname -a` 含 `nv8` 或 hostname=`heyi-sh-nv8`（防止误跑在 mac/dev）；可用 `--force` 跳过
+   - `uname -a` 含 `nv8` 或 hostname=`<NV8_HOSTNAME>`（防止误跑在 mac/dev）；可用 `--force` 跳过
    - `docker --version` 存在
    - `nvidia-smi` 返回 0
    - 用户 `ai` 存在；当前用户必须是 `ai` 或 sudo 切到 ai

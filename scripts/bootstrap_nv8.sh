@@ -63,7 +63,7 @@ run()  {
 step "preflight"
 hn="$(hostname)"
 log "hostname=${hn}"
-if [[ "$FORCE" != "1" ]] && [[ "$hn" != *nv8* ]] && [[ "$hn" != *heyi-sh-nv8* ]]; then
+if [[ "$FORCE" != "1" ]] && [[ "$hn" != *nv8* ]]; then
   echo "refuse: hostname '${hn}' is not nv8. Re-run with --force to override." >&2
   exit 1
 fi

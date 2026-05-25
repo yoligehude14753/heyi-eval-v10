@@ -15,7 +15,7 @@ v10 pipeline: `DISCOVER → CURATE → ENGINE_SELECT → DEPLOY → READY_WAIT
 
 | Item | Value |
 |---|---|
-| Host | `heyi-sh-nv8` (NV8-6000, 8× GPU) |
+| Host | `<NV8_HOSTNAME>` (NV8-6000, 8× GPU) |
 | Eval GPU pool | `(5, 6, 7)` (GPU 0–3 = MiniMax-M2.7 API, GPU 4 = ComfyUI) |
 | Model cache | `/DATA/Model/_eval-cache/` (3.6 TB, 722 GB free pre-run) |
 | Engines used | `vllm v0.11.0`, `heyi/transformers-runner:dev` |
