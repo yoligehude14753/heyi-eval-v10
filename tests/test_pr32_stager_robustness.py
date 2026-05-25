@@ -21,6 +21,7 @@ the cache to the tune of 357 GB):
 from __future__ import annotations
 
 import unittest
+import unittest.mock
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -300,7 +301,9 @@ class TestEnsureStagedGgufNarrowsDownload(unittest.TestCase):
             (Path(local_dir) / "README.md").write_bytes(b"")
             return local_dir
 
-        with TemporaryDirectory() as td:
+        with TemporaryDirectory() as td, \
+             unittest.mock.patch.object(
+                 model_stager, "_free_bytes", return_value=10**12):
             target = Path(td) / "Qwen3.6-27B-GGUF"
             r = model_stager.ensure_model_staged(
                 hf_id="unsloth/Qwen3.6-27B-GGUF",

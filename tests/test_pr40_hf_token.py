@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import unittest
+import unittest.mock
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -134,7 +135,9 @@ class StagerForwardsToken(unittest.TestCase):
             _stage_complete(Path(local_dir))
             return local_dir
 
-        with TemporaryDirectory() as td:
+        with TemporaryDirectory() as td, \
+             unittest.mock.patch.object(
+                 model_stager, "_free_bytes", return_value=10**12):
             target = Path(td) / "M"
             r = model_stager.ensure_model_staged(
                 hf_id="google/gemma-3-9b-it",
