@@ -1,18 +1,21 @@
 """
-10-stage state machine with mixed checkpoint policy.
+11-stage state machine with mixed checkpoint policy.
 
 Stage list (in order):
-    DISCOVER  CURATE  METADATA  ENGINE_SELECT               <- run-level checkpoint
-    DEPLOY  READY_WAIT  CAPABILITY  PERF_BENCH  SHOWCASE  CLEANUP  <- stage-level checkpoint
+    DISCOVER  CURATE  METADATA  ENGINE_SELECT  STAGE_MODEL              <- run-level checkpoint
+    DEPLOY  READY_WAIT  CAPABILITY  PERF_BENCH  SHOWCASE  CLEANUP       <- stage-level checkpoint
 
 Checkpoint semantics:
 - run-level stages: if any fails, restart the whole run from DISCOVER on retry
+  (STAGE_MODEL is idempotent on an already-staged dir, so full restart is cheap)
 - stage-level stages: if any fails, retry from the last OK stage (DEPLOY result is preserved)
   This avoids wasting 60-120s of vllm boot if CAPABILITY/SHOWCASE fail.
 - CLEANUP is idempotent and always runs (best-effort) on terminal transitions.
 
 State is persisted to runs/<run_id>/state.json after every transition.
 Process can crash and recover by scanning state.json files.
+
+See docs/ARCHITECTURE.md §3 for per-stage inputs/outputs and failure semantics.
 """
 from __future__ import annotations
 

@@ -1,4 +1,8 @@
-# Invariants (INV-1 ~ INV-5)
+# [ARCHIVED — v8] Invariants (INV-1 ~ INV-5)
+
+> **不再适用**。本文件是 heyi-eval-v8 时代的不变量草案（`e8-` 前缀，GPU 4-7 给 eval）。
+> v10 的运行时红线见 [`docs/INVARIANTS.md`](../docs/INVARIANTS.md)（INV-1..INV-23，`e9-` 前缀，eval GPU `(5,6,7)`）。
+> 此处保留仅作审计参考，**严禁**作为现状描述引用。
 
 These are the non-negotiable rules that every pipeline component — CC agents,
 orchestrator, watchdog, runner_validator — enforces. A violation is a stage

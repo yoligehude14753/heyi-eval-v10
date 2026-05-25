@@ -1,6 +1,6 @@
 [Unit]
 Description=heyi-eval-v10 auto-enqueue newest discovered models into orchestrator queue
-Documentation=https://github.com/yoligehude14753/heyi-eval-v10/blob/main/docs/PR7b_TEST_PLAN.md
+Documentation=https://github.com/yoligehude14753/heyi-eval-v10/blob/main/docs/ARCHITECTURE.md
 After=network-online.target heyi-eval-discover.service
 Wants=network-online.target
 # PR#30 supersedes the v9-era unit that pointed at ~/heyi-eval-v9/.venv —

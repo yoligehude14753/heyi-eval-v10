@@ -1,6 +1,6 @@
 [Unit]
 Description=heyi-eval-v10 data snapshot (rsync to HEYI_EVAL_BACKUPS)
-Documentation=https://github.com/yoligehude14753/heyi-eval-v10/blob/main/docs/PR6_TEST_PLAN.md
+Documentation=https://github.com/yoligehude14753/heyi-eval-v10/blob/main/docs/ARCHITECTURE.md
 # Don't fight a running orchestrator main loop; backup is best-effort.
 After=network-online.target
 Wants=network-online.target

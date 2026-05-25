@@ -1,7 +1,7 @@
 # heyi-eval-v10 不变量清单
 
 > 这里是 v10 评估管道的**红线列表**。每条不变量由一个或多个组件守护;违反 = 阶段失败 + outbox 告警。
-> 编辑前请先读 `docs/ARCHITECTURE.md §信任边界`。历史 v8 文档参见 `sops/invariants.md`(保留作审计参考,不再适用)。
+> 编辑前请先读 [`docs/ARCHITECTURE.md §1 信任域`](ARCHITECTURE.md#1--信任域)。历史 v8 文档参见 [`sops/_archive_v8_invariants.md`](../sops/_archive_v8_invariants.md)（保留作审计参考,不再适用）。
 
 ## 两个 LLM,一个管道
 

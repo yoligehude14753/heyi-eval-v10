@@ -1,6 +1,6 @@
 [Unit]
 Description=heyi-eval-v10 quarter-hourly auto-enqueue trigger for newly discovered models
-Documentation=https://github.com/yoligehude14753/heyi-eval-v10/blob/main/docs/PR7b_TEST_PLAN.md
+Documentation=https://github.com/yoligehude14753/heyi-eval-v10/blob/main/docs/ARCHITECTURE.md
 
 [Timer]
 OnBootSec=5min

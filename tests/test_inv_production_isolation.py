@@ -45,9 +45,9 @@ INV_DOC_ALLOWLIST: set[str] = {
     "tests/test_pr10_concept_split.py",
     "tests/e2e/conftest.py",
     "tests/e2e/test_full_pipeline_qwen.py",
-    "docs/PR3_TEST_PLAN.md",
-    "docs/PR8_TEST_PLAN.md",
-    "docs/PR10_TEST_PLAN.md",
+    "docs/_archive/PR3_TEST_PLAN.md",
+    "docs/_archive/PR8_TEST_PLAN.md",
+    "docs/_archive/PR10_TEST_PLAN.md",
     # PR#22a sandbox attack drills — these scripts *deliberately* invoke
     # the forbidden production verbs as the sandboxed agent user, then
     # ASSERT the call gets rejected. The strings here are evidence that
@@ -64,7 +64,7 @@ INV_DOC_ALLOWLIST: set[str] = {
     "docs/INVARIANTS.md",
     "docs/THREAT_MODEL.md",
     "docs/PLAN.md",
-    "sops/invariants.md",
+    "sops/_archive_v8_invariants.md",
     "README.md",
     # validator.py validates INV-2 ("the configured production LLM stays up")
     # — it must reference the container name to inspect it. Post-PR#10 the

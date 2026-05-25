@@ -1,3 +1,7 @@
+> **状态（2026-05-25）**：这是 v10 **启动期的设计文档与 PR 序列规划**，保留作为 design rationale。
+> 当前**运行时真相**（已演进至 11 阶段，包含 PR#31 STAGE_MODEL 与 PR#26 PERF_BENCH）请看 [`ARCHITECTURE.md`](ARCHITECTURE.md)。
+> 本文的 9 阶段图、`compose.yml`、`cc-agent/` 目录拼写等已不反映现状。
+
 ---
 name: heyi-eval-v10 architecture
 overview: 基于 v9 incident 与 heyi-engine 调研结果，重新设计严格信任域分离的评测流水线。新开 heyi-eval-v10 仓库，将 DEPLOY/READY_WAIT/CAPABILITY/CLEANUP 4 个原 cc-agent 阶段全部 Python 化，cc-agent 仅保留 SHOWCASE 一个阶段且彻底去掉 shell + docker socket，LLM 走本地 :10814 自动发现，加上 30 分钟级备份。按 rules § 阶段 1-4 分阶段开发，feature branch + PR + E2E。
