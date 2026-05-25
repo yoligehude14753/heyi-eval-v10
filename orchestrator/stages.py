@@ -486,6 +486,14 @@ def _execute_stage_model_stage(
 
     target_dir = cfg.model_cache_root / cfg.hf_local_dir(run.hf_id)
 
+    # PR#65: enable LRU eviction inside ensure_model_staged. Reads
+    # quota from config (default 200 GB) so the eval-cache stops
+    # growing unboundedly. runs_root tells the evictor where to look
+    # for status=ok markers.
+    cache_quota_bytes = int(getattr(cfg, "cache_quota_bytes", None)
+                            or 200 * 1024 * 1024 * 1024)
+    runs_root = cfg.data_root / "runs"
+
     result = model_stager.ensure_model_staged(
         hf_id=run.hf_id,
         target_dir=target_dir,
@@ -499,6 +507,8 @@ def _execute_stage_model_stage(
         download_timeout_s=float(
             getattr(cfg, "stage_model_download_timeout_s", 0.0)
         ) or None,
+        cache_quota_bytes=cache_quota_bytes,
+        runs_root=runs_root,
     )
     artifact = model_stager.write_provenance(rd, result)
 

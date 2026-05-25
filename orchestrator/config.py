@@ -164,6 +164,13 @@ class OrchestratorConfig:
     model_cache_root: Path = field(
         default_factory=lambda: _env_path("HEYI_EVAL_MODEL_CACHE", "/DATA/Model/_eval-cache")
     )
+    # PR#65: LRU eviction quota for model_cache_root. When the cache
+    # exceeds this on staging, the evictor drops oldest evictable
+    # entries (orphan → failed_only → safe) until under quota. Default
+    # 200 GB; override via env for boxes with bigger /DATA.
+    cache_quota_bytes: int = int(
+        os.environ.get("HEYI_EVAL_CACHE_QUOTA_GB", "200")
+    ) * 1024 * 1024 * 1024
     vllm_port: int = int(os.environ.get("HEYI_EVAL_VLLM_PORT", "18200"))
 
     # production LLM (the vLLM container that heyi_engine talks to on :10814).

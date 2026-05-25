@@ -483,6 +483,8 @@ def ensure_model_staged(
     allow_patterns: list[str] | None = None,
     max_workers: int = 8,
     download_timeout_s: float | None = None,
+    cache_quota_bytes: int | None = None,
+    runs_root: Path | None = None,
     now: Callable[[], float] = time.time,
 ) -> StageModelResult:
     """Synchronously ensure ``hf_id`` is fully staged at ``target_dir``.
@@ -531,7 +533,43 @@ def ensure_model_staged(
         else _compute_allow_patterns(hf_id, metadata)
     )
 
-    # 3. Disk-headroom gate: if we can estimate, refuse to start a
+    # 3a. PR#65: LRU cache eviction. Before each download we enforce a
+    # cache-size quota on the *eval-cache root* (the parent of
+    # target_dir). User feedback (2026-05-25): the cache had grown to
+    # 737 GB across 52 models because the orchestrator never evicts
+    # successfully-evaluated weights. Now we cap it: if total >
+    # cache_quota_bytes, drop entries in priority order
+    # (orphan → failed_only → safe) until we're under quota. This is
+    # opt-in: only runs when cache_quota_bytes is set and runs_root is
+    # provided, so unit tests aren't affected.
+    if cache_quota_bytes is not None and runs_root is not None:
+        try:
+            # Lazy import — keep cache_evictor optional so the rest of
+            # the stager works in minimal test environments.
+            from orchestrator.cache_evictor import enforce_quota
+            cache_root = target_dir.parent
+            plan = enforce_quota(
+                cache_root, runs_root,
+                quota_bytes=cache_quota_bytes,
+                dry_run=False,
+            )
+            if plan.bytes_freed > 0:
+                import sys as _sys
+                print(
+                    f"[model_stager] LRU evicted "
+                    f"{len(plan.evicted)} dirs, "
+                    f"freed {plan.bytes_freed / 1e9:.1f} GB "
+                    f"(total was {plan.total_bytes / 1e9:.1f} GB, "
+                    f"quota {cache_quota_bytes / 1e9:.0f} GB)",
+                    file=_sys.stderr,
+                )
+        except Exception as _e:  # noqa: BLE001
+            # LRU is best-effort — never block staging on eviction errors.
+            import sys as _sys
+            print(f"[model_stager] LRU eviction failed: {_e}",
+                  file=_sys.stderr)
+
+    # 3b. Disk-headroom gate: if we can estimate, refuse to start a
     # download we know won't fit. Pre-flight check, NOT a partial-fail
     # cleanup (that's harder to make idempotent).
     estimate = _estimate_size_bytes(metadata, allow_patterns=effective_allow)
