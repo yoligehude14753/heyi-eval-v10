@@ -14,7 +14,7 @@ These tests pin two fixes:
      failed, then aborted. The top of the page is always the
      useful data.
   2. failure_reason cells are truncated to 200 chars + a tooltip
-     with the full content (via title= attribute) + max-height + 
+     with the full content (via title= attribute) + max-height +
      overflow:hidden inline style.
 """
 from __future__ import annotations
@@ -75,7 +75,7 @@ class TestRowPrioritySort(unittest.TestCase):
             "t2-old/foo", "t1-oldest/foo",
         ]
         positions = [pos(name) for name in order]
-        for prev, curr, name in zip(positions, positions[1:], order[1:]):
+        for prev, curr, name in zip(positions, positions[1:], order[1:], strict=False):
             self.assertLess(prev, curr,
                             f"{name!r} should come AFTER older row")
 
@@ -111,7 +111,7 @@ class TestFailureReasonTruncated(unittest.TestCase):
         # in the visible cell body — the title attr is searchable
         # but inside an attribute).
         body_after_title = html.split('title="')[-1].split('">', 1)[-1]
-        # The visible-cell portion (after `title="..."` close + ">") 
+        # The visible-cell portion (after `title="..."` close + ">")
         # must contain only the truncated `fail` (200 chars + …).
         # The full input had 200 copies — visible cell must have far
         # fewer (≤ 15 fits in 200-char truncation budget; raw render

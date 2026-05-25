@@ -34,6 +34,7 @@ Trust boundary
 """
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import os
@@ -98,7 +99,7 @@ class AgentSpec:
         return obj
 
     @classmethod
-    def validate(cls, obj: dict[str, Any]) -> "AgentSpec":
+    def validate(cls, obj: dict[str, Any]) -> AgentSpec:
         mode = obj.get("mode")
         if mode == "smoke":
             cmd = obj.get("command")
@@ -152,7 +153,7 @@ class AgentRunResult:
 SubprocessRunner = Callable[[Sequence[str]], "subprocess.CompletedProcess[str]"]
 
 
-def _default_runner(argv: Sequence[str]) -> "subprocess.CompletedProcess[str]":
+def _default_runner(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         list(argv),
         check=False,
@@ -472,8 +473,7 @@ def invoke_agent(
 # ── CLI ───────────────────────────────────────────────────────────────────
 
 
-def _build_argparser() -> "argparse.ArgumentParser":
-    import argparse
+def _build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="orchestrator.agent_runner",
         description="Invoke the sandboxed agent for one run_id",
@@ -500,7 +500,6 @@ def _build_argparser() -> "argparse.ArgumentParser":
 
 
 def main(argv: list[str] | None = None) -> int:
-    import argparse
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     args = _build_argparser().parse_args(argv)
     if args.mode == "smoke":

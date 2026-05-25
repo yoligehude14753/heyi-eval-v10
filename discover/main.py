@@ -24,7 +24,6 @@ from .tracker import (
     scan_backfill,
     scan_curated,
     scan_incremental,
-    scan_round,
 )
 
 
@@ -110,7 +109,6 @@ def cmd_once(args: argparse.Namespace) -> int:
     if mode in ("curated", "legacy"):
         new, stats = scan_curated(api, config, cursor)
         kind = "curated"
-        finished = None
     elif mode == "backfill" or (mode == "auto" and not cursor.backfill_complete):
         # PR#52: cursor-aware mirror paginator drains the entire 2026
         # cohort in one round (~30min) by following Link-header `next`
@@ -126,7 +124,7 @@ def cmd_once(args: argparse.Namespace) -> int:
             max_pages=getattr(args, "backfill_max_pages", 2000),
             page_sleep_s=getattr(args, "backfill_page_sleep_s", 0.2),
         )
-        new, stats, finished = scan_backfill(paginator, config, cursor)
+        new, stats, _finished = scan_backfill(paginator, config, cursor)
         kind = "backfill"
     else:
         # Incremental: 1-3 pages of newest models is plenty for a daily
@@ -143,7 +141,6 @@ def cmd_once(args: argparse.Namespace) -> int:
         )
         new, stats = scan_incremental(paginator, config, cursor)
         kind = "incremental"
-        finished = None
 
     n_written = append_candidates(_candidates_path(data_root), new)
     save_cursor(_cursor_path(data_root), cursor)

@@ -42,27 +42,23 @@ import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import MagicMock, patch
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from orchestrator import deploy_repair, stages_py  # noqa: E402
-from orchestrator.config import OrchestratorConfig  # noqa: E402
-from orchestrator.state_machine import Run  # noqa: E402
 
 # Reuse the helpers from the existing PR#33 deploy tests.
 from tests.test_stages_py_deploy import (  # noqa: E402
-    _FakeContainer,
+    _NOP_SLEEP,
     _fake_docker_client,
+    _FakeContainer,
     _make_cfg,
     _make_model_cache,
     _make_run,
-    _NOP_SLEEP,
     _patch_docker,
     _write_engine_plan,
 )
-
 
 # Sample real log lines captured from nv8 (truncated for compactness).
 GGUF_LOG_TAIL = (

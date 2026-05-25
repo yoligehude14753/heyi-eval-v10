@@ -20,11 +20,9 @@ the cache to the tune of 357 GB):
 """
 from __future__ import annotations
 
-import shutil
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest import mock
 
 from orchestrator import model_stager
 

@@ -27,7 +27,6 @@ from unittest import mock
 
 from orchestrator import deploy_repair as dr
 
-
 # ── rule-based: classify() ────────────────────────────────────────────────
 
 
@@ -476,10 +475,11 @@ class TestAttemptAgentRepair(unittest.TestCase):
         return rd, cfg, failure, fake_try_once, fake_propose_repair
 
     def test_agent_succeeds_on_first_proposal(self) -> None:
-        from cc_agent import deploy_repair_agent as agent_mod
-        from orchestrator import stages_py
         import tempfile
         from pathlib import Path
+
+        from cc_agent import deploy_repair_agent as agent_mod
+        from orchestrator import stages_py
 
         with tempfile.TemporaryDirectory() as td:
             rd, cfg, failure, fake_try_once, fake_propose_repair = self._setup(
@@ -518,10 +518,11 @@ class TestAttemptAgentRepair(unittest.TestCase):
         self.assertEqual(len(summary["proposals"]), 1)
 
     def test_agent_exhausted_after_max_attempts(self) -> None:
-        from cc_agent import deploy_repair_agent as agent_mod
-        from orchestrator import stages_py
         import tempfile
         from pathlib import Path
+
+        from cc_agent import deploy_repair_agent as agent_mod
+        from orchestrator import stages_py
 
         # 3 proposals, all return execution failure.
         proposals = [
@@ -562,10 +563,11 @@ class TestAttemptAgentRepair(unittest.TestCase):
         self.assertEqual(len(summary["proposals"]), 3)
 
     def test_agent_parse_failure_does_not_crash_loop(self) -> None:
-        from cc_agent import deploy_repair_agent as agent_mod
-        from orchestrator import stages_py
         import tempfile
         from pathlib import Path
+
+        from cc_agent import deploy_repair_agent as agent_mod
+        from orchestrator import stages_py
 
         with tempfile.TemporaryDirectory() as td:
             rd, cfg, failure, fake_try_once, fake_propose_repair = self._setup(

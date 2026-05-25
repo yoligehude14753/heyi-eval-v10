@@ -49,7 +49,6 @@ import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
 
 # Conservative grace: do NOT touch a cache dir whose mtime is within
 # the last 30 minutes — covers an active download mid-flight, plus an
@@ -245,9 +244,7 @@ def find_evictable(
                 break
 
         # Classify
-        if (now - mtime) < grace_s:
-            status = "in_progress"
-        elif any(s == "in_progress" for _h, s, _t, _r in runs):
+        if (now - mtime) < grace_s or any(s == "in_progress" for _h, s, _t, _r in runs):
             status = "in_progress"
         elif any(s == "ok" for _h, s, _t, _r in runs):
             status = "safe"
@@ -343,11 +340,11 @@ def humansize(b: int) -> str:
 
 
 __all__ = [
+    "DEFAULT_GRACE_S",
+    "DEFAULT_QUOTA_BYTES",
     "CacheEntry",
     "EvictionPlan",
-    "find_evictable",
     "enforce_quota",
+    "find_evictable",
     "humansize",
-    "DEFAULT_QUOTA_BYTES",
-    "DEFAULT_GRACE_S",
 ]

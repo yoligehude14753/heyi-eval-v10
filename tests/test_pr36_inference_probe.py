@@ -38,26 +38,24 @@ import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from orchestrator import capability, deploy_repair, stages_py  # noqa: E402
-from orchestrator.state_machine import Run  # noqa: E402
+from orchestrator import deploy_repair, stages_py  # noqa: E402
 
 # Reuse PR#33 deploy helpers.
 from tests.test_stages_py_deploy import (  # noqa: E402
-    _FakeContainer,
+    _NOP_SLEEP,
     _fake_docker_client,
+    _FakeContainer,
     _make_cfg,
     _make_model_cache,
     _make_run,
-    _NOP_SLEEP,
     _patch_docker,
     _write_engine_plan,
 )
-
 
 # Sample 501 body shape we observed on nv8 from transformers-runner
 TRANSFORMERS_501_BODY = (
@@ -85,7 +83,7 @@ class InferenceProbeTests(unittest.TestCase):
     def test_200_empty_choices_is_not_ok(self):
         with patch.object(stages_py, "_http_post_json") as m:
             m.return_value = (200, {"choices": []}, "")
-            ok, status, excerpt = stages_py._inference_probe(
+            ok, _status, excerpt = stages_py._inference_probe(
                 "http://127.0.0.1:18200"
             )
         self.assertFalse(ok)
@@ -299,7 +297,7 @@ class InferenceProbeInTryOnceTests(unittest.TestCase):
                  patch.object(stages_py, "_http_get_json",
                               return_value=(200, {"data": [{"id": "x"}]})), \
                  patch.object(stages_py, "_http_post_json") as probe:
-                r = stages_py.execute_deploy(
+                stages_py.execute_deploy(
                     run, cfg, sleep=_NOP_SLEEP, enable_repair=False,
                 )
             probe.assert_not_called()
@@ -316,7 +314,7 @@ class InferenceProbeInTryOnceTests(unittest.TestCase):
                  patch.object(stages_py, "_http_get_json",
                               return_value=(200, {"data": [{"id": "x"}]})), \
                  patch.object(stages_py, "_http_post_json") as probe:
-                r = stages_py.execute_deploy(
+                stages_py.execute_deploy(
                     run, cfg, sleep=_NOP_SLEEP, enable_repair=False,
                 )
             probe.assert_not_called()

@@ -63,7 +63,7 @@ def main() -> int:
     if path == "-":
         data = json.load(sys.stdin)
     else:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
     render(data)
     return 0

@@ -31,14 +31,11 @@ This file tests all four fixes.
 from __future__ import annotations
 
 import argparse
-import io
-import json
 import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -100,7 +97,7 @@ class LibraryNameRejectionTests(unittest.TestCase):
 
     def test_diffusers_single_file_rejected(self):
         c = _cand("X/Y", library_name="diffusers-single-file")
-        allow, reason = _enqueue_policy_passes(c, _args())
+        allow, _reason = _enqueue_policy_passes(c, _args())
         self.assertFalse(allow)
 
     def test_transformers_library_passes(self):

@@ -59,7 +59,6 @@ INV_DOC_ALLOWLIST: set[str] = {
     "deploy/agent-sandbox/README.md",
     "docs/RUNBOOK_NV8.md",
     "tests/test_inv16_19_agent_sandbox_static.py",
-    "docs/RUNBOOK_NV8.md",
     "docs/ARCHITECTURE.md",
     "docs/INVARIANTS.md",
     "docs/THREAT_MODEL.md",

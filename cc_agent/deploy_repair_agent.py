@@ -46,7 +46,7 @@ import json
 import logging
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from heyi_engine import HeyiEngineClient, HeyiEngineError
@@ -251,7 +251,7 @@ def _parse_proposal(raw: str) -> dict[str, Any]:
     try:
         obj = json.loads(blob)
     except json.JSONDecodeError as e:
-        raise DeployRepairAgentError(f"invalid JSON: {e}; raw={blob[:200]!r}")
+        raise DeployRepairAgentError(f"invalid JSON: {e}; raw={blob[:200]!r}") from e
     if not isinstance(obj, dict):
         raise DeployRepairAgentError(f"proposal is not an object: {type(obj)}")
     # Schema: required string fields can be missing-and-empty; engine/

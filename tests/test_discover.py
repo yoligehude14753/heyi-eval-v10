@@ -368,7 +368,7 @@ class ScanBackfillTests(unittest.TestCase):
         The 2 models from 2025 must be excluded."""
         pages = _sorted_paginator(_mk_models_by_month())
         cursor = Cursor()
-        new, stats, finished = scan_backfill(pages, self._config(), cursor)
+        new, _stats, finished = scan_backfill(pages, self._config(), cursor)
         self.assertEqual(len(new), 20,
                          f"expected 20 2026 models, got {len(new)}")
         self.assertTrue(finished,

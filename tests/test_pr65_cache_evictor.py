@@ -11,11 +11,8 @@ import json
 import time
 from pathlib import Path
 
-import pytest
-
 from orchestrator.cache_evictor import (
     DEFAULT_GRACE_S,
-    EvictionPlan,
     enforce_quota,
     find_evictable,
 )

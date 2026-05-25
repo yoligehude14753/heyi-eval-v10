@@ -16,7 +16,8 @@ def main(run_ids: list[str]) -> int:
             if os.path.isdir(rd):
                 print("  files:", sorted(os.listdir(rd))[:10])
             continue
-        d = json.load(open(p))
+        with open(p) as fh:
+            d = json.load(fh)
         score = d.get("score")
         rate = d.get("pass_rate")
         cats = list((d.get("categories") or {}).keys())

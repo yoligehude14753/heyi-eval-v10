@@ -63,9 +63,8 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-import time
 from collections.abc import Iterable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -93,7 +92,7 @@ CREATE INDEX IF NOT EXISTS idx_commands_parent    ON commands(parent_audit_id);
 
 
 def _iso_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    return datetime.now(UTC).isoformat(timespec="milliseconds")
 
 
 def init_schema(db_path: Path = DEFAULT_DB_PATH) -> None:

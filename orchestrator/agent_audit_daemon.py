@@ -52,7 +52,7 @@ import struct
 import sys
 import threading
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from . import agent_audit
 
@@ -78,7 +78,7 @@ def _send_json(conn: socket.socket, payload: dict[str, Any]) -> None:
     conn.sendall(data)
 
 
-def _recv_line(conn: socket.socket, limit: int = MAX_REQUEST_BYTES) -> Optional[bytes]:
+def _recv_line(conn: socket.socket, limit: int = MAX_REQUEST_BYTES) -> bytes | None:
     buf = bytearray()
     while len(buf) < limit:
         chunk = conn.recv(min(4096, limit - len(buf)))
@@ -192,7 +192,7 @@ class AuditDaemon:
                 sock.settimeout(1.0)
                 try:
                     conn, _ = sock.accept()
-                except socket.timeout:
+                except TimeoutError:
                     continue
             except OSError as exc:
                 if exc.errno in (errno.EBADF, errno.EINVAL):

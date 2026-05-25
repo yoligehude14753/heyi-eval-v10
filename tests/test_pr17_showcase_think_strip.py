@@ -14,7 +14,6 @@ import unittest
 
 from cc_agent.showcase_runner import _render_items_for_grading, _strip_think
 
-
 # ── T series: pure unit tests for _strip_think ────────────────────────────
 
 

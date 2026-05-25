@@ -130,6 +130,7 @@ class TestPlannerFallbackDiagnostic(unittest.TestCase):
         import io
         import logging
         from unittest import mock
+
         from cc_agent import showcase_runner
 
         # Capture the WARNING log line.

@@ -36,9 +36,7 @@ class ModelDetection:
         if self.capability == cap:
             return True
         # VLM models can answer plain text-chat too
-        if self.capability == "vlm" and cap == "text":
-            return True
-        return False
+        return bool(self.capability == "vlm" and cap == "text")
 
 
 # ── HF transformers model_type → capability ───────────────────────────────

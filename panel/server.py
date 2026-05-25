@@ -31,6 +31,7 @@ from collections import Counter
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 
 DATA_ROOT = Path(os.environ.get("HEYI_EVAL_DATA", "/home/ai/heyi-eval-data"))
 BACKUPS_ROOT = Path(os.environ.get("HEYI_EVAL_BACKUPS", "/home/ai/heyi-eval-backups"))
@@ -109,7 +110,7 @@ def _fmt_bytes(s: str) -> str:
     return f"{n}B"
 
 
-_FAILURE_RULES: list[tuple[re.Pattern[str], "callable"]] = [  # type: ignore[name-defined]
+_FAILURE_RULES: list[tuple[re.Pattern[str], callable]] = [  # type: ignore[name-defined]
     # "aborted at <STAGE>: <reason>" — the orchestrator wraps every
     # downstream skip/error this way. Recurse into the wrapped reason
     # so each layer prints in Chinese ("DEPLOY 阶段中止：磁盘空间不足…").
@@ -208,9 +209,7 @@ def _is_safe_fixture_path(rel: str) -> bool:
         return False
     if _FIXTURE_BAD.search(rel):
         return False
-    if not _FIXTURE_REL_RE.match(rel):
-        return False
-    return True
+    return bool(_FIXTURE_REL_RE.match(rel))
 
 
 def hf_hub_url(hf_id: str | None) -> str:
@@ -797,8 +796,8 @@ def resolve_meta_pills(
     )
     src = "metadata" if (
         (meta or {}).get("publisher") and (
-            (meta["publisher"].get("name") if isinstance(meta["publisher"], dict)
-             else meta["publisher"]))
+            meta["publisher"].get("name") if isinstance(meta["publisher"], dict)
+             else meta["publisher"])
     ) else None
     if not pub_name:
         pub_name = infer_publisher_from_hf_id(hf_id)
@@ -936,8 +935,8 @@ def list_runs() -> list[dict]:
         resolved = resolve_meta_pills(state, meta, curated, discover_art)
         _src = resolved.get("_source", {})
 
-        def _real_or_none(field: str):
-            return resolved[field] if _src.get(field) != "placeholder" else None
+        def _real_or_none(field: str, _r: dict = resolved, _s: dict = _src):
+            return _r[field] if _s.get(field) != "placeholder" else None
 
         publisher_name = _real_or_none("publisher")
         modality_str = _real_or_none("modality")
@@ -2083,7 +2082,6 @@ def render_candidates_page() -> str:
     rows_html = []
     for r in data["rows"]:
         hf_raw = r.get("hf_id") or "-"
-        hf = html.escape(hf_raw)
         hf_attr = html.escape(hf_raw, quote=True)
         st = r.get("status") or "?"
         st_cls = _status_color(st)
@@ -2138,8 +2136,8 @@ def render_candidates_page() -> str:
             action_html = "<span class='muted'>-</span>"
         elif st in ("queued", "in_progress"):
             action_html = (
-                f"<span class='pill run' title='已在队列或评测中，"
-                f"无需重复入队'>排队中</span>"
+                "<span class='pill run' title='已在队列或评测中，"
+                "无需重复入队'>排队中</span>"
             )
         else:
             label = "重测" if st in ("ok", "failed", "aborted") else "立即评测"
@@ -2379,8 +2377,6 @@ def render_results_page() -> str:
     for r in sorted_rows:
         if r.get("hf_id") in (None, "?"):
             continue
-        hf = html.escape(r.get("hf_id") or "-")
-        pub = html.escape(r.get("publisher") or "")
         modality = html.escape(r.get("modality") or "")
         engine = html.escape(r.get("engine") or "")
         license_ = html.escape(r.get("license") or "")

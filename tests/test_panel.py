@@ -8,9 +8,10 @@ from __future__ import annotations
 import json
 import sys
 from unittest import mock as _unittest_mock
+
 unittest_mock_patch_object = _unittest_mock.patch.object
 
-import pytest
+import pytest  # noqa: E402
 
 
 @pytest.fixture
@@ -464,6 +465,7 @@ def fake_lifecycle_root(tmp_path, monkeypatch):
 
     monkeypatch.setenv("HEYI_EVAL_DATA", str(tmp_path))
     import importlib
+
     import panel.server as srv
     importlib.reload(srv)
     return srv, tmp_path
@@ -543,6 +545,7 @@ def test_pr50_lifecycle_empty_data_root_ok(tmp_path, monkeypatch):
     that the panel can render without exploding."""
     monkeypatch.setenv("HEYI_EVAL_DATA", str(tmp_path / "empty"))
     import importlib
+
     import panel.server as srv
     importlib.reload(srv)
     data = srv.candidates_lifecycle()
@@ -578,6 +581,7 @@ def test_pr54_discover_summary_streams_without_full_sort(tmp_path, monkeypatch):
     )
     monkeypatch.setenv("HEYI_EVAL_DATA", str(tmp_path))
     import importlib
+
     import panel.server as srv
     importlib.reload(srv)
     d = srv.discover_summary(top_n=20)
@@ -617,6 +621,7 @@ def test_pr54_lifecycle_sorts_newest_last_modified_first(tmp_path, monkeypatch):
     )
     monkeypatch.setenv("HEYI_EVAL_DATA", str(tmp_path))
     import importlib
+
     import panel.server as srv
     importlib.reload(srv)
     data = srv.candidates_lifecycle()
@@ -699,6 +704,7 @@ def test_pr55_active_then_results_then_discovered_then_orphans(
 
     monkeypatch.setenv("HEYI_EVAL_DATA", str(tmp_path))
     import importlib
+
     import panel.server as srv
     importlib.reload(srv)
     data = srv.candidates_lifecycle()
@@ -753,6 +759,7 @@ def test_pr55_enqueue_route_happy_path(tmp_path, monkeypatch):
     202 with {"ok": true, "run_id": "..."}."""
     monkeypatch.setenv("HEYI_EVAL_DATA", str(tmp_path))
     import importlib
+
     import panel.server as srv
     importlib.reload(srv)
 
@@ -785,6 +792,7 @@ def test_pr55_enqueue_route_happy_path(tmp_path, monkeypatch):
 def test_pr55_enqueue_rejects_bad_hf_id(tmp_path, monkeypatch):
     monkeypatch.setenv("HEYI_EVAL_DATA", str(tmp_path))
     import importlib
+
     import panel.server as srv
     importlib.reload(srv)
     body, status = _post_enqueue(srv, {"hf_id": "../../etc/passwd"})
@@ -795,6 +803,7 @@ def test_pr55_enqueue_rejects_bad_hf_id(tmp_path, monkeypatch):
 def test_pr55_enqueue_rejects_missing_hf_id(tmp_path, monkeypatch):
     monkeypatch.setenv("HEYI_EVAL_DATA", str(tmp_path))
     import importlib
+
     import panel.server as srv
     importlib.reload(srv)
     body, status = _post_enqueue(srv, {})
@@ -805,6 +814,7 @@ def test_pr55_enqueue_rejects_missing_hf_id(tmp_path, monkeypatch):
 def test_pr55_enqueue_duplicate_returns_409(tmp_path, monkeypatch):
     monkeypatch.setenv("HEYI_EVAL_DATA", str(tmp_path))
     import importlib
+
     import panel.server as srv
     importlib.reload(srv)
 
@@ -831,6 +841,7 @@ def test_pr55_enqueue_duplicate_returns_409(tmp_path, monkeypatch):
 def test_pr55_enqueue_rejects_oversize_body(tmp_path, monkeypatch):
     monkeypatch.setenv("HEYI_EVAL_DATA", str(tmp_path))
     import importlib
+
     import panel.server as srv
     importlib.reload(srv)
     big = {"hf_id": "x/y", "junk": "a" * 5000}
@@ -844,6 +855,7 @@ def test_pr55_get_does_not_expose_enqueue(tmp_path, monkeypatch):
     contractually read-only."""
     monkeypatch.setenv("HEYI_EVAL_DATA", str(tmp_path))
     import importlib
+
     import panel.server as srv
     importlib.reload(srv)
     from io import BytesIO
@@ -1079,8 +1091,8 @@ def test_pr58_candidates_lifecycle_carries_params_and_zh(
 def test_pr56_enqueue_policy_whitelist_bypasses_low_signal_gate():
     """PR#56: whitelist/both/manual candidates must NOT be rejected for
     being below the dl/likes threshold — we already trust the vendor."""
-    import importlib
     import argparse
+    import importlib
     m = importlib.import_module("discover.main")
     # A whitelist candidate with rock-bottom signal: should still pass.
     class _Cand:
@@ -1108,8 +1120,8 @@ def test_pr56_enqueue_policy_whitelist_bypasses_low_signal_gate():
 
 
 def test_pr56_enqueue_policy_still_rejects_private_gated():
-    import importlib
     import argparse
+    import importlib
     m = importlib.import_module("discover.main")
     class _C:
         hf_id = "x/y"

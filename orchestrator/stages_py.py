@@ -641,7 +641,7 @@ def execute_deploy(
             # sleep + the brief container.reload() RPC, so iteration
             # count and wall-clock are equivalent. We add 1 to round up
             # so a 20 s window with 0.5 s step → 40 iterations.
-            n_steps = max(1, int(round(early_crash_window_s / poll_step_s)))
+            n_steps = max(1, round(early_crash_window_s / poll_step_s))
             died = False
             models_listed = False
             for _ in range(n_steps):
@@ -955,7 +955,6 @@ def execute_deploy(
                 logs=info.get("logs", ""),
             )
 
-        container = info["container"]
         base_url = f"http://127.0.0.1:{port}"
         deploy_payload = {
             "stage": "DEPLOY",
@@ -1062,8 +1061,8 @@ def _attempt_agent_repair(
     the agent itself failed to propose anything usable.
     """
     try:
-        from heyi_engine import HeyiEngineClient
         from cc_agent import deploy_repair_agent as agent_mod
+        from heyi_engine import HeyiEngineClient
     except Exception as e:  # pragma: no cover — env misconfig only
         return {
             "ok": False,

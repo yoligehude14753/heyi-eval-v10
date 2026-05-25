@@ -258,7 +258,7 @@ def _execute_metadata_stage(
         siblings: list[str] = []
         try:
             siblings = list(api.list_repo_files(run.hf_id))
-        except Exception as fe:  # noqa: BLE001
+        except Exception as fe:
             print(f"  [metadata] list_repo_files non-fatal: "
                   f"{type(fe).__name__}: {fe}")
         hf_info = {
@@ -463,6 +463,7 @@ def _execute_stage_model_stage(
     are skipped without download).
     """
     import json as _json
+
     from . import model_stager
     t0 = time.time()
     rd = cfg.run_dir(run.run_id)

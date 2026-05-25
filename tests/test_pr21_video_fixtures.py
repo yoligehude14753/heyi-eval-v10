@@ -25,7 +25,6 @@ from pathlib import Path
 
 from orchestrator import capability
 
-
 REPO = Path(capability.__file__).resolve().parent.parent
 VIDEOS_DIR = capability.FIXTURES_DIR / "videos"
 EXPECTED_VIDEOS = (
@@ -181,7 +180,7 @@ class GracefulDegradationWithoutFfmpeg(unittest.TestCase):
             # Just to be safe, also add a no-ffmpeg shim dir
             shim_dir = Path(fake_home) / "shim"
             shim_dir.mkdir()
-            env_path = ":".join([str(shim_dir)] + keep_path)
+            env_path = ":".join([str(shim_dir), *keep_path])
             res = subprocess.run(
                 [sys.executable, str(script)],
                 env={"PATH": env_path, "HOME": fake_home},

@@ -13,12 +13,11 @@ import subprocess
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest import mock
 
 from orchestrator import agent_audit, agent_runner
 
 
-def _cp(stdout: str = "", stderr: str = "", rc: int = 0) -> "subprocess.CompletedProcess[str]":
+def _cp(stdout: str = "", stderr: str = "", rc: int = 0) -> subprocess.CompletedProcess[str]:
     return subprocess.CompletedProcess(args=[], returncode=rc, stdout=stdout, stderr=stderr)
 
 
@@ -71,9 +70,8 @@ class TestRunIdValidation(unittest.TestCase):
             cfg = _make_cfg(Path(td))
             spec = agent_runner.AgentSpec(mode="smoke", command="x")
             for bad in ("", "../etc", "a/b", "x" * 65, "-leading-dash", " spaced "):
-                with self.subTest(bad=bad):
-                    with self.assertRaises(agent_runner.AgentRunnerError):
-                        agent_runner.write_spec(spec, run_id=bad, cfg=cfg)
+                with self.subTest(bad=bad), self.assertRaises(agent_runner.AgentRunnerError):
+                    agent_runner.write_spec(spec, run_id=bad, cfg=cfg)
 
 
 class TestHarvestOutbox(unittest.TestCase):

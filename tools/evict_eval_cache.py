@@ -32,7 +32,7 @@ from pathlib import Path
 _HERE = Path(__file__).resolve()
 sys.path.insert(0, str(_HERE.parent.parent))
 
-from orchestrator.cache_evictor import (
+from orchestrator.cache_evictor import (  # noqa: E402
     DEFAULT_GRACE_S,
     DEFAULT_QUOTA_BYTES,
     enforce_quota,

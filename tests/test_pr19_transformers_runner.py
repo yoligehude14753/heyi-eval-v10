@@ -7,14 +7,11 @@ on CPU-only machines.
 """
 from __future__ import annotations
 
-import io
 import json
 import socket
 import threading
-import time
 import unittest
 import urllib.request
-from http import HTTPStatus
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -22,7 +19,6 @@ from urllib.error import HTTPError
 
 from transformers_runner import detect as detect_mod
 from transformers_runner import server as server_mod
-
 
 # ── detect.py ─────────────────────────────────────────────────────────────
 
@@ -359,7 +355,7 @@ class _FakeTokenizer:
 class _FakeModel:
     device = "cpu"
 
-    def generate(self, **kwargs):  # noqa: ARG002
+    def generate(self, **kwargs):
         class _Out:
             shape = (1, 12)
             def __getitem__(self, _i):

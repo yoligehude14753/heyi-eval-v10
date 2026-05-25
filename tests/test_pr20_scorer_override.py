@@ -11,10 +11,8 @@ from __future__ import annotations
 import json
 import unittest
 from pathlib import Path
-from tempfile import TemporaryDirectory
 
 from orchestrator import capability
-
 
 # ── _score_non_empty_output unit tests ────────────────────────────────────
 

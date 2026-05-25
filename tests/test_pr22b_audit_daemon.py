@@ -21,7 +21,6 @@ import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest import mock
 
 from orchestrator import agent_audit, agent_audit_daemon
 
@@ -162,7 +161,7 @@ class TestPeerCredEnforcement(unittest.TestCase):
     def tearDown(self) -> None:
         self._td.cleanup()
 
-    def _run_daemon(self, expect_uid: int) -> "agent_audit_daemon.AuditDaemon":
+    def _run_daemon(self, expect_uid: int) -> agent_audit_daemon.AuditDaemon:
         # apply_socket_perms=False so the test process (non-root on dev
         # machines) doesn't try to chown the socket to root.
         daemon = agent_audit_daemon.AuditDaemon(

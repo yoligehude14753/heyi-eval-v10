@@ -17,7 +17,7 @@ def main(hf_id: str) -> int:
     if not row:
         print("no runs for", hf_id)
         return 1
-    d = dict(zip(cols, row))
+    d = dict(zip(cols, row, strict=False))
     print("\nlatest run:")
     for k, v in d.items():
         if isinstance(v, str) and len(v) > 80:
@@ -25,14 +25,14 @@ def main(hf_id: str) -> int:
         print(f"  {k:20s} = {v!r}")
     rid = d["run_id"]
     rd = Path(f"/home/ai/heyi-eval-data/runs/{rid}")
-    print(f"\n_meta/ files:")
+    print("\n_meta/ files:")
     for p in sorted((rd / "_meta").glob("*.json")):
         print(f"  {p.name}: {p.stat().st_size}B")
 
     drp = rd / "_meta" / "deploy_repair.json"
     if drp.exists():
         rep = json.loads(drp.read_text())
-        print(f"\n=== deploy_repair.json ===")
+        print("\n=== deploy_repair.json ===")
         print(f"  ok                  : {rep.get('ok')}")
         print(f"  winning_strategy    : {rep.get('winning_strategy')!r}")
         print(f"  failure_class       : {rep.get('failure_class')!r}")
@@ -52,7 +52,7 @@ def main(hf_id: str) -> int:
                 print(f"        err: {err[:100]}")
         agent = rep.get("agent_escalation") or {}
         if agent:
-            print(f"\n  agent_escalation:")
+            print("\n  agent_escalation:")
             print(f"    ok    : {agent.get('ok')}")
             print(f"    phase : {agent.get('phase')!r}")
             for p in agent.get("proposals", []):

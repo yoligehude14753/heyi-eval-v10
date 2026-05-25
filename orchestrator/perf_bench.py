@@ -28,10 +28,10 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from orchestrator import capability as _cap
 from orchestrator.config import OrchestratorConfig

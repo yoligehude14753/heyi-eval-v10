@@ -27,10 +27,11 @@ import logging
 import os
 import threading
 import time
+from collections.abc import Callable
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from .detect import Capability, ModelDetection, detect
 
@@ -144,7 +145,7 @@ class _PipelineCache:
                 return None, self._errors[cap]
             try:
                 inst = builder()
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 msg = f"pipeline build failed: {type(e).__name__}: {e}"
                 self._errors[cap] = msg
                 return None, msg
@@ -156,8 +157,8 @@ class _PipelineCache:
 
 
 def _build_text_pipeline(model_path: str) -> Any:
-    from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: PLC0415
-    import torch  # noqa: PLC0415
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
@@ -168,8 +169,8 @@ def _build_text_pipeline(model_path: str) -> Any:
 
 
 def _build_vlm_pipeline(model_path: str) -> Any:
-    from transformers import AutoProcessor, AutoModelForVision2Seq  # noqa: PLC0415
-    import torch  # noqa: PLC0415
+    import torch
+    from transformers import AutoModelForVision2Seq, AutoProcessor
 
     proc = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
     model = AutoModelForVision2Seq.from_pretrained(
@@ -180,8 +181,8 @@ def _build_vlm_pipeline(model_path: str) -> Any:
 
 
 def _build_asr_pipeline(model_path: str) -> Any:
-    from transformers import pipeline as hf_pipeline  # noqa: PLC0415
-    import torch  # noqa: PLC0415
+    import torch
+    from transformers import pipeline as hf_pipeline
 
     # Blackwell (sm_120) prefers bf16 over fp16 for cuBLAS Lt heuristics;
     # fp16 occasionally trips CUBLAS_STATUS_NOT_INITIALIZED on the
@@ -202,16 +203,16 @@ def _build_asr_pipeline(model_path: str) -> Any:
 
 
 def _build_tts_pipeline(model_path: str) -> Any:
-    from transformers import pipeline as hf_pipeline  # noqa: PLC0415
-    import torch  # noqa: PLC0415
+    import torch
+    from transformers import pipeline as hf_pipeline
 
     device = 0 if torch.cuda.is_available() else -1
     return hf_pipeline("text-to-speech", model=model_path, device=device)
 
 
 def _build_image_gen_pipeline(model_path: str) -> Any:
-    from diffusers import DiffusionPipeline  # noqa: PLC0415
-    import torch  # noqa: PLC0415
+    import torch
+    from diffusers import DiffusionPipeline
 
     return DiffusionPipeline.from_pretrained(
         model_path, torch_dtype=torch.bfloat16,
@@ -219,8 +220,8 @@ def _build_image_gen_pipeline(model_path: str) -> Any:
 
 
 def _build_video_gen_pipeline(model_path: str) -> Any:
-    from diffusers import DiffusionPipeline  # noqa: PLC0415
-    import torch  # noqa: PLC0415
+    import torch
+    from diffusers import DiffusionPipeline
 
     return DiffusionPipeline.from_pretrained(
         model_path, torch_dtype=torch.bfloat16,
@@ -228,8 +229,8 @@ def _build_video_gen_pipeline(model_path: str) -> Any:
 
 
 def _build_music_gen_pipeline(model_path: str) -> Any:
-    from transformers import AutoProcessor, MusicgenForConditionalGeneration  # noqa: PLC0415
-    import torch  # noqa: PLC0415
+    import torch
+    from transformers import AutoProcessor, MusicgenForConditionalGeneration
 
     proc = AutoProcessor.from_pretrained(model_path)
     model = MusicgenForConditionalGeneration.from_pretrained(
@@ -288,7 +289,7 @@ def _infer_asr(pipeline_obj: Any, audio_bytes: bytes) -> str:
     # HF pipeline accepts bytes directly when given a file-like via tmp;
     # most ASR pipelines also accept raw numpy. We write to /tmp to keep
     # the path simple and avoid pulling in librosa here.
-    import tempfile  # noqa: PLC0415
+    import tempfile
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
         tmp.write(audio_bytes)
         tmp.flush()
@@ -302,8 +303,9 @@ def _infer_asr(pipeline_obj: Any, audio_bytes: bytes) -> str:
 
 def _infer_tts(pipeline_obj: Any, text: str) -> bytes:
     """Returns WAV bytes (16-bit PCM, mono)."""
-    import numpy as np  # noqa: PLC0415
-    import wave  # noqa: PLC0415
+    import wave
+
+    import numpy as np
 
     out = pipeline_obj(text)
     audio = out.get("audio") if isinstance(out, dict) else None
@@ -340,10 +342,10 @@ class _Handler(BaseHTTPRequestHandler):
     state: ServerState  # set by serve_main via subclass
 
     # Quieter access log: route + status + size.
-    def log_message(self, fmt: str, *args: Any) -> None:  # noqa: A003
+    def log_message(self, fmt: str, *args: Any) -> None:
         logger.info("%s", fmt % args)
 
-    def do_GET(self) -> None:  # noqa: N802
+    def do_GET(self) -> None:
         if self.path in ("/health", "/healthz"):
             _json_response(self, HTTPStatus.OK, {
                 "status": "ok",
@@ -367,7 +369,7 @@ class _Handler(BaseHTTPRequestHandler):
             "error": {"kind": "not_found", "message": f"no GET {self.path}"}
         })
 
-    def do_POST(self) -> None:  # noqa: N802
+    def do_POST(self) -> None:
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
@@ -430,7 +432,7 @@ class _Handler(BaseHTTPRequestHandler):
                 text, usage = _infer_text(pipe_for_text, messages, max_new)
             else:
                 text, usage = _infer_text(pipe, messages, max_new)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {
                 "error": {"kind": "inference",
                           "message": f"{type(e).__name__}: {e}"}
@@ -485,7 +487,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
         try:
             text = _infer_asr(pipe, audio)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {
                 "error": {"kind": "inference",
                           "message": f"{type(e).__name__}: {e}"}
@@ -522,7 +524,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
         try:
             wav = _infer_tts(pipe, text)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {
                 "error": {"kind": "inference",
                           "message": f"{type(e).__name__}: {e}"}
@@ -560,7 +562,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
         try:
             png = _infer_image_gen(pipe, prompt)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {
                 "error": {"kind": "inference",
                           "message": f"{type(e).__name__}: {e}"}

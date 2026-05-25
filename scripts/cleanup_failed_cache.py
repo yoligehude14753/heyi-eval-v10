@@ -39,7 +39,6 @@ from orchestrator.model_stager import (  # noqa: E402
     GGUF_PREFERRED_QUANT,
     _cleanup_partial,
     _has_weight_file,
-    _looks_like_gguf_repo,
 )
 
 

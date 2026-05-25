@@ -42,9 +42,10 @@ import json
 import os
 import shutil
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 # Stay aligned with the existing PR#11 / PR#23 graceful-skip vocabulary.
 GRACEFUL_DISK_FULL = "disk_full"
@@ -273,9 +274,8 @@ def _estimate_size_bytes(metadata: dict[str, Any],
             size = sib.get("size") or sib.get("lfs", {}).get("size") if isinstance(sib.get("lfs"), dict) else sib.get("size")
             if not isinstance(size, int) or size <= 0:
                 continue
-            if allow_patterns:
-                if not any(fnmatch(name, pat) for pat in allow_patterns):
-                    continue
+            if allow_patterns and not any(fnmatch(name, pat) for pat in allow_patterns):
+                continue
             total += size
             matched += 1
         if matched > 0:
@@ -316,9 +316,7 @@ def _looks_like_gguf_repo(hf_id: str, metadata: dict[str, Any]) -> bool:
         1 for s in sib
         if isinstance(s, dict) and (s.get("rfilename") or "").lower().endswith(".gguf")
     )
-    if sib and gguf_count >= max(1, len(sib) // 2):
-        return True
-    return False
+    return bool(sib and gguf_count >= max(1, len(sib) // 2))
 
 
 def _compute_allow_patterns(hf_id: str,
@@ -563,7 +561,7 @@ def ensure_model_staged(
                     f"quota {cache_quota_bytes / 1e9:.0f} GB)",
                     file=_sys.stderr,
                 )
-        except Exception as _e:  # noqa: BLE001
+        except Exception as _e:
             # LRU is best-effort — never block staging on eviction errors.
             import sys as _sys
             print(f"[model_stager] LRU eviction failed: {_e}",

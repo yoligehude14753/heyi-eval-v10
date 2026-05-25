@@ -29,7 +29,6 @@ import json
 import os
 import socket
 import sys
-from pathlib import Path
 
 DEFAULT_SOCKET = "/run/heyi-eval-agent-audit.sock"
 TIMEOUT_S = 5.0
