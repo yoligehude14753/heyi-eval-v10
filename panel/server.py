@@ -1617,78 +1617,102 @@ INDEX_HTML = """<!doctype html>
 <html lang="zh">
 <head>
 <meta charset="utf-8">
-<title>heyi-eval-v9 panel</title>
+<title>heyi-eval · 管理面板</title>
+__PANEL_STYLES__
 <style>
-  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-         background: #0c0c10; color: #e7e7ea; margin: 0; padding: 0; }
-  header { padding: 16px 24px; background: #14141a; border-bottom: 1px solid #26262e; }
-  header h1 { margin: 0; font-size: 18px; font-weight: 600; }
-  header .sub { color: #8a8a96; font-size: 12px; margin-top: 4px; }
-  main { padding: 18px 24px 80px; max-width: 1400px; margin: 0 auto; }
-  section { background: #14141a; border: 1px solid #26262e; border-radius: 8px;
-            padding: 14px 18px; margin-bottom: 16px; }
-  section h2 { font-size: 14px; margin: 0 0 12px; color: #a9a9b6; font-weight: 600;
-               text-transform: uppercase; letter-spacing: 0.04em; }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid #20202a; }
-  th { color: #8a8a96; font-weight: 500; font-size: 11px;
-       text-transform: uppercase; letter-spacing: 0.05em; }
-  tr:hover td { background: #1a1a22; }
-  .ok    { color: #5ad48d; }
-  .warn  { color: #e9b870; }
-  .err   { color: #ef5f64; }
-  .muted { color: #6a6a76; }
-  .pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px;
-          background: #20202a; color: #b8b8c4; }
-  .pill.ok  { background: #1a3a26; color: #5ad48d; }
-  .pill.err { background: #3a1a1f; color: #ef5f64; }
-  .pill.run { background: #1a2a3a; color: #6ec0ff; }
-  .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
-  .stat { padding: 10px 14px; background: #1a1a22; border-radius: 6px; }
-  .stat .label { color: #8a8a96; font-size: 11px;
-                 text-transform: uppercase; letter-spacing: 0.05em; }
-  .stat .value { font-size: 22px; margin-top: 4px; font-weight: 500; }
-  a { color: #6ec0ff; text-decoration: none; }
-  a:hover { text-decoration: underline; }
-  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
-  .stage-row td { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-                  font-size: 12px; }
-  details { margin-top: 8px; }
-  summary { cursor: pointer; color: #8a8a96; font-size: 12px; }
-  pre { background: #08080c; border: 1px solid #20202a; border-radius: 4px;
-        padding: 10px; font-size: 11px; overflow-x: auto; max-height: 360px; }
+/* PR#66: dashboard-only extras on top of the shared _PANEL_STYLES.
+   Grid + stat box variants used by the JS-populated KPI strips. */
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
+.grid.cols-2{grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}
+.stat{padding:12px 16px;background:var(--bg-card-2);border:1px solid var(--border);
+  border-radius:8px;display:flex;flex-direction:column;gap:4px;min-height:64px;
+  transition:border-color 0.15s}
+.stat:hover{border-color:var(--border-2)}
+.stat .label{color:var(--text-3);font-size:10px;text-transform:uppercase;
+  letter-spacing:0.06em;font-weight:600}
+.stat .value{font-size:22px;font-weight:600;color:var(--text);font-variant-numeric:tabular-nums}
+.stat .value.ok{color:var(--accent-2)}
+.stat .value.err{color:var(--err)}
+.stat .value.warn{color:var(--warn)}
+.stat .value.muted{color:var(--text-3)}
+.stage-row td{font-family:var(--mono);font-size:12px}
+.section-link{font-size:12px;font-weight:400;margin-left:10px;color:var(--accent);
+  text-decoration:none}
+.section-link:hover{text-decoration:underline}
+.page-nav{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+.page-nav a{background:var(--bg-card-2);border:1px solid var(--border);
+  border-radius:6px;padding:6px 14px;font-size:12px;color:var(--text-2);
+  text-decoration:none;transition:all 0.15s}
+.page-nav a:hover{border-color:var(--accent);color:var(--accent);text-decoration:none}
+.page-nav a.active{background:var(--accent);border-color:var(--accent);color:#0a0a10;font-weight:600}
+.refresh-bar{display:flex;align-items:center;gap:10px;font-size:12px;color:var(--text-3);
+  margin-top:6px}
+.refresh-bar .dot{width:8px;height:8px;border-radius:50%;background:var(--accent-2);
+  display:inline-block;animation:pulse 2s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.35}}
+.queue-summary{font-size:13px;color:var(--text-2);padding:8px 0 12px;
+  border-bottom:1px solid var(--border);margin-bottom:10px}
+.queue-summary strong{color:var(--text);font-size:15px;font-variant-numeric:tabular-nums}
+/* Utility colour classes (used by JS-rendered cells) */
+.ok{color:var(--accent-2)}
+.err{color:var(--err)}
+.warn{color:var(--warn)}
+.run{color:var(--info)}
+/* Legacy pill class aliases — JS still emits "pill ok" not "pill pill-ok" */
+.pill.ok{background:#15331f;color:#5ad48d;border-color:#1f4a2d}
+.pill.err{background:#3a1820;color:#ef5f64;border-color:#5a232f}
+.pill.warn{background:#3a2a18;color:#e9b870;border-color:#5a4322}
+.pill.run{background:#1a2245;color:#a8aaf7;border-color:#2f3a6a}
+.pill.muted{background:#1a1a22;color:#6a6a76;border-color:#262630}
+/* Tighten the section table chrome */
+.card-section table{width:100%;border-collapse:collapse;font-size:13px}
+.card-section th,.card-section td{text-align:left;padding:8px 10px;
+  border-bottom:1px solid var(--border);vertical-align:top}
+.card-section th{color:var(--text-3);font-weight:600;font-size:10px;
+  text-transform:uppercase;letter-spacing:0.06em}
+.card-section tr:hover td{background:rgba(124,183,255,0.04)}
+.card-section .stage-row td{font-family:var(--mono);font-size:12px}
 </style>
 </head>
 <body>
-<header>
-  <h1>heyi-eval-v9 · 管理面板</h1>
-  <div class="sub" id="updated">loading…</div>
+<header class='page-header'>
+  <h1 class='page-title'>heyi-eval · 管理面板</h1>
+  <div class='page-nav'>
+    <a href='/' class='active'>主面板</a>
+    <a href='/results'>评测结果</a>
+    <a href='/candidates'>候选模型</a>
+  </div>
+  <div class='refresh-bar'>
+    <span class='dot'></span>
+    <span id='updated'>loading…</span>
+  </div>
 </header>
 <main>
 
-  <section>
+  <section class='card-section'>
     <h2>系统健康</h2>
     <div class="grid" id="health-grid"></div>
-    <details><summary>详情 JSON</summary><pre id="health-json"></pre></details>
+    <details class='raw-section'><summary>详情 JSON</summary><pre id="health-json"></pre></details>
   </section>
 
-  <section>
-    <h2>数据备份 (30min rsync · 7d 保留)</h2>
+  <section class='card-section'>
+    <h2>数据备份 · 30min rsync · 7d 保留</h2>
     <div class="grid" id="backup-grid"></div>
-    <details><summary>最近 snapshots</summary><pre id="backup-snapshots"></pre></details>
+    <details class='raw-section'><summary>最近 snapshots</summary><pre id="backup-snapshots"></pre></details>
   </section>
 
-  <section>
+  <section class='card-section'>
     <h2>队列（待评测）</h2>
-    <div id="queue-summary" class="muted">loading…</div>
+    <div id="queue-summary" class="queue-summary">loading…</div>
     <table id="queue-table" data-table data-table-name="queue"><thead><tr>
       <th data-sort="text">run_id</th>
       <th data-sort="text" data-filter="search" data-filter-label="模型">hf_id</th>
     </tr></thead><tbody></tbody></table>
   </section>
 
-  <section>
-    <h2>评测结果总览 <a href="/results" style="font-size:11px;font-weight:normal;margin-left:8px">查看完整结果表 →</a></h2>
+  <section class='card-section'>
+    <h2>评测结果总览
+      <a href="/results" class='section-link'>查看完整结果表 →</a></h2>
     <div class="grid" id="results-grid"></div>
     <table id="results-table" data-table data-table-name="results"><thead><tr>
       <th data-sort="text" data-filter="search" data-filter-label="模型">hf_id</th>
@@ -1704,7 +1728,7 @@ INDEX_HTML = """<!doctype html>
     </tr></thead><tbody></tbody></table>
   </section>
 
-  <section>
+  <section class='card-section'>
     <h2>9 阶段状态明细</h2>
     <table id="runs-table" data-table data-table-name="runs"><thead><tr>
       <th>run_id</th>
@@ -1717,13 +1741,14 @@ INDEX_HTML = """<!doctype html>
     </tr></thead><tbody></tbody></table>
   </section>
 
-  <section>
-    <h2>discover 候选概览 <a href="/candidates" style="font-size:11px;font-weight:normal;margin-left:8px">查看完整候选生命周期 →</a></h2>
+  <section class='card-section'>
+    <h2>discover 候选概览
+      <a href="/candidates" class='section-link'>查看完整候选生命周期 →</a></h2>
     <div class="grid" id="discover-grid"></div>
-    <details><summary>Top 20 by downloads</summary><pre id="discover-top"></pre></details>
+    <details class='raw-section'><summary>Top 20 by downloads</summary><pre id="discover-top"></pre></details>
   </section>
 
-  <section>
+  <section class='card-section'>
     <h2>近期通知（outbox）</h2>
     <table id="outbox-table"><thead><tr>
       <th>时间</th><th>类型</th><th>级别</th><th>标题</th>
@@ -1755,7 +1780,11 @@ function pillStatus(s) {
 // PR#60: client-side equivalent of panel.server.hf_link — every place
 // that prints a model id on the dashboard tables uses this so users
 // can jump to either the model card on HF or the local run detail.
-function escHTML(s){return String(s||'').replace(/[&<>\"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));}
+function escHTML(s){
+  const m={'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;'};
+  m[String.fromCharCode(34)]='&quot;';
+  return String(s||'').replace(/[&<>"']/g, function(c){return m[c];});
+}
 function hfLinkJS(hfId, runId, showIcon) {
   if (!hfId || hfId === '?') return '<span class="muted">-</span>';
   const safe = escHTML(hfId);
@@ -3021,8 +3050,16 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "/" or path == "":
                 # PR#64: append data-table toolkit JS so the dashboard
-                # results / runs / queue tables get sort + filter UI too.
-                self._html(INDEX_HTML.replace("</body>", _TABLE_TOOLKIT_JS + "</body>"))
+                # results / runs / queue tables get sort + filter UI.
+                # PR#66: substitute the shared _PANEL_STYLES so the
+                # main dashboard matches the polished /results +
+                # /candidates chrome instead of the old flat skeleton.
+                html_out = (
+                    INDEX_HTML
+                    .replace("__PANEL_STYLES__", _PANEL_STYLES)
+                    .replace("</body>", _TABLE_TOOLKIT_JS + "</body>")
+                )
+                self._html(html_out)
             elif path == "/api/health":
                 self._json(health_summary())
             elif path == "/api/runs":
