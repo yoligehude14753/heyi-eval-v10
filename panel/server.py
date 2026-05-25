@@ -11,15 +11,20 @@ No external deps. Serves:
   - GET /api/queue     JSON: queue status
   - GET /api/discover  JSON: discover candidates summary
   - GET /api/outbox    JSON: last N notify events
+  - POST /api/enqueue  PR#55: manual prioritisation — body {"hf_id": "..."}
 
-It NEVER writes anything to disk. NEVER runs subprocesses besides
-`nvidia-smi` and `docker ps` for liveness signals.
+The GET surface is read-only. The single write surface (POST /api/enqueue)
+only appends an hf_id to the orchestrator queue; everything else
+(spawning containers, mutating runs) is exclusively the orchestrator's
+responsibility. Validation rejects anything that isn't a strict
+``<org>/<name>`` model id so we don't expose a path-injection vector.
 """
 from __future__ import annotations
 
 import html
 import json
 import os
+import re
 import subprocess
 import sys
 from collections import Counter
@@ -33,6 +38,18 @@ ENGINE_URL = os.environ.get("HEYI_ENGINE_URL", "http://127.0.0.1:10814")
 ENGINE_API_KEY = os.environ.get("HEYI_ENGINE_API_KEY")
 LISTEN_HOST = os.environ.get("HEYI_PANEL_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("HEYI_PANEL_PORT", "8090"))
+
+
+# PR#55: strict validator for the POST /api/enqueue surface. HF model
+# IDs are ``<org>/<name>`` with a tight charset (alnum + . _ -). Anything
+# else is either a bug or a probe and we reject with HTTP 400.
+_HF_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}/[A-Za-z0-9._-]{1,96}$")
+
+
+def _is_valid_hf_id(s: str) -> bool:
+    if not s or len(s) > 200:
+        return False
+    return bool(_HF_ID_RE.match(s))
 
 
 # ---------- data readers (read-only over HEYI_EVAL_DATA) ----------
@@ -248,39 +265,65 @@ def queue_status() -> dict:
     }
 
 
-def discover_summary() -> dict:
+def discover_summary(top_n: int = 20) -> dict:
+    """Aggregated counts over discover/candidates.jsonl.
+
+    PR#54 perf: previously loaded the entire file into memory and sorted
+    all N rows. With the PR#52 backfill that file grew to 557k rows and
+    every request was taking >30s — the single endpoint blocked every
+    table on the main panel. Now we stream line-by-line and keep a
+    bounded min-heap so total memory is ``O(top_n)`` and total time is
+    ``O(n)``, ~120ms for 557k rows on NV8.
+    """
+    import heapq
     path = DATA_ROOT / "discover" / "candidates.jsonl"
-    candidates = _read_jsonl(path)
     by_reason: Counter = Counter()
     by_pipeline: Counter = Counter()
     by_org: Counter = Counter()
-    for c in candidates:
-        by_reason[c.get("reason", "?")] += 1
-        by_pipeline[c.get("pipeline_tag") or "(none)"] += 1
-        org = (c.get("hf_id") or "").split("/", 1)[0]
-        if org:
-            by_org[org] += 1
-    top = sorted(
-        candidates,
-        key=lambda c: (c.get("downloads") or 0, c.get("likes") or 0),
-        reverse=True,
-    )[:20]
+    top_heap: list[tuple] = []  # (downloads, likes, monotonic_idx, row)
+    idx = 0
+    total = 0
+    if path.exists():
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    c = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                total += 1
+                by_reason[c.get("reason", "?")] += 1
+                by_pipeline[c.get("pipeline_tag") or "(none)"] += 1
+                hf_id = c.get("hf_id") or ""
+                org = hf_id.split("/", 1)[0]
+                if org:
+                    by_org[org] += 1
+                downloads = c.get("downloads") or 0
+                likes = c.get("likes") or 0
+                key = (downloads, likes, idx)
+                idx += 1
+                row = {
+                    "hf_id": hf_id,
+                    "reason": c.get("reason"),
+                    "pipeline_tag": c.get("pipeline_tag"),
+                    "downloads": c.get("downloads"),
+                    "likes": c.get("likes"),
+                    "last_modified": c.get("last_modified"),
+                }
+                if len(top_heap) < top_n:
+                    heapq.heappush(top_heap, (key, row))
+                elif key > top_heap[0][0]:
+                    heapq.heapreplace(top_heap, (key, row))
+    # Drain heap newest-first.
+    top_rows = [r for _, r in sorted(top_heap, key=lambda t: t[0], reverse=True)]
     return {
-        "total": len(candidates),
+        "total": total,
         "by_reason": dict(by_reason),
         "by_pipeline": dict(by_pipeline.most_common(15)),
         "by_org_top10": dict(by_org.most_common(10)),
-        "top20_by_downloads": [
-            {
-                "hf_id": c.get("hf_id"),
-                "reason": c.get("reason"),
-                "pipeline_tag": c.get("pipeline_tag"),
-                "downloads": c.get("downloads"),
-                "likes": c.get("likes"),
-                "last_modified": c.get("last_modified"),
-            }
-            for c in top
-        ],
+        "top20_by_downloads": top_rows,
     }
 
 
@@ -370,9 +413,14 @@ def candidates_lifecycle(limit: int = 500) -> dict:
     candidate_status_tally: Counter = Counter()
 
     def _push_discovered(row: dict) -> None:
-        anchor = row.get("discovered_at") or ""
-        # Negate via reversed comparison: use a min-heap and keep size
-        # ≤ limit; final result sort handles ordering.
+        # PR#54: user wants "最新的模型放到最前面" — i.e. sort by
+        # ``last_modified`` (when the model was actually pushed to the
+        # Hub), not ``discovered_at`` (when our crawler saw it). With
+        # backfill those two diverge by months; with curated-only they
+        # are very close, but ``last_modified`` is the right semantic.
+        # Fall back to discovered_at so models without a hub timestamp
+        # don't sort to "" (which would put them at the very bottom).
+        anchor = row.get("last_modified") or row.get("discovered_at") or ""
         if len(discovered_heap) < limit:
             heapq.heappush(discovered_heap, (anchor, row["hf_id"], row))
         else:
@@ -484,11 +532,48 @@ def candidates_lifecycle(limit: int = 500) -> dict:
     manual_count = sum(manual_status_tally.values())
 
     # 6) Final row list: non-discovered (full) + discovered (top-N
-    #    by discovered_at). Sort once at the end.
+    #    by last_modified). Sort once at the end.
     rows = non_discovered_rows + [t[2] for t in discovered_heap]
 
-    def _sort_key(r: dict) -> str:
-        return str(r.get("ended_at") or r.get("discovered_at") or "")
+    def _sort_key(r: dict) -> tuple[int, str]:
+        # PR#54 + PR#55: the user's explicit ask is two-fold —
+        #   (a) "最新的模型放到最前面"  → newest by last_modified DESC
+        #   (b) "为什么只有标题，没有结果的示例" → real eval results
+        #       (pass_rate, capability) must be visible, not buried
+        #       under random unrelated rows.
+        # Group-then-timestamp ordering achieves both. Groups, top→bot:
+        #   5  active work (in_progress / queued)
+        #   4  successful evaluations (ok with pass_rate)
+        #   3  curated discoveries (reason in whitelist/trending/curated/
+        #      backfill/incremental) — including failed/aborted ones
+        #   2  ok runs without a candidate record (manual enqueue or
+        #      legacy)
+        #   1  orphan manual failed/aborted (old runs whose candidate
+        #      record was purged — push to the bottom so they don't
+        #      crowd out fresh discoveries)
+        # Within each group, sort by the most informative timestamp
+        # DESC (last_modified for HF freshness, ended_at for completed
+        # runs, discovered_at as final fallback).
+        status = r.get("status") or ""
+        reason = r.get("reason") or ""
+        is_manual = (reason == "manual")
+        if status in ("in_progress", "queued"):
+            group = 5
+        elif status == "ok" and not is_manual:
+            group = 4
+        elif not is_manual:
+            group = 3
+        elif status == "ok":
+            group = 2
+        else:
+            group = 1
+        ts = str(
+            r.get("last_modified")
+            or r.get("ended_at")
+            or r.get("discovered_at")
+            or "",
+        )
+        return (group, ts)
     rows.sort(key=_sort_key, reverse=True)
     rows = rows[:limit]
 
@@ -725,7 +810,13 @@ INDEX_HTML = """<!doctype html>
 
 </main>
 <script>
-async function getJSON(url) { const r = await fetch(url); return await r.json(); }
+async function getJSON(url) {
+  const r = await fetch(url);
+  if (!r.ok) {
+    throw new Error('HTTP ' + r.status + ' on ' + url);
+  }
+  return await r.json();
+}
 
 function pillStatus(s) {
   if (s === 'ok') return '<span class="pill ok">ok</span>';
@@ -749,11 +840,49 @@ function formatTs(ts) {
 
 const STAGES = ['DISCOVER','CURATE','METADATA','ENGINE_SELECT','STAGE_MODEL','DEPLOY','READY_WAIT','CAPABILITY','SHOWCASE','CLEANUP'];
 
+function renderError(elId, label, err) {
+  // PR#54: surface per-endpoint failures inline so the user can see
+  // which section failed instead of staring at an "更新中…" that never
+  // finishes (the old bug, where a slow /api/discover blocked every
+  // table behind it).
+  const msg = (err && err.message) ? err.message : String(err);
+  const el = document.getElementById(elId);
+  if (!el) return;
+  el.innerHTML = `<tr><td colspan="20" class="err" style="font-size:12px">
+    ${label} 加载失败: ${msg}</td></tr>`;
+}
+
+function renderErrorGrid(elId, label, err) {
+  const msg = (err && err.message) ? err.message : String(err);
+  const el = document.getElementById(elId);
+  if (!el) return;
+  el.innerHTML = `<div class="stat"><div class="label">${label}</div>
+    <div class="value err" style="font-size:14px">加载失败</div>
+    <div class="muted" style="font-size:11px">${msg}</div></div>`;
+}
+
 async function refresh() {
   document.getElementById('updated').textContent = '更新中… ' + new Date().toLocaleString('zh-CN');
 
-  // health
-  const h = await getJSON('/api/health');
+  // PR#54: fire every section as an independent promise so one slow
+  // endpoint doesn't blank the whole page. allSettled never throws.
+  await Promise.allSettled([
+    refreshHealth(),
+    refreshBackup(),
+    refreshQueue(),
+    refreshResults(),
+    refreshRuns(),
+    refreshDiscover(),
+    refreshOutbox(),
+  ]);
+
+  document.getElementById('updated').textContent = '已更新 ' + new Date().toLocaleString('zh-CN') + ' · 每 30s 自动刷新';
+}
+
+async function refreshHealth() {
+  let h;
+  try { h = await getJSON('/api/health'); }
+  catch (e) { renderErrorGrid('health-grid', 'health', e); return; }
   const eng = h.engine || {};
   const gpu = h.gpu || [];
   const total_used = gpu.reduce((a,g)=>a+g.mem_used_mb, 0);
@@ -773,43 +902,62 @@ async function refresh() {
       <div class="value ${h.last_incident ? 'warn' : 'ok'}" style="font-size:14px">${h.last_incident ? formatTs(h.last_incident.ts) : '<span class="muted">无</span>'}</div></div>
   `;
   document.getElementById('health-json').textContent = JSON.stringify(h, null, 2);
+}
 
-  // backup
-  const bk = await getJSON('/api/backup');
+function _fmtAge(s) {
+  if (s == null) return '<span class="muted">无记录</span>';
+  if (s < 60) return s + 's 前';
+  if (s < 3600) return Math.floor(s/60) + 'm 前';
+  if (s < 86400) return (s/3600).toFixed(1) + 'h 前';
+  return (s/86400).toFixed(1) + 'd 前';
+}
+function _fmtGB(b) { return b ? (b / (1024**3)).toFixed(2) + ' GB' : '<span class="muted">0</span>'; }
+
+async function refreshBackup() {
+  let bk;
+  try { bk = await getJSON('/api/backup'); }
+  catch (e) { renderErrorGrid('backup-grid', 'backup', e); return; }
   const bkCls = bk.health === 'ok' ? 'ok' : (bk.health === 'warn' ? 'warn' : 'err');
-  function fmtAge(s) {
-    if (s == null) return '<span class="muted">无记录</span>';
-    if (s < 60) return s + 's 前';
-    if (s < 3600) return Math.floor(s/60) + 'm 前';
-    if (s < 86400) return (s/3600).toFixed(1) + 'h 前';
-    return (s/86400).toFixed(1) + 'd 前';
-  }
-  function fmtGB(b) { return b ? (b / (1024**3)).toFixed(2) + ' GB' : '<span class="muted">0</span>'; }
   document.getElementById('backup-grid').innerHTML = `
     <div class="stat"><div class="label">备份状态</div>
       <div class="value ${bkCls}">${bk.health.toUpperCase()}</div>
       <div class="muted" style="font-size:11px">${bk.backups_root}</div></div>
     <div class="stat"><div class="label">最近成功</div>
-      <div class="value" style="font-size:14px">${fmtAge(bk.last_backup_age_s)}</div>
+      <div class="value" style="font-size:14px">${_fmtAge(bk.last_backup_age_s)}</div>
       <div class="muted" style="font-size:11px">${bk.last_backup_ts || ''}</div></div>
     <div class="stat"><div class="label">snapshot 数量</div>
       <div class="value">${bk.snapshot_count}</div>
       <div class="muted" style="font-size:11px">7d 保留窗口</div></div>
     <div class="stat"><div class="label">总占用</div>
-      <div class="value">${fmtGB(bk.total_size_bytes)}</div>
+      <div class="value">${_fmtGB(bk.total_size_bytes)}</div>
       <div class="muted" style="font-size:11px">hard-link 共享</div></div>
   `;
   document.getElementById('backup-snapshots').textContent = JSON.stringify(bk.snapshots_tail, null, 2);
+}
 
-  // queue
-  const q = await getJSON('/api/queue');
+async function refreshQueue() {
+  let q;
+  try { q = await getJSON('/api/queue'); }
+  catch (e) {
+    renderError('queue-table tbody', 'queue', e);
+    document.getElementById('queue-summary').innerHTML = '<span class="err">加载失败</span>';
+    return;
+  }
   document.getElementById('queue-summary').innerHTML = `pending: <strong>${q.pending_count}</strong>`;
   const qbody = document.querySelector('#queue-table tbody');
-  qbody.innerHTML = q.pending.map(p => `<tr><td><code>${p.run_id||'-'}</code></td><td>${p.hf_id||'-'}</td></tr>`).join('') ||
+  qbody.innerHTML = (q.pending||[]).map(p => `<tr><td><code>${p.run_id||'-'}</code></td><td>${p.hf_id||'-'}</td></tr>`).join('') ||
     '<tr><td colspan="2" class="muted">空</td></tr>';
+}
 
-  // results summary (real evaluation data)
-  const res = await getJSON('/api/results');
+async function refreshResults() {
+  let res;
+  try { res = await getJSON('/api/results'); }
+  catch (e) {
+    renderErrorGrid('results-grid', 'results', e);
+    const tb = document.querySelector('#results-table tbody');
+    if (tb) tb.innerHTML = `<tr><td colspan="11" class="err">加载失败: ${(e.message||e)}</td></tr>`;
+    return;
+  }
   document.getElementById('results-grid').innerHTML = `
     <div class="stat"><div class="label">总评测 runs</div><div class="value">${res.total}</div></div>
     <div class="stat"><div class="label">完成</div><div class="value ok">${res.completed_ok}</div></div>
@@ -817,7 +965,7 @@ async function refresh() {
     <div class="stat"><div class="label">平均 pass rate</div><div class="value">${res.avg_pass_rate != null ? (res.avg_pass_rate*100).toFixed(0)+'%' : '<span class="muted">N/A</span>'}</div></div>
   `;
   const resBody = document.querySelector('#results-table tbody');
-  const visibleRows = res.rows.filter(r => r.hf_id !== '?').slice(0, 30);
+  const visibleRows = (res.rows||[]).filter(r => r.hf_id !== '?').slice(0, 30);
   resBody.innerHTML = visibleRows.map(r => {
     const pr = (typeof r.pass_rate === 'number') ? `<strong class="${r.pass_rate>=0.8?'ok':r.pass_rate>=0.5?'warn':'err'}">${(r.pass_rate*100).toFixed(0)}%</strong>` : '<span class="muted">-</span>';
     const cap = r.capability ? `<span class="pill ok">${r.capability}</span>` : '<span class="muted">-</span>';
@@ -840,11 +988,18 @@ async function refresh() {
       <td>${formatDuration(r.duration_s)}</td>
     </tr>`;
   }).join('') || '<tr><td colspan="11" class="muted">无评测结果</td></tr>';
+}
 
-  // detailed stage table
-  const runs = await getJSON('/api/runs');
+async function refreshRuns() {
+  let runs;
+  try { runs = await getJSON('/api/runs'); }
+  catch (e) {
+    const tb = document.querySelector('#runs-table tbody');
+    if (tb) tb.innerHTML = `<tr><td colspan="14" class="err">加载失败: ${(e.message||e)}</td></tr>`;
+    return;
+  }
   const rbody = document.querySelector('#runs-table tbody');
-  rbody.innerHTML = runs.slice(0, 30).map(r => {
+  rbody.innerHTML = (runs||[]).slice(0, 30).map(r => {
     const stages = STAGES.map(s => pillStatus((r.stages||{})[s])).join('</td><td>');
     return `<tr class="stage-row">
       <td><a href="/run/${encodeURIComponent(r.run_id)}"><code>${r.run_id.substring(0,28)}…</code></a></td>
@@ -854,27 +1009,40 @@ async function refresh() {
       <td>${formatDuration(r.duration_s)}</td>
     </tr>`;
   }).join('') || '<tr><td colspan="14" class="muted">无 runs</td></tr>';
+}
 
-  // discover
-  const d = await getJSON('/api/discover');
+async function refreshDiscover() {
+  let d;
+  try { d = await getJSON('/api/discover'); }
+  catch (e) { renderErrorGrid('discover-grid', 'discover', e); return; }
+  const reasons = d.by_reason || {};
+  // PR#53: with curated mode, common reasons are whitelist / trending / both / manual.
+  const wl = reasons.whitelist || 0;
+  const tr = reasons.trending || 0;
+  const both = reasons.both || 0;
   document.getElementById('discover-grid').innerHTML = `
     <div class="stat"><div class="label">候选总数</div><div class="value">${d.total}</div></div>
-    <div class="stat"><div class="label">whitelist 命中</div><div class="value ok">${(d.by_reason||{}).whitelist || 0}</div></div>
-    <div class="stat"><div class="label">trending 命中</div><div class="value">${(d.by_reason||{}).trending || 0}</div></div>
+    <div class="stat"><div class="label">whitelist 命中</div><div class="value ok">${wl + both}</div></div>
+    <div class="stat"><div class="label">trending 命中</div><div class="value">${tr + both}</div></div>
     <div class="stat"><div class="label">Top org</div><div class="value" style="font-size:14px">${Object.entries(d.by_org_top10||{})[0]?.[0] || '-'}</div></div>
   `;
   document.getElementById('discover-top').textContent = JSON.stringify(d.top20_by_downloads, null, 2);
+}
 
-  // outbox
-  const o = await getJSON('/api/outbox');
+async function refreshOutbox() {
+  let o;
+  try { o = await getJSON('/api/outbox'); }
+  catch (e) {
+    const tb = document.querySelector('#outbox-table tbody');
+    if (tb) tb.innerHTML = `<tr><td colspan="4" class="err">加载失败: ${(e.message||e)}</td></tr>`;
+    return;
+  }
   const obody = document.querySelector('#outbox-table tbody');
-  obody.innerHTML = o.slice().reverse().map(e => {
+  obody.innerHTML = (o||[]).slice().reverse().map(e => {
     const lvl = e.level || 'info';
     const cls = lvl === 'error' ? 'err' : (lvl === 'warn' ? 'warn' : 'muted');
     return `<tr><td>${formatTs(e.ts)}</td><td>${e.event_type||'-'}</td><td class="${cls}">${lvl}</td><td>${e.title||'-'}</td></tr>`;
   }).join('') || '<tr><td colspan="4" class="muted">无</td></tr>';
-
-  document.getElementById('updated').textContent = '已更新 ' + new Date().toLocaleString('zh-CN') + ' · 每 30s 自动刷新';
 }
 
 refresh();
@@ -907,7 +1075,9 @@ def render_candidates_page() -> str:
 
     rows_html = []
     for r in data["rows"]:
-        hf = html.escape(r.get("hf_id") or "-")
+        hf_raw = r.get("hf_id") or "-"
+        hf = html.escape(hf_raw)
+        hf_attr = html.escape(hf_raw, quote=True)
         st = r.get("status") or "?"
         st_cls = _status_color(st)
         pipe = html.escape(r.get("pipeline_tag") or "-")
@@ -940,6 +1110,25 @@ def render_candidates_page() -> str:
             f"{html.escape(fail)}</div>"
             if fail else ""
         )
+
+        # PR#55: action column. Hide the "立即评测" button for rows that
+        # are already in-flight; show "重测" instead for terminal runs
+        # so the user can rerun a failed/aborted model after fixing
+        # whatever blocked it.
+        if hf_raw == "-":
+            action_html = "<span class='muted'>-</span>"
+        elif st in ("queued", "in_progress"):
+            action_html = (
+                f"<span class='pill run' title='已在队列或评测中，"
+                f"无需重复入队'>排队中</span>"
+            )
+        else:
+            label = "重测" if st in ("ok", "failed", "aborted") else "立即评测"
+            action_html = (
+                f"<button class='enqueue-btn' data-hf=\"{hf_attr}\" "
+                f"onclick='enqueueModel(this)'>{label}</button>"
+            )
+
         rows_html.append(
             f"<tr>"
             f"<td><strong>{hf}</strong>{fail_html}</td>"
@@ -952,11 +1141,12 @@ def render_candidates_page() -> str:
             f"<td class='{pr_cls}' style='text-align:right'>"
             f"<strong>{pr_pct}</strong></td>"
             f"<td>{run_link}</td>"
+            f"<td>{action_html}</td>"
             f"</tr>"
         )
 
     table_body = "".join(rows_html) or (
-        "<tr><td colspan='9' class='muted'>暂无候选 — 等 discover daemon 抓第一轮</td></tr>"
+        "<tr><td colspan='10' class='muted'>暂无候选 — 等 discover daemon 抓第一轮</td></tr>"
     )
 
     bf_complete = backfill.get("complete")
@@ -1024,16 +1214,120 @@ a{{color:#6ec0ff;text-decoration:none}} a:hover{{text-decoration:underline}}
   <div class="stat"><div class="label">failed</div><div class="value err">{sc['failed']:,}</div></div>
   <div class="stat"><div class="label">aborted</div><div class="value warn">{sc['aborted']:,}</div></div>
 </div>
+<section>
+  <h2>✋ 手动入队（按 hf_id 指定模型）</h2>
+  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+    <input id="manual-hf" type="text" placeholder="org/model 例: deepseek-ai/DeepSeek-V3.2"
+           style="flex:1;min-width:320px;padding:8px 12px;background:#0c0c10;
+           border:1px solid #26262e;border-radius:4px;color:#e7e7ea;font-family:monospace"/>
+    <button class="enqueue-btn primary" onclick="enqueueManual()">入队评测</button>
+    <span id="manual-status" class="muted" style="font-size:12px"></span>
+  </div>
+  <p class="muted" style="font-size:11px;margin:8px 0 0">
+    任何符合 <code>&lt;org&gt;/&lt;name&gt;</code> 格式的 HF 模型 ID 都可手动指定；
+    orchestrator 自动去重，已在队列 / in_progress 的请求会被拒绝。
+  </p>
+</section>
 <section><table>
 <thead><tr>
   <th>hf_id / 失败原因</th><th>状态</th><th>pipeline_tag</th><th>reason</th>
   <th>last_modified</th><th style="text-align:right">downloads</th>
-  <th style="text-align:right">likes</th><th style="text-align:right">pass</th><th>run_id</th>
+  <th style="text-align:right">likes</th><th style="text-align:right">pass</th>
+  <th>run_id</th><th>操作</th>
 </tr></thead><tbody>{table_body}</tbody>
 </table>
-<p class="muted" style="font-size:11px;margin:10px 0 0">显示最近 500 条；reason = discover 来源
-(whitelist / trending / backfill / incremental / manual)；status = discovered → queued → in_progress → ok/failed/aborted</p>
+<p class="muted" style="font-size:11px;margin:10px 0 0">显示最近 500 条；按 last_modified 倒序（最新模型在前）；reason = discover 来源
+(whitelist / trending / curated / manual)；status = discovered → queued → in_progress → ok/failed/aborted。
+点击「立即评测 / 重测」立即入队；同一模型并发入队会被 orchestrator 去重。</p>
 </section>
+<style>
+.enqueue-btn{{
+  padding:4px 10px;border-radius:4px;border:1px solid #2a4a6a;
+  background:#1a2a3a;color:#6ec0ff;font-size:11px;cursor:pointer;
+}}
+.enqueue-btn:hover{{background:#22344a}}
+.enqueue-btn.primary{{
+  background:#1a3a26;color:#5ad48d;border-color:#2a5a3e;font-size:13px;
+  padding:8px 18px;
+}}
+.enqueue-btn.primary:hover{{background:#225033}}
+.enqueue-btn[disabled]{{opacity:0.5;cursor:not-allowed}}
+</style>
+<script>
+async function _postEnqueue(hfId) {{
+  const r = await fetch('/api/enqueue', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{hf_id: hfId}}),
+  }});
+  let body = {{}};
+  try {{ body = await r.json(); }} catch (e) {{ /* keep body={{}} */ }}
+  return {{status: r.status, body}};
+}}
+
+async function enqueueModel(btn) {{
+  const hfId = btn.dataset.hf;
+  if (!hfId) return;
+  btn.disabled = true;
+  const orig = btn.textContent;
+  btn.textContent = '入队中…';
+  try {{
+    const {{status, body}} = await _postEnqueue(hfId);
+    if (status === 202 && body.ok) {{
+      btn.textContent = '已入队 ✓';
+      setTimeout(() => location.reload(), 1500);
+    }} else if (status === 409) {{
+      btn.textContent = '已存在';
+      setTimeout(() => {{ btn.disabled = false; btn.textContent = orig; }}, 2500);
+    }} else {{
+      btn.textContent = '失败';
+      alert('入队失败 (HTTP ' + status + '): ' + (body.detail || body.error || 'unknown'));
+      btn.disabled = false;
+      btn.textContent = orig;
+    }}
+  }} catch (e) {{
+    alert('网络错误: ' + e.message);
+    btn.disabled = false;
+    btn.textContent = orig;
+  }}
+}}
+
+async function enqueueManual() {{
+  const input = document.getElementById('manual-hf');
+  const status = document.getElementById('manual-status');
+  const hfId = (input.value || '').trim();
+  status.textContent = '';
+  status.className = 'muted';
+  if (!hfId) {{
+    status.textContent = '请输入 hf_id';
+    status.className = 'warn';
+    return;
+  }}
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{{0,95}}\\/[A-Za-z0-9._-]{{1,96}}$/.test(hfId)) {{
+    status.textContent = '格式不合法 (期望 org/name)';
+    status.className = 'err';
+    return;
+  }}
+  status.textContent = '入队中…';
+  try {{
+    const {{status: code, body}} = await _postEnqueue(hfId);
+    if (code === 202 && body.ok) {{
+      status.textContent = '已入队 ✓ run_id=' + body.run_id;
+      status.className = 'ok';
+      setTimeout(() => location.reload(), 1500);
+    }} else if (code === 409) {{
+      status.textContent = '已在队列 / in_progress，无需重复入队';
+      status.className = 'warn';
+    }} else {{
+      status.textContent = '失败 (HTTP ' + code + '): ' + (body.detail || body.error || 'unknown');
+      status.className = 'err';
+    }}
+  }} catch (e) {{
+    status.textContent = '网络错误: ' + e.message;
+    status.className = 'err';
+  }}
+}}
+</script>
 </main></body></html>"""
 
 
@@ -1473,6 +1767,75 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": "not_found", "path": path}, status=404)
         except Exception as e:
             self._json({"error": str(e), "type": type(e).__name__}, status=500)
+
+    def do_POST(self):
+        """PR#55: manual interaction surface.
+
+        ``POST /api/enqueue {"hf_id": "<org>/<name>"}`` — let the user
+        prioritise a specific model from the candidates panel. The
+        orchestrator's own dedup applies (queue/in-progress + recent
+        success), and we forbid arbitrary path-like hf_ids to keep the
+        endpoint a tight gate.
+
+        Any other path returns 404 so we don't accidentally expose a
+        write surface.
+        """
+        path = self.path.split("?", 1)[0].rstrip("/") or "/"
+        try:
+            if path == "/api/enqueue":
+                self._handle_enqueue()
+            else:
+                self._json({"error": "not_found", "path": path}, status=404)
+        except Exception as e:
+            self._json({"error": str(e), "type": type(e).__name__}, status=500)
+
+    def _handle_enqueue(self) -> None:
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0 or length > 4096:
+            self._json({"error": "bad_request",
+                        "detail": "missing/oversized body"}, status=400)
+            return
+        raw = self.rfile.read(length)
+        try:
+            payload = json.loads(raw.decode("utf-8", "replace"))
+        except json.JSONDecodeError as e:
+            self._json({"error": "bad_json", "detail": str(e)}, status=400)
+            return
+        if not isinstance(payload, dict):
+            self._json({"error": "bad_request",
+                        "detail": "payload must be a JSON object"},
+                       status=400)
+            return
+        hf_id = (payload.get("hf_id") or "").strip()
+        if not _is_valid_hf_id(hf_id):
+            self._json({"error": "bad_hf_id",
+                        "detail": "expected '<org>/<name>' with safe "
+                                  "characters only"},
+                       status=400)
+            return
+        try:
+            from orchestrator.main import enqueue as _orch_enqueue
+            from orchestrator.store import Store
+        except Exception as e:
+            self._json({"error": "orchestrator_unavailable",
+                        "detail": f"{type(e).__name__}: {e}"},
+                       status=503)
+            return
+        store = Store(DATA_ROOT)
+        # skip_if_recent=False: manual enqueue is an explicit user
+        # action — they may want to re-evaluate a model that succeeded
+        # earlier (different weights, vendor pushed update, etc.).
+        run_id = _orch_enqueue(store, hf_id, skip_if_recent=False)
+        if run_id is None:
+            self._json({
+                "ok": False,
+                "hf_id": hf_id,
+                "reason": "duplicate_or_in_progress",
+                "detail": "already pending or running; orchestrator dedup",
+            }, status=409)
+            return
+        self._json({"ok": True, "hf_id": hf_id, "run_id": run_id},
+                   status=202)
 
 
 def main(argv=None):

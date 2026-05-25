@@ -68,6 +68,11 @@ class TrackerConfig:
     ])
     per_org_limit: int = 50
     trending_sweep_limit: int = 200
+    # PR#53: only admit a "trending" candidate if it has actually been
+    # touched in the last N days. Without this gate every daily scan
+    # surfaces the same stale mega-popular checkpoints (bert-base,
+    # llama-2-7b, …) and crowds out fresh releases. ``0`` disables.
+    min_trending_recency_days: int = 0
 
     @classmethod
     def from_yaml(cls, path: Path) -> TrackerConfig:
@@ -94,6 +99,9 @@ class TrackerConfig:
             ]),
             per_org_limit=int(data.get("per_org_limit", 50)),
             trending_sweep_limit=int(data.get("trending_sweep_limit", 200)),
+            min_trending_recency_days=int(
+                data.get("min_trending_recency_days", 0)
+            ),
         )
 
 
@@ -526,6 +534,18 @@ def scan_round(
         stats.api_errors += 1
         models = []
 
+    # PR#53: precompute the recency cutoff once. Models touched before
+    # this datetime are dropped from the trending bucket so the daily
+    # scan surfaces actually-fresh hot models, not the same stale
+    # mega-checkpoints every round.
+    recency_cutoff: str | None = None
+    if config.min_trending_recency_days > 0:
+        from datetime import timedelta
+        cutoff_dt = datetime.now(tz=UTC) - timedelta(
+            days=config.min_trending_recency_days,
+        )
+        recency_cutoff = cutoff_dt.isoformat(timespec="seconds")
+
     for m in models:
         cand = _model_to_candidate(m, reason="trending")
         if cand.hf_id in cursor.seen:
@@ -536,6 +556,12 @@ def scan_round(
             stats.seen_skipped += 1
             continue
         if not _passes_window(cand.last_modified, config.from_date):
+            stats.excluded_old += 1
+            continue
+        if recency_cutoff and cand.last_modified and (
+            (_norm_ts(cand.last_modified) or cand.last_modified)
+            < recency_cutoff
+        ):
             stats.excluded_old += 1
             continue
         if not _passes_modality(cand.pipeline_tag, config.modality_pipeline_tags):
@@ -552,6 +578,11 @@ def scan_round(
 
     cursor.last_run_ts = datetime.now(tz=UTC).isoformat(timespec="seconds")
     return new, stats
+
+
+# Backwards-compatible alias: PR#53 reframes "legacy whitelist+trending"
+# as "curated" — the user's stated discovery scope. Same code path.
+scan_curated = scan_round
 
 
 # ── backfill (PR#49) ───────────────────────────────────────────────────────

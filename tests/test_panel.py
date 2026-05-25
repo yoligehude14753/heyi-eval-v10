@@ -6,6 +6,7 @@ malformed JSON, and never raise.
 from __future__ import annotations
 
 import json
+import sys
 
 import pytest
 
@@ -547,3 +548,363 @@ def test_pr50_lifecycle_empty_data_root_ok(tmp_path, monkeypatch):
     assert data["rows"] == []
     assert data["status_counts"] == {}
     assert "backfill" in data
+
+
+# ── PR#54: discover_summary streaming + sort order ───────────────────────
+
+
+def test_pr54_discover_summary_streams_without_full_sort(tmp_path, monkeypatch):
+    """Regression: prior to PR#54, discover_summary loaded the entire
+    candidates.jsonl into memory and ran ``sorted()`` over it. With 500k+
+    rows the panel endpoint timed out at 30s and blanked every other
+    table on the dashboard. New impl uses a top-N heap and finishes in
+    O(n) with O(top_n) memory."""
+    (tmp_path / "discover").mkdir()
+    rows = []
+    for i in range(2000):
+        rows.append({
+            "hf_id": f"org{i % 20}/m{i}",
+            "discovered_at": f"2026-05-{(i % 28) + 1:02d}T00:00:00+00:00",
+            "reason": "trending" if i % 3 == 0 else "whitelist",
+            "pipeline_tag": "text-generation",
+            "downloads": i * 100,
+            "likes": i,
+            "last_modified": f"2026-05-{(i % 28) + 1:02d}T00:00:00",
+        })
+    (tmp_path / "discover" / "candidates.jsonl").write_text(
+        "\n".join(json.dumps(r) for r in rows) + "\n"
+    )
+    monkeypatch.setenv("HEYI_EVAL_DATA", str(tmp_path))
+    import importlib
+    import panel.server as srv
+    importlib.reload(srv)
+    d = srv.discover_summary(top_n=20)
+    assert d["total"] == 2000
+    assert len(d["top20_by_downloads"]) == 20
+    top_dls = [r["downloads"] for r in d["top20_by_downloads"]]
+    assert top_dls == sorted(top_dls, reverse=True)
+    assert top_dls[0] == 1999 * 100
+    assert d["by_reason"]["whitelist"] > 0
+    assert d["by_reason"]["trending"] > 0
+
+
+def test_pr54_lifecycle_sorts_newest_last_modified_first(tmp_path, monkeypatch):
+    """User: "既然每天都去爬最新的模型，那就应该把最新的模型放到最前面".
+    Newest last_modified must bubble to the top regardless of when our
+    crawler happened to discover it."""
+    (tmp_path / "discover").mkdir()
+    (tmp_path / "runs").mkdir()
+    (tmp_path / "store").mkdir()
+    rows = [
+        {"hf_id": "org/oldnew",
+         "discovered_at": "2026-05-25T00:00:00+00:00",
+         "reason": "backfill", "pipeline_tag": "text-generation",
+         "downloads": 1000, "likes": 100,
+         "last_modified": "2026-01-05T00:00:00"},
+        {"hf_id": "org/newest",
+         "discovered_at": "2026-05-01T00:00:00+00:00",
+         "reason": "whitelist", "pipeline_tag": "text-generation",
+         "downloads": 50, "likes": 2,
+         "last_modified": "2026-05-24T00:00:00"},
+    ]
+    (tmp_path / "discover" / "candidates.jsonl").write_text(
+        "\n".join(json.dumps(r) for r in rows) + "\n"
+    )
+    (tmp_path / "discover" / "cursor.json").write_text(
+        json.dumps({"seen": ["org/oldnew", "org/newest"]})
+    )
+    monkeypatch.setenv("HEYI_EVAL_DATA", str(tmp_path))
+    import importlib
+    import panel.server as srv
+    importlib.reload(srv)
+    data = srv.candidates_lifecycle()
+    ids_in_order = [r["hf_id"] for r in data["rows"]]
+    assert ids_in_order[0] == "org/newest"
+    assert ids_in_order[1] == "org/oldnew"
+
+
+def test_pr55_active_then_results_then_discovered_then_orphans(
+    tmp_path, monkeypatch,
+):
+    """PR#55 sort priority: the user explicitly asked to see (a) real
+    eval results not just titles, and (b) the newest models at the top.
+    The right ordering is: active work > successful curated runs >
+    curated discoveries (incl. failed/aborted) > orphan manual runs.
+
+    Manual orphans (runs from a previous candidates.jsonl that's since
+    been purged) must NOT crowd out fresh discoveries.
+    """
+    (tmp_path / "discover").mkdir()
+    (tmp_path / "runs").mkdir()
+    (tmp_path / "store").mkdir()
+    candidates = [
+        {"hf_id": "org/curated-disco",
+         "discovered_at": "2026-05-25T00:00:00+00:00",
+         "reason": "whitelist", "pipeline_tag": "text-generation",
+         "last_modified": "2026-05-20T00:00:00"},
+        {"hf_id": "org/curated-ok",
+         "discovered_at": "2026-05-25T00:01:00+00:00",
+         "reason": "whitelist", "pipeline_tag": "text-generation",
+         "last_modified": "2026-05-22T00:00:00"},
+        {"hf_id": "org/curated-fail",
+         "discovered_at": "2026-05-25T00:02:00+00:00",
+         "reason": "trending", "pipeline_tag": "text-generation",
+         "last_modified": "2026-05-23T00:00:00"},
+    ]
+    (tmp_path / "discover" / "candidates.jsonl").write_text(
+        "\n".join(json.dumps(c) for c in candidates) + "\n"
+    )
+    (tmp_path / "discover" / "cursor.json").write_text(
+        json.dumps({"seen": [c["hf_id"] for c in candidates]})
+    )
+    # Orphan manual runs (the kind PR#53 purge leaves behind)
+    for hf, status in (("ghost/spam-failed", "failed"),
+                       ("ghost/spam-aborted", "aborted")):
+        rd = tmp_path / "runs" / f"r-{hf.replace('/', '-')}"
+        rd.mkdir()
+        (rd / "state.json").write_text(json.dumps({
+            "run_id": rd.name, "hf_id": hf, "status": status,
+            "created_at": 1779500000.0, "ended_at": 1779500100.0,
+        }))
+    # The curated ok run
+    rok = tmp_path / "runs" / "r-curated-ok"
+    rok.mkdir()
+    (rok / "state.json").write_text(json.dumps({
+        "run_id": "r-curated-ok", "hf_id": "org/curated-ok",
+        "status": "ok",
+        "created_at": 1779500200.0, "ended_at": 1779500900.0,
+    }))
+    (rok / "capability.json").write_text(json.dumps({
+        "score": "16/20", "pass_rate": 0.8,
+    }))
+    # The curated failed run (still group=3, but not 'ok')
+    rfail = tmp_path / "runs" / "r-curated-fail"
+    rfail.mkdir()
+    (rfail / "state.json").write_text(json.dumps({
+        "run_id": "r-curated-fail", "hf_id": "org/curated-fail",
+        "status": "failed",
+        "created_at": 1779500300.0, "ended_at": 1779500360.0,
+        "failure_reason": "container exited 1",
+    }))
+    # And an in_progress for an enqueued model
+    rip = tmp_path / "runs" / "r-active"
+    rip.mkdir()
+    (rip / "state.json").write_text(json.dumps({
+        "run_id": "r-active", "hf_id": "ghost/active-now",
+        "status": "in_progress",
+        "created_at": 1779500400.0,
+    }))
+
+    monkeypatch.setenv("HEYI_EVAL_DATA", str(tmp_path))
+    import importlib
+    import panel.server as srv
+    importlib.reload(srv)
+    data = srv.candidates_lifecycle()
+    ids_in_order = [r["hf_id"] for r in data["rows"]]
+    # Active first
+    assert ids_in_order[0] == "ghost/active-now"
+    # Then the curated ok (group 4)
+    assert ids_in_order[1] == "org/curated-ok"
+    # Then curated discovery + curated failed (group 3) before orphans
+    pos_curated = [ids_in_order.index(h) for h in
+                   ("org/curated-disco", "org/curated-fail")]
+    pos_orphans = [ids_in_order.index(h) for h in
+                   ("ghost/spam-failed", "ghost/spam-aborted")]
+    assert max(pos_curated) < min(pos_orphans), (
+        f"curated rows {pos_curated} must precede orphan rows "
+        f"{pos_orphans} in {ids_in_order}"
+    )
+
+
+# ── PR#55: POST /api/enqueue ─────────────────────────────────────────────
+
+
+def test_pr55_is_valid_hf_id_accepts_well_formed():
+    import panel.server as srv
+    assert srv._is_valid_hf_id("deepseek-ai/DeepSeek-V3.2")
+    assert srv._is_valid_hf_id("Qwen/Qwen3-72B-Instruct")
+    assert srv._is_valid_hf_id("a/b")
+    assert srv._is_valid_hf_id("01-ai/Yi-34B")
+
+
+def test_pr55_is_valid_hf_id_rejects_bad_input():
+    import panel.server as srv
+    bad = [
+        "",
+        "no-slash",
+        "/leading-slash",
+        "trailing-slash/",
+        "a//b",
+        "../../etc/passwd",
+        "org/model with space",
+        "org/model;rm -rf",
+        "../" * 100,
+        "x" * 300 + "/y",
+        None,
+    ]
+    for s in bad:
+        assert not srv._is_valid_hf_id(s or ""), f"should reject: {s!r}"
+
+
+def test_pr55_enqueue_route_happy_path(tmp_path, monkeypatch):
+    """POST /api/enqueue must call orchestrator.main.enqueue and reply
+    202 with {"ok": true, "run_id": "..."}."""
+    monkeypatch.setenv("HEYI_EVAL_DATA", str(tmp_path))
+    import importlib
+    import panel.server as srv
+    importlib.reload(srv)
+
+    captured = {}
+
+    class FakeStore:
+        def __init__(self, root):
+            captured["root"] = root
+
+    def fake_enqueue(store, hf_id, *, skip_if_recent=False):
+        captured["hf_id"] = hf_id
+        captured["skip_if_recent"] = skip_if_recent
+        return "r-2026-test-fake"
+
+    fake_orch_main = types.ModuleType("orchestrator.main")
+    fake_orch_main.enqueue = fake_enqueue
+    fake_orch_store = types.ModuleType("orchestrator.store")
+    fake_orch_store.Store = FakeStore
+    monkeypatch.setitem(sys.modules, "orchestrator.main", fake_orch_main)
+    monkeypatch.setitem(sys.modules, "orchestrator.store", fake_orch_store)
+
+    body, status = _post_enqueue(srv, {"hf_id": "deepseek-ai/DeepSeek-V3.2"})
+    assert status == 202, body
+    assert body["ok"] is True
+    assert body["run_id"] == "r-2026-test-fake"
+    assert captured["hf_id"] == "deepseek-ai/DeepSeek-V3.2"
+    assert captured["skip_if_recent"] is False
+
+
+def test_pr55_enqueue_rejects_bad_hf_id(tmp_path, monkeypatch):
+    monkeypatch.setenv("HEYI_EVAL_DATA", str(tmp_path))
+    import importlib
+    import panel.server as srv
+    importlib.reload(srv)
+    body, status = _post_enqueue(srv, {"hf_id": "../../etc/passwd"})
+    assert status == 400
+    assert body["error"] == "bad_hf_id"
+
+
+def test_pr55_enqueue_rejects_missing_hf_id(tmp_path, monkeypatch):
+    monkeypatch.setenv("HEYI_EVAL_DATA", str(tmp_path))
+    import importlib
+    import panel.server as srv
+    importlib.reload(srv)
+    body, status = _post_enqueue(srv, {})
+    assert status == 400
+    assert body["error"] == "bad_hf_id"
+
+
+def test_pr55_enqueue_duplicate_returns_409(tmp_path, monkeypatch):
+    monkeypatch.setenv("HEYI_EVAL_DATA", str(tmp_path))
+    import importlib
+    import panel.server as srv
+    importlib.reload(srv)
+
+    class FakeStore:
+        def __init__(self, root):
+            pass
+
+    def fake_enqueue(store, hf_id, *, skip_if_recent=False):
+        return None  # dedup hit
+
+    fake_orch_main = types.ModuleType("orchestrator.main")
+    fake_orch_main.enqueue = fake_enqueue
+    fake_orch_store = types.ModuleType("orchestrator.store")
+    fake_orch_store.Store = FakeStore
+    monkeypatch.setitem(sys.modules, "orchestrator.main", fake_orch_main)
+    monkeypatch.setitem(sys.modules, "orchestrator.store", fake_orch_store)
+
+    body, status = _post_enqueue(srv, {"hf_id": "Qwen/Qwen3-72B"})
+    assert status == 409, body
+    assert body["ok"] is False
+    assert body["reason"] == "duplicate_or_in_progress"
+
+
+def test_pr55_enqueue_rejects_oversize_body(tmp_path, monkeypatch):
+    monkeypatch.setenv("HEYI_EVAL_DATA", str(tmp_path))
+    import importlib
+    import panel.server as srv
+    importlib.reload(srv)
+    big = {"hf_id": "x/y", "junk": "a" * 5000}
+    body, status = _post_enqueue(srv, big)
+    assert status == 400
+    assert "oversized" in (body.get("detail") or "")
+
+
+def test_pr55_get_does_not_expose_enqueue(tmp_path, monkeypatch):
+    """POST /api/enqueue must NEVER respond on GET — the GET surface is
+    contractually read-only."""
+    monkeypatch.setenv("HEYI_EVAL_DATA", str(tmp_path))
+    import importlib
+    import panel.server as srv
+    importlib.reload(srv)
+    from io import BytesIO
+    from unittest.mock import MagicMock
+    handler = MagicMock(spec=srv.Handler)
+    handler.path = "/api/enqueue"
+    handler.wfile = BytesIO()
+    captured = {}
+
+    def fake_json(payload, status=200):
+        captured["payload"] = payload
+        captured["status"] = status
+        handler.wfile.write(json.dumps(payload).encode("utf-8"))
+
+    handler._json = fake_json  # type: ignore[attr-defined]
+    handler._html = lambda *a, **kw: None  # type: ignore[attr-defined]
+    srv.Handler.do_GET(handler)
+    assert captured["status"] == 404
+
+
+def test_pr55_candidates_page_has_action_column_and_form(fake_lifecycle_root):
+    srv, _ = fake_lifecycle_root
+    html_str = srv.render_candidates_page()
+    assert "立即评测" in html_str or "重测" in html_str
+    assert "手动入队" in html_str
+    assert "POST" in html_str.upper() or "/api/enqueue" in html_str
+    assert "排队中" in html_str  # for org/b (queued) and org/c (in_progress)
+
+
+# ── shared helpers for PR#55 tests ──────────────────────────────────────
+
+import types  # noqa: E402
+
+
+def _post_enqueue(srv, payload: dict) -> tuple[dict, int]:
+    """Drive Handler.do_POST against /api/enqueue with the given JSON
+    body. Returns (parsed_body, status). Avoids spinning up a real
+    socket so the tests stay <1ms each.
+
+    Note: ``MagicMock(spec=Handler)`` auto-stubs every method on the
+    class, so calling ``self._handle_enqueue()`` from inside the real
+    ``do_POST`` would hit a no-op mock instead of the real method.
+    We rebind ``_handle_enqueue`` to call the real implementation
+    with the mock-as-self so the dispatch works end-to-end.
+    """
+    from io import BytesIO
+    from unittest.mock import MagicMock
+
+    handler = MagicMock(spec=srv.Handler)
+    raw = json.dumps(payload).encode("utf-8")
+    handler.path = "/api/enqueue"
+    handler.rfile = BytesIO(raw)
+    handler.headers = {"Content-Length": str(len(raw)),
+                       "Content-Type": "application/json"}
+    handler.wfile = BytesIO()
+    captured: dict = {}
+
+    def fake_json(p, status=200):
+        captured["body"] = p
+        captured["status"] = status
+        handler.wfile.write(json.dumps(p).encode("utf-8"))
+
+    handler._json = fake_json  # type: ignore[attr-defined]
+    handler._handle_enqueue = lambda: srv.Handler._handle_enqueue(handler)  # type: ignore[attr-defined]
+    srv.Handler.do_POST(handler)
+    return captured.get("body", {}), captured.get("status", -1)

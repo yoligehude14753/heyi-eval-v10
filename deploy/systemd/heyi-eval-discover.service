@@ -15,19 +15,15 @@ EnvironmentFile=-/etc/heyi-eval-v10/env
 Environment=PYTHONUNBUFFERED=1
 Environment=HF_ENDPOINT=https://hf-mirror.com
 # `discover` is a package, must invoke the CLI module directly (PR#30 fix).
-# PR#49 + PR#52: cursor-driven backfill-then-incremental.
-#   --backfill-interval 1800 (30min) — one backfill round drains 2026
-#                                      history in ~30min via cursor-paged
-#                                      mirror_paginate_models; back off
-#                                      so we don't double-load the hub
-#   --interval 86400 (24h)          → after backfill, daily delta sweep
-#   --mode auto                     → tracker decides based on cursor.backfill_complete
+# PR#53: curated daily scan — user explicitly opted *out* of the 557k-row
+# 2026 backfill firehose ("我不是要全量的，我只要基模厂商发的 和 每天热门
+# 的几个模型"). Curated = whitelist vendor orgs + a few daily-trending
+# models, deduped, ~50-200 candidates/day total.
+#   --mode curated                  → scan_curated (whitelist + trending)
+#   --interval 86400 (24h)          → one sweep per day
 ExecStart=/home/ai/heyi-eval-v10/.venv/bin/python -m discover.main loop \
-    --mode auto \
-    --backfill-interval 1800 \
-    --interval 86400 \
-    --backfill-page-size 1000 \
-    --backfill-page-sleep-s 0.2
+    --mode curated \
+    --interval 86400
 Restart=on-failure
 RestartSec=30s
 # discover is HF-Hub-bound, lower priority than orchestrator main loop.

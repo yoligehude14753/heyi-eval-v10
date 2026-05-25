@@ -22,6 +22,7 @@ from .tracker import (
     mirror_paginate_models,
     save_cursor,
     scan_backfill,
+    scan_curated,
     scan_incremental,
     scan_round,
 )
@@ -70,20 +71,45 @@ def _resolve_hf_token() -> str | None:
 
 
 def cmd_once(args: argparse.Namespace) -> int:
-    """One discover pass. PR#49: auto-routes to backfill or incremental
-    based on cursor state, unless the user forces a legacy ``scan_round``
-    via ``--mode legacy``.
+    """One discover pass.
+
+    PR#53: default mode is ``curated`` (= whitelist vendors + a few
+    daily-hot models, deduped, the user's stated scope: "基模厂商发的 +
+    每天热门的几个模型"). The PR#49 ``auto``/``backfill``/``incremental``
+    paths are still selectable for backfill operators, but no longer
+    the default — backfilling 557k 2026 LoRA spam repos was the wrong
+    architecture.
+
+    ``--reset`` purges discover/candidates.jsonl and discover/cursor.json
+    before running so a single command can recover from a polluted
+    candidates file (e.g. after a runaway backfill). Historical runs/
+    are preserved.
     """
     data_root = _default_data_root()
     config = TrackerConfig.from_yaml(args.whitelist or _whitelist_path())
+
+    if getattr(args, "reset", False):
+        cand_path = _candidates_path(data_root)
+        cur_path = _cursor_path(data_root)
+        cand_n = (
+            sum(1 for _ in cand_path.open("r", encoding="utf-8"))
+            if cand_path.exists() else 0
+        )
+        if cand_path.exists():
+            cand_path.unlink()
+        if cur_path.exists():
+            cur_path.unlink()
+        print(f"[discover.reset] purged candidates.jsonl ({cand_n} rows) "
+              f"and cursor.json — starting from scratch")
+
     cursor = load_cursor(_cursor_path(data_root))
     api = _make_api(args.hf_endpoint, token=_resolve_hf_token())
 
-    mode = getattr(args, "mode", "auto") or "auto"
+    mode = getattr(args, "mode", "curated") or "curated"
 
-    if mode == "legacy":
-        new, stats = scan_round(api, config, cursor)
-        kind = "legacy"
+    if mode in ("curated", "legacy"):
+        new, stats = scan_curated(api, config, cursor)
+        kind = "curated"
         finished = None
     elif mode == "backfill" or (mode == "auto" and not cursor.backfill_complete):
         # PR#52: cursor-aware mirror paginator drains the entire 2026
@@ -146,21 +172,26 @@ def cmd_once(args: argparse.Namespace) -> int:
 
 
 def cmd_loop(args: argparse.Namespace) -> int:
-    """PR#49: backfill-then-daily-incremental loop.
+    """Periodic discover daemon.
 
-    While ``cursor.backfill_complete`` is False, run a backfill round
-    every ``--backfill-interval`` seconds (default 300s, so a fresh
-    install drains 50-100k HF entries in a few hours rather than
-    weeks). Once backfill is complete, switch to ``--interval`` (default
-    86400s = daily) of ``scan_incremental``.
+    PR#53: ``--mode curated`` (the new default) loops once per
+    ``--interval`` seconds (default 86400 = daily). ``--reset`` only
+    fires on the very first iteration so a restart never wipes a
+    healthy candidates file.
+
+    PR#49 fallback: ``--mode auto`` keeps the backfill-then-incremental
+    behavior — backfill_interval applies while cursor.backfill_complete
+    is False, then it switches to ``--interval``.
     """
     backfill_interval = getattr(args, "backfill_interval", 300)
     incr_interval = args.interval
+    mode = getattr(args, "mode", "curated") or "curated"
     print(
-        f"[discover.loop] backfill_interval={backfill_interval}s "
+        f"[discover.loop] mode={mode} backfill_interval={backfill_interval}s "
         f"incremental_interval={incr_interval}s, ctrl-c to stop",
         file=sys.stderr,
     )
+    first_iteration = True
     while True:
         try:
             rc = cmd_once(args)
@@ -170,11 +201,20 @@ def cmd_loop(args: argparse.Namespace) -> int:
             return 130
         except Exception as e:
             print(f"[discover.loop] UNHANDLED: {type(e).__name__}: {e}", file=sys.stderr)
-        # Decide sleep based on cursor state (re-load after cmd_once which
-        # may have flipped backfill_complete).
-        data_root = _default_data_root()
-        cursor = load_cursor(_cursor_path(data_root))
-        sleep_s = incr_interval if cursor.backfill_complete else backfill_interval
+        # Reset only on the very first round; subsequent rounds must
+        # never wipe the candidates file we just populated.
+        if first_iteration and getattr(args, "reset", False):
+            args.reset = False
+        first_iteration = False
+        # Decide sleep:
+        #  - curated / legacy: always incremental interval (daily).
+        #  - auto: backfill interval while backfill not yet complete.
+        if mode in ("curated", "legacy", "incremental"):
+            sleep_s = incr_interval
+        else:
+            data_root = _default_data_root()
+            cursor = load_cursor(_cursor_path(data_root))
+            sleep_s = incr_interval if cursor.backfill_complete else backfill_interval
         time.sleep(sleep_s)
 
 
@@ -321,11 +361,19 @@ def main(argv: list[str] | None = None) -> int:
     p_once = sp.add_parser("once", help="single scan round")
     p_once.add_argument(
         "--mode",
-        choices=["auto", "backfill", "incremental", "legacy"],
-        default="auto",
-        help=("PR#49: auto = cursor-driven (backfill until complete, then "
-              "incremental); backfill / incremental force one mode; legacy "
-              "= the pre-PR#49 whitelist+trending sweep"),
+        choices=["curated", "auto", "backfill", "incremental", "legacy"],
+        default="curated",
+        help=("PR#53 default: curated = whitelist vendors + daily "
+              "trending top-N (deduped). PR#49 modes: auto = cursor-driven; "
+              "backfill = drain all 2026 history (566k+ rows); incremental "
+              "= delta since last_run_ts. ``legacy`` is an alias for "
+              "``curated`` (kept for back-compat scripts)."),
+    )
+    p_once.add_argument(
+        "--reset", action="store_true",
+        help="purge discover/candidates.jsonl + discover/cursor.json before "
+             "scanning (one-shot recovery from a polluted candidates file). "
+             "Historical runs/ are preserved.",
     )
     p_once.add_argument(
         "--backfill-page-size", type=int, default=1000,
@@ -352,8 +400,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_loop.add_argument(
         "--mode",
-        choices=["auto", "backfill", "incremental", "legacy"],
-        default="auto",
+        choices=["curated", "auto", "backfill", "incremental", "legacy"],
+        default="curated",
         help="see `once --mode`",
     )
     p_loop.add_argument(

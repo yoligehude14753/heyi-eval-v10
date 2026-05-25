@@ -32,6 +32,7 @@ from discover.tracker import (  # noqa: E402
     mirror_paginate_models,
     save_cursor,
     scan_backfill,
+    scan_curated,
     scan_incremental,
     scan_round,
 )
@@ -187,6 +188,67 @@ class ScanRoundTests(unittest.TestCase):
         ids = {c.hf_id for c in new}
         self.assertEqual(ids, {"OrgA/M1"})
         self.assertEqual(stats.api_errors, 1)
+
+    def test_scan_curated_is_alias_for_scan_round(self):
+        """PR#53: scan_curated must be the same code path as scan_round
+        so the new ``--mode curated`` default uses the well-tested
+        whitelist+trending pipeline (just with a less misleading name)."""
+        self.assertIs(scan_curated, scan_round)
+
+    def test_trending_recency_gate_drops_stale_megamodels(self):
+        """PR#53: a model with millions of downloads that hasn't been
+        updated in 6 months should NOT pollute today's "trending"
+        bucket (which the user reframed as "每天热门的几个模型")."""
+        from datetime import UTC, datetime, timedelta
+        fresh_ts = datetime.now(tz=UTC).isoformat(timespec="seconds")
+        stale_ts = (
+            datetime.now(tz=UTC) - timedelta(days=180)
+        ).isoformat(timespec="seconds")
+        api = FakeApi(
+            trending=[
+                FakeModel(id="fresh/Hot",
+                          last_modified=fresh_ts,
+                          downloads=200_000, likes=300,
+                          pipeline_tag="text-generation"),
+                FakeModel(id="stale/Ancient",
+                          last_modified=stale_ts,
+                          downloads=9_999_999, likes=9_999,
+                          pipeline_tag="text-generation"),
+            ]
+        )
+        cfg = self._config(orgs=())
+        cfg.min_trending_recency_days = 30
+        cursor = Cursor()
+        new, stats = scan_round(api, cfg, cursor)
+        ids = {c.hf_id for c in new}
+        self.assertEqual(ids, {"fresh/Hot"})
+        self.assertGreaterEqual(stats.excluded_old, 1)
+
+    def test_trending_recency_gate_zero_disables(self):
+        """recency=0 must preserve PR#52 behaviour (no recency check).
+
+        We pick a stale-ish timestamp that's still within the
+        ``from_date`` window (≥ 2026-01-01) so the window gate doesn't
+        confound the assertion — we only want to prove that
+        ``min_trending_recency_days=0`` lets the row through."""
+        from datetime import UTC, datetime, timedelta
+        stale_ts = (
+            datetime.now(tz=UTC) - timedelta(days=60)
+        ).isoformat(timespec="seconds")
+        api = FakeApi(
+            trending=[
+                FakeModel(id="old/Bert",
+                          last_modified=stale_ts,
+                          downloads=10_000_000, likes=9_000,
+                          pipeline_tag="text-generation"),
+            ]
+        )
+        cfg = self._config(orgs=())
+        cfg.min_trending_recency_days = 0
+        cursor = Cursor()
+        new, _ = scan_round(api, cfg, cursor)
+        ids = {c.hf_id for c in new}
+        self.assertEqual(ids, {"old/Bert"})
 
 
 class PersistenceTests(unittest.TestCase):
