@@ -1155,6 +1155,206 @@ def test_pr59_showcase_grade_strips_think_blocks_and_uses_zh_prompt(monkeypatch)
     assert "中文流畅度" in out
 
 
+def test_pr60_hf_link_renders_hub_link_and_run_icon():
+    import importlib
+    srv = importlib.import_module("panel.server")
+    out = srv.hf_link("Qwen/Qwen2.5", run_id="r-abc")
+    assert "https://huggingface.co/Qwen/Qwen2.5" in out
+    assert "target='_blank'" in out
+    assert "/run/r-abc" in out
+    assert "📄" in out
+
+
+def test_pr60_hf_link_without_run_id_omits_icon():
+    import importlib
+    srv = importlib.import_module("panel.server")
+    out = srv.hf_link("Qwen/Qwen2.5")
+    assert "https://huggingface.co/Qwen/Qwen2.5" in out
+    assert "📄" not in out
+
+
+def test_pr60_hf_link_handles_missing_id():
+    import importlib
+    srv = importlib.import_module("panel.server")
+    assert "muted" in srv.hf_link(None)
+    assert "muted" in srv.hf_link("")
+
+
+def test_pr60_publisher_link_renders():
+    import importlib
+    srv = importlib.import_module("panel.server")
+    out = srv.hf_publisher_link("Qwen")
+    assert "https://huggingface.co/Qwen" in out
+
+
+def test_pr60_is_safe_fixture_path_accepts_valid():
+    import importlib
+    srv = importlib.import_module("panel.server")
+    assert srv._is_safe_fixture_path("images/vision/v01_solid_red.png")
+    assert srv._is_safe_fixture_path("images/ocr/o05_word_open.png")
+    assert srv._is_safe_fixture_path("a.png")
+
+
+def test_pr60_is_safe_fixture_path_rejects_traversal():
+    import importlib
+    srv = importlib.import_module("panel.server")
+    bad = [
+        "../etc/passwd",
+        "images/../../../etc",
+        "/absolute/path.png",
+        "images//double.png",
+        "image with space.png",
+        "image$.png",
+        "",
+        "x" * 250,
+    ]
+    for b in bad:
+        assert not srv._is_safe_fixture_path(b), b
+
+
+def test_pr60_render_fixture_preview_uses_route():
+    import importlib
+    srv = importlib.import_module("panel.server")
+    out = srv.render_fixture_preview("images/vision/v01_red.png")
+    assert "/fixtures/images/vision/v01_red.png" in out
+    assert "<img" in out
+    assert "输入图像" in out
+
+
+def test_pr60_render_fixture_preview_invalid_returns_empty():
+    import importlib
+    srv = importlib.import_module("panel.server")
+    assert srv.render_fixture_preview(None) == ""
+    assert srv.render_fixture_preview("../bad") == ""
+
+
+def test_pr60_fixtures_route_serves_real_png(tmp_path, monkeypatch):
+    """End-to-end: GET /fixtures/<path> returns the image bytes with
+    a sane content-type. Uses a fake fixtures root + a synthesized PNG."""
+    import importlib
+    srv = importlib.import_module("panel.server")
+    fixtures = tmp_path / "fx"
+    (fixtures / "images" / "ocr").mkdir(parents=True)
+    img = fixtures / "images" / "ocr" / "x.png"
+    # 1x1 transparent PNG
+    img.write_bytes(
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"
+        b"\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
+        b"\x00\x00\x00\rIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01"
+        b"\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82",
+    )
+    monkeypatch.setattr(srv, "_FIXTURES_ROOT", fixtures)
+
+    from io import BytesIO
+    from unittest.mock import MagicMock
+    handler = MagicMock(spec=srv.Handler)
+    captured = {}
+
+    def fake_send_response(c): captured["code"] = c
+    def fake_send_header(k, v): captured.setdefault("h", {})[k] = v
+    def fake_end_headers(): captured["ended"] = True
+    handler.send_response = fake_send_response
+    handler.send_header = fake_send_header
+    handler.end_headers = fake_end_headers
+    handler.wfile = BytesIO()
+    handler._json = lambda p, status=200: captured.update({"json_status": status, "json_body": p})
+
+    srv.Handler._serve_fixture(handler, "images/ocr/x.png")
+    assert captured.get("code") == 200, captured
+    assert captured["h"]["Content-Type"] == "image/png"
+    assert handler.wfile.getvalue().startswith(b"\x89PNG")
+
+
+def test_pr60_fixtures_route_rejects_traversal(tmp_path, monkeypatch):
+    import importlib
+    srv = importlib.import_module("panel.server")
+    monkeypatch.setattr(srv, "_FIXTURES_ROOT", tmp_path)
+    from unittest.mock import MagicMock
+    handler = MagicMock(spec=srv.Handler)
+    captured = {}
+    handler._json = lambda p, status=200: captured.update({"status": status, "body": p})
+    srv.Handler._serve_fixture(handler, "../../etc/passwd")
+    assert captured["status"] == 400
+    assert captured["body"]["error"] == "bad_fixture_path"
+
+
+def test_pr61_capability_renders_card_with_fixture(tmp_path, monkeypatch):
+    """A vision capability item with a fixture must render an <img>
+    pointing to the /fixtures/ route in the card body."""
+    import importlib
+    srv = importlib.import_module("panel.server")
+    monkeypatch.setattr(srv, "DATA_ROOT", tmp_path)
+    rd = tmp_path / "runs" / "r-vis"
+    (rd / "_meta").mkdir(parents=True)
+    (rd / "state.json").write_text(json.dumps({
+        "run_id": "r-vis", "hf_id": "Qwen/Qwen2.5-VL", "status": "ok",
+        "created_at": 1, "ended_at": 2, "stages": {},
+    }))
+    (rd / "capability.json").write_text(json.dumps({
+        "categories": {
+            "vision": {
+                "applicable": True, "scorer": "substring",
+                "score": "1/1", "pass_rate": 1.0,
+                "items": [{
+                    "id": "vi-001", "category": "vision",
+                    "prompt": "what color?",
+                    "actual": "red",
+                    "pass": True, "latency_ms": 320,
+                    "tokens_in": 50, "tokens_out": 3,
+                    "fixture": "images/vision/v01_solid_red.png",
+                    "scorer_used": "substring",
+                }],
+            },
+        },
+    }))
+    out = srv.render_run_detail("r-vis")
+    assert "/fixtures/images/vision/v01_solid_red.png" in out
+    assert "<img" in out
+    assert "输入图像" in out
+    # Card-style markup (PR#61)
+    assert "item-card" in out
+    assert "通过" in out
+
+
+def test_pr62_na_category_renders_friendly_chinese_message(
+    tmp_path, monkeypatch,
+):
+    """When a category is `applicable=False` because the model doesn't
+    declare the right pipeline_tag, the panel must show a friendly
+    Chinese explanation — NOT the cryptic raw 'missing capability_tags'
+    string from the orchestrator log."""
+    import importlib
+    srv = importlib.import_module("panel.server")
+    monkeypatch.setattr(srv, "DATA_ROOT", tmp_path)
+    rd = tmp_path / "runs" / "r-text"
+    (rd / "_meta").mkdir(parents=True)
+    (rd / "state.json").write_text(json.dumps({
+        "run_id": "r-text", "hf_id": "Qwen/Qwen2.5-0.5B", "status": "ok",
+        "created_at": 1, "ended_at": 2, "stages": {},
+    }))
+    (rd / "capability.json").write_text(json.dumps({
+        "categories": {
+            "tts": {
+                "applicable": False, "scorer": "substring",
+                "reason": "missing capability_tags: tts",
+                "items": [],
+            },
+            "image_gen": {
+                "applicable": False, "scorer": "substring",
+                "reason": "missing capability_tags: image_gen",
+                "items": [],
+            },
+        },
+    }))
+    out = srv.render_run_detail("r-text")
+    assert "未适用" in out
+    # Chinese-friendly TTS reason, not raw English
+    assert "TTS" in out
+    assert "未声明" in out
+    # No raw orchestrator string bleeds through
+    assert "missing capability_tags" not in out
+
+
 def test_pr59_first_impression_chinese_short_and_no_think(monkeypatch):
     import importlib
     sr = importlib.import_module("cc_agent.showcase_runner")

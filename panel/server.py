@@ -177,6 +177,254 @@ def failure_zh(text: str | None) -> str:
     return f"原文：{s}"
 
 
+# ---------- PR#60: clickable hf_id + multimodal preview helpers ----------
+#
+# The user explicitly asked: "所有页面里出现了模型名称就要能够跳转".
+# Every hf_id rendered anywhere on the panel must link to:
+#   (a) the local run-detail page if a run exists, OR
+#   (b) the HF Hub page so users can read the model card
+# The convention is: clicking the hf_id text opens the model on
+# HF Hub in a new tab; a small "📄" icon links to /run/<id> for the
+# detail view when applicable. This keeps the surface uniform across
+# results / candidates / queue / index / run-detail / showcase cards.
+
+_FIXTURES_ROOT = Path(
+    os.environ.get(
+        "HEYI_EVAL_FIXTURES_ROOT",
+        "/home/ai/heyi-eval-v10/orchestrator/capability_data/fixtures",
+    ),
+)
+_FIXTURE_REL_RE = re.compile(r"^[A-Za-z0-9_/.\-]{1,200}$")
+_FIXTURE_BAD = re.compile(r"\.\.|/{2,}|^/")
+
+
+def _is_safe_fixture_path(rel: str) -> bool:
+    """Validate a fixture relative path. Rejects:
+    - empty/oversized
+    - '..' traversal, leading '/', double slashes
+    - characters outside the safe whitelist
+    """
+    if not rel or len(rel) > 200:
+        return False
+    if _FIXTURE_BAD.search(rel):
+        return False
+    if not _FIXTURE_REL_RE.match(rel):
+        return False
+    return True
+
+
+def hf_hub_url(hf_id: str | None) -> str:
+    if not hf_id or "/" not in hf_id:
+        return "#"
+    return f"https://huggingface.co/{hf_id}"
+
+
+def hf_link(
+    hf_id: str | None, *,
+    run_id: str | None = None,
+    show_run_icon: bool = True,
+    css_class: str = "",
+) -> str:
+    """Render an hf_id as: <a target=_blank href=HF>org/name</a> [📄 → /run/<id>].
+
+    - hf_id text → HF Hub (always, opens new tab)
+    - 📄 icon → local /run/<id> page (only if run_id given)
+    The user can both inspect the model card on HF and dive into our
+    evaluation in one glance. ``css_class`` lets callers theme the
+    text (e.g. larger header link vs inline table link).
+    """
+    if not hf_id:
+        return "<span class='muted'>-</span>"
+    safe = html.escape(hf_id)
+    hub = html.escape(hf_hub_url(hf_id), quote=True)
+    cls = f" class='{html.escape(css_class, quote=True)}'" if css_class else ""
+    link = (
+        f"<a{cls} href='{hub}' target='_blank' rel='noopener noreferrer' "
+        f"title='在 HuggingFace Hub 查看模型卡'>{safe}</a>"
+    )
+    if show_run_icon and run_id:
+        run_safe = html.escape(run_id, quote=True)
+        link += (
+            f" <a class='run-icon' href='/run/{run_safe}' "
+            f"title='查看本地评测详情'>📄</a>"
+        )
+    return link
+
+
+def hf_publisher_link(name: str | None) -> str:
+    """Publisher name → https://huggingface.co/<name> (no slash)."""
+    if not name:
+        return "<span class='muted'>-</span>"
+    n = html.escape(name)
+    n_attr = html.escape(name, quote=True)
+    return (
+        f"<a href='https://huggingface.co/{n_attr}' target='_blank' "
+        f"rel='noopener noreferrer' title='在 HuggingFace 查看该厂商'>{n}</a>"
+    )
+
+
+# PR#61: shared stylesheet — modern dark theme, card-based, lots of
+# breathing room. Used by /run/<id>, /candidates, /results and the
+# main /. Kept as a single constant so updates are one-file.
+_PANEL_STYLES = """<style>
+:root{
+  --bg:#0b0b10; --bg-card:#15151c; --bg-card-2:#1a1a22;
+  --border:#262630; --border-2:#2f2f3a;
+  --text:#e7e7ea; --text-2:#b3b3bf; --text-3:#7a7a86;
+  --accent:#7cb7ff; --accent-2:#5ad48d; --warn:#e9b870; --err:#ef5f64;
+  --info:#a8aaf7;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace;
+  --sans:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Hiragino Sans GB','Microsoft YaHei',sans-serif;
+}
+*,*::before,*::after{box-sizing:border-box}
+html,body{background:var(--bg);color:var(--text);margin:0;padding:0;font-family:var(--sans);
+  font-size:14px;line-height:1.6;-webkit-font-smoothing:antialiased}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+code{font-family:var(--mono);font-size:0.9em;background:#0a0a10;padding:1px 5px;border-radius:3px;
+  border:1px solid var(--border)}
+pre{font-family:var(--mono);font-size:12px;line-height:1.55;background:#08080c;
+  border:1px solid var(--border);border-radius:6px;padding:12px 14px;overflow-x:auto;
+  max-height:480px;white-space:pre-wrap;word-break:break-word}
+.muted{color:var(--text-3)}
+.empty-note{padding:24px;text-align:center;font-style:italic}
+
+/* Page chrome */
+.page-header{padding:18px 28px;background:var(--bg-card);border-bottom:1px solid var(--border);
+  display:flex;flex-direction:column;gap:6px}
+.page-header .header-left{font-size:13px}
+.page-header .breadcrumb-sep{color:var(--text-3);margin:0 6px}
+.page-header .page-title{margin:4px 0 0;font-size:22px;font-weight:600;letter-spacing:-0.01em}
+.page-header .header-sub{font-size:12px}
+.back-link{font-weight:500}
+.hf-header-link{color:#fff !important;font-weight:600}
+.hf-header-link:hover{color:var(--accent) !important;text-decoration:underline}
+.run-icon{font-size:0.85em;opacity:0.7;margin-left:3px;text-decoration:none !important}
+.run-icon:hover{opacity:1}
+
+main{padding:20px 28px 80px;max-width:1500px;margin:0 auto}
+.card-section{background:var(--bg-card);border:1px solid var(--border);border-radius:10px;
+  padding:18px 22px;margin-bottom:18px}
+.card-section h2{margin:0 0 14px;font-size:13px;color:var(--text-2);
+  text-transform:uppercase;letter-spacing:0.08em;font-weight:600}
+.card-section h3{margin:18px 0 8px;font-size:12px;color:var(--text-2);
+  text-transform:uppercase;letter-spacing:0.05em;font-weight:600}
+.raw-section summary{cursor:pointer;color:var(--text-2);font-size:13px}
+.raw-section summary:hover{color:var(--text)}
+
+/* Pills (unified) */
+.pill{display:inline-block;padding:3px 10px;border-radius:12px;font-size:11px;
+  background:#22222c;color:var(--text-2);white-space:nowrap;font-weight:500;
+  border:1px solid var(--border-2)}
+.pill-ok{background:#15331f;color:#5ad48d;border-color:#1f4a2d}
+.pill-err{background:#3a1820;color:#ef5f64;border-color:#5a232f}
+.pill-warn{background:#3a2a18;color:#e9b870;border-color:#5a4322}
+.pill-info{background:#1a2245;color:#a8aaf7;border-color:#2f3a6a}
+.pill-muted{background:#1a1a22;color:#6a6a76;border-color:#262630}
+.pill-big{font-size:14px;padding:6px 14px;border-radius:14px}
+
+/* Overall banner */
+.overall-banner{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:14px}
+.overall-banner .fail-text{color:var(--err);font-size:13px}
+
+/* Metadata pills (4-column grid) */
+.meta-pills{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-top:8px}
+.meta-pill{background:var(--bg-card-2);border:1px solid var(--border);
+  border-radius:8px;padding:10px 14px;display:flex;flex-direction:column;gap:2px}
+.meta-pill label{font-size:10px;color:var(--text-3);text-transform:uppercase;letter-spacing:0.05em}
+.meta-pill .val{font-size:14px;color:var(--text);font-weight:500}
+
+/* Stages table */
+.stages-table{width:100%;border-collapse:collapse;font-size:13px}
+.stages-table th{text-align:left;padding:8px 12px;color:var(--text-2);font-size:11px;
+  text-transform:uppercase;letter-spacing:0.05em;font-weight:600;border-bottom:1px solid var(--border-2)}
+.stages-table td{padding:9px 12px;border-bottom:1px solid var(--border)}
+.stages-table tr:last-child td{border-bottom:none}
+.stage-cell{min-width:140px}
+.stage-zh{font-weight:500}
+.stage-en{font-size:10px;color:var(--text-3);font-family:var(--mono)}
+.dur-cell{color:var(--text-2);font-variant-numeric:tabular-nums}
+.err-cell{color:var(--err);font-size:12px;max-width:600px}
+
+/* Capability overall */
+.cap-overall{margin-bottom:18px;padding-bottom:14px;border-bottom:1px solid var(--border)}
+.cap-overall .big-score{font-size:28px;font-weight:600;color:var(--accent-2);font-variant-numeric:tabular-nums}
+
+/* Category blocks */
+.cap-cat{background:var(--bg-card-2);border:1px solid var(--border);
+  border-radius:8px;padding:12px 16px;margin-bottom:12px}
+.cap-cat[open]>summary{margin-bottom:14px;border-bottom:1px solid var(--border);padding-bottom:12px}
+.cap-cat>summary{cursor:pointer;list-style:none}
+.cap-cat>summary::-webkit-details-marker{display:none}
+.cap-cat.cat-na{padding:14px 16px}
+.cat-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.cat-name{font-weight:600;font-size:14px;color:var(--text)}
+.cat-na .cat-na-reason{margin-top:6px;font-size:12px;font-style:italic}
+
+/* Item card grid */
+.item-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(420px,1fr));gap:12px}
+.item-card{background:var(--bg);border:1px solid var(--border-2);border-radius:8px;
+  padding:12px 14px;display:flex;flex-direction:column;gap:8px;
+  border-left:3px solid var(--border-2)}
+.item-card.item-ok{border-left-color:var(--accent-2)}
+.item-card.item-err{border-left-color:var(--err)}
+.item-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px}
+.item-id{font-family:var(--mono);color:var(--text-2);font-size:11px;background:#0a0a10;
+  padding:2px 7px;border-radius:4px;border:1px solid var(--border)}
+.item-meta{font-size:10px;color:var(--text-3);margin-left:auto;font-family:var(--mono)}
+.item-body{display:flex;flex-direction:column;gap:8px}
+.item-prompt label,.item-actual label,.show-rationale label,.show-comment label,
+.show-summary label,.first-impression label{font-size:10px;color:var(--text-3);
+  text-transform:uppercase;letter-spacing:0.05em;font-weight:600;display:block;margin-bottom:4px}
+.prompt-text{color:var(--text-2);font-size:13px;line-height:1.55;white-space:pre-wrap;word-break:break-word}
+.actual-text{font-family:var(--mono);font-size:12px;background:#08080c;
+  border:1px solid var(--border);border-radius:6px;padding:10px 12px;
+  white-space:pre-wrap;word-break:break-word;max-height:360px;overflow-y:auto;margin:6px 0 0}
+.item-actual details>summary,.item-prompt details>summary{cursor:pointer;font-size:12px;color:var(--accent);padding:3px 0}
+
+/* Fixture image preview */
+.fixture-preview img{display:block}
+
+/* Showcase */
+.first-impression{margin-bottom:10px;display:flex;align-items:center;gap:10px}
+.show-summary{background:var(--bg-card-2);border:1px solid var(--border);
+  border-radius:8px;padding:12px 16px;margin-bottom:14px}
+.show-summary p{margin:0;line-height:1.8;font-size:14px;color:var(--text)}
+.show-card{background:var(--bg);border:1px solid var(--border-2);border-radius:8px;padding:12px 14px;
+  display:flex;flex-direction:column;gap:8px}
+.show-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px}
+.show-body{display:flex;flex-direction:column;gap:8px}
+.show-rationale>div,.show-comment>div{color:var(--text-2);font-size:13px;line-height:1.55}
+.show-comment{background:#2a230f;border:1px solid #5a4322;border-radius:6px;padding:8px 12px;color:#e9b870}
+.show-comment label{color:#e9b870}
+</style>"""
+
+
+def render_fixture_preview(
+    fixture: str | None,
+    *,
+    max_height_px: int = 180,
+) -> str:
+    """Render an <img> tag for a fixture path. The panel exposes
+    fixtures via GET /fixtures/<rel>, validated by _is_safe_fixture_path.
+    Returns empty string if fixture is missing or invalid; never raises.
+    """
+    if not fixture:
+        return ""
+    if not _is_safe_fixture_path(fixture):
+        return ""
+    src = "/fixtures/" + fixture
+    safe = html.escape(src, quote=True)
+    return (
+        f"<div class='fixture-preview' style='margin:6px 0'>"
+        f"<img src='{safe}' alt='{html.escape(fixture)}' "
+        f"style='max-height:{max_height_px}px;max-width:100%;"
+        f"border:1px solid #2a2a32;border-radius:4px;background:#fff'/>"
+        f"<div class='muted' style='font-size:10px;margin-top:2px'>"
+        f"输入图像：{html.escape(fixture)}</div></div>"
+    )
+
+
 # ---------- data readers (read-only over HEYI_EVAL_DATA) ----------
 
 def _read_json(path: Path) -> dict | None:
@@ -1047,10 +1295,38 @@ async function getJSON(url) {
 }
 
 function pillStatus(s) {
-  if (s === 'ok') return '<span class="pill ok">ok</span>';
-  if (s === 'failed' || s === 'aborted') return '<span class="pill err">' + s + '</span>';
-  if (s === 'running') return '<span class="pill run">running</span>';
-  return '<span class="pill muted">' + (s || '-') + '</span>';
+  // PR#57: localized status labels match the server-side status_zh map.
+  const ZH = {ok:'成功', failed:'失败', aborted:'已中止',
+              in_progress:'进行中', queued:'排队中', skipped:'跳过',
+              running:'进行中'};
+  const label = ZH[s] || s || '-';
+  if (s === 'ok') return '<span class="pill pill-ok" title="'+s+'">'+label+'</span>';
+  if (s === 'failed' || s === 'aborted') return '<span class="pill pill-err" title="'+s+'">'+label+'</span>';
+  if (s === 'in_progress' || s === 'running' || s === 'queued') return '<span class="pill pill-info" title="'+s+'">'+label+'</span>';
+  return '<span class="pill pill-muted" title="'+s+'">'+label+'</span>';
+}
+
+// PR#60: client-side equivalent of panel.server.hf_link — every place
+// that prints a model id on the dashboard tables uses this so users
+// can jump to either the model card on HF or the local run detail.
+function escHTML(s){return String(s||'').replace(/[&<>\"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));}
+function hfLinkJS(hfId, runId, showIcon) {
+  if (!hfId || hfId === '?') return '<span class="muted">-</span>';
+  const safe = escHTML(hfId);
+  const enc = encodeURIComponent(hfId);
+  let out = '<a href="https://huggingface.co/'+enc+'" target="_blank" '
+          + 'rel="noopener noreferrer" title="在 HuggingFace Hub 查看模型卡">'+safe+'</a>';
+  if (showIcon && runId) {
+    out += ' <a class="run-icon" href="/run/'+encodeURIComponent(runId)+'" title="查看本地评测详情">📄</a>';
+  }
+  return out;
+}
+function publisherLinkJS(name) {
+  if (!name) return '<span class="muted">-</span>';
+  const safe = escHTML(name);
+  const enc = encodeURIComponent(name);
+  return '<a href="https://huggingface.co/'+enc+'" target="_blank" '
+       + 'rel="noopener noreferrer" title="在 HuggingFace 查看该厂商">'+safe+'</a>';
 }
 
 function formatDuration(s) {
@@ -1186,7 +1462,10 @@ async function refreshQueue() {
   document.getElementById('queue-summary').innerHTML =
     `待评测 <strong>${q.pending_count}</strong> 个${etaLabel}`;
   const qbody = document.querySelector('#queue-table tbody');
-  qbody.innerHTML = (q.pending||[]).map(p => `<tr><td><code>${p.run_id||'-'}</code></td><td>${p.hf_id||'-'}</td></tr>`).join('') ||
+  qbody.innerHTML = (q.pending||[]).map(p =>
+    `<tr><td><a href="/run/${encodeURIComponent(p.run_id||'')}"><code>${escHTML((p.run_id||'').substring(0,32))}…</code></a></td>`
+    + `<td>${hfLinkJS(p.hf_id, p.run_id, false)}</td></tr>`
+  ).join('') ||
     '<tr><td colspan="2" class="muted">空 — 等待下次自动入队 / 或在 <a href="/candidates">候选模型</a> 页手动入队</td></tr>';
 }
 
@@ -1215,11 +1494,11 @@ async function refreshResults() {
     const ttft = (typeof r.ttft_ms_p50 === 'number') ? `${r.ttft_ms_p50.toFixed(0)}ms` : (r.perf_applicable === false ? '<span class="muted">N/A</span>' : '<span class="muted">-</span>');
     const tps  = (typeof r.tps_p50 === 'number') ? `${r.tps_p50.toFixed(1)} tok/s` : (r.perf_applicable === false ? '<span class="muted">N/A</span>' : '<span class="muted">-</span>');
     return `<tr>
-      <td><a href="/run/${encodeURIComponent(r.run_id)}"><strong>${r.hf_id||'-'}</strong></a>
-        <div class="muted" style="font-size:11px">${r.publisher||''}</div></td>
+      <td><strong>${hfLinkJS(r.hf_id, r.run_id, true)}</strong>
+        <div class="muted" style="font-size:11px">${publisherLinkJS(r.publisher)}</div></td>
       <td>${pillStatus(r.status)}</td>
-      <td>${r.modality||'<span class="muted">-</span>'}</td>
-      <td>${r.engine||'<span class="muted">-</span>'}</td>
+      <td>${escHTML(r.modality)||'<span class="muted">-</span>'}</td>
+      <td>${escHTML(r.engine)||'<span class="muted">-</span>'}</td>
       <td>${cap}</td>
       <td>${pr}</td>
       <td>${ttft}</td>
@@ -1243,8 +1522,8 @@ async function refreshRuns() {
   rbody.innerHTML = (runs||[]).slice(0, 30).map(r => {
     const stages = STAGES.map(s => pillStatus((r.stages||{})[s])).join('</td><td>');
     return `<tr class="stage-row">
-      <td><a href="/run/${encodeURIComponent(r.run_id)}"><code>${r.run_id.substring(0,28)}…</code></a></td>
-      <td>${r.hf_id || '-'}</td>
+      <td><a href="/run/${encodeURIComponent(r.run_id)}"><code>${escHTML(r.run_id.substring(0,28))}…</code></a></td>
+      <td>${hfLinkJS(r.hf_id, r.run_id, true)}</td>
       <td>${pillStatus(r.status)}</td>
       <td>${stages}</td>
       <td>${formatDuration(r.duration_s)}</td>
@@ -1382,9 +1661,13 @@ def render_candidates_page() -> str:
                 f"onclick='enqueueModel(this)'>{label}</button>"
             )
 
+        # PR#60: hf_id text becomes a link to HF Hub + 📄 to run detail
+        hf_cell = hf_link(hf_raw if hf_raw != "-" else None,
+                          run_id=run_id,
+                          show_run_icon=False)  # run_id link is its own column already
         rows_html.append(
             f"<tr>"
-            f"<td><strong>{hf}</strong>{fail_html}</td>"
+            f"<td><strong>{hf_cell}</strong>{fail_html}</td>"
             f"<td><span class='pill {st_cls}' title='{html.escape(st)}'>{st_label}</span></td>"
             f"<td>{params_html}</td>"
             f"<td>{pipe}</td>"
@@ -1709,10 +1992,17 @@ def render_results_page() -> str:
         )
 
         status_zh_label = html.escape(r.get("status_zh") or status_zh(status))
+        # PR#60: hf_id text → HF Hub (new tab), 📄 icon → local run
+        # detail; publisher name → HF Hub publisher page.
+        pub_link = (
+            hf_publisher_link(r.get("publisher"))
+            if r.get("publisher") else "<span class='muted'>-</span>"
+        )
+        hf_cell = hf_link(r.get("hf_id"), run_id=r.get("run_id"))
         rows_html.append(
             f"<tr><td>{when_cell}</td>"
-            f"<td><a href='/run/{html.escape(r.get('run_id', ''))}'><strong>{hf}</strong></a>"
-            f"<div class='muted' style='font-size:11px'>{pub}</div></td>"
+            f"<td><strong>{hf_cell}</strong>"
+            f"<div class='muted' style='font-size:11px'>{pub_link}</div></td>"
             f"<td><span class='pill {status_cls}' title='{html.escape(status)}'>{status_zh_label}</span></td>"
             f"<td>{modality}</td><td>{params}</td><td>{license_}</td>"
             f"<td>{engine}</td>"
@@ -1774,17 +2064,106 @@ a{{color:#6ec0ff;text-decoration:none}} a:hover{{text-decoration:underline}}
 # ── PR#18: CAPABILITY (multimodal) + PERF_BENCH renderers ─────────────────
 
 
-def _render_item_row(r: dict) -> str:
-    """Render a single capability item row. Used by both the per-category
-    table and the legacy flat-results fallback."""
-    cls = "ok" if r.get("pass") else "err"
+def _render_item_card(r: dict) -> str:
+    """PR#61: card-based per-item rendering. Replaces the cramped table
+    row that lost detail behind 80-char truncation. Cards show:
+      - PASS/FAIL pill + latency
+      - full prompt (no truncation, wrapped)
+      - fixture image preview when present (vision/ocr items)
+      - full model output in a monospace block (collapsible if long)
+      - scorer attribution + tokens i/o on the footer
+
+    User feedback: "页面太丑了 ... 又图片、音频、视频的，你从测试到结果
+    都要能够支持预览这些内容". Visual hierarchy now leads with image
+    input + verdict, then prompt, then output."""
+    passed = bool(r.get("pass"))
+    cls = "ok" if passed else "err"
+    verdict = "通过" if passed else "未通过"
+    iid = html.escape(r.get("id", ""))
+    prompt = html.escape(r.get("prompt") or "")
+    actual_raw = r.get("actual") or ""
+    actual = html.escape(actual_raw)
+    latency = r.get("latency_ms")
+    tokens_in = r.get("tokens_in") or 0
+    tokens_out = r.get("tokens_out") or 0
+    scorer = html.escape(r.get("scorer_used") or r.get("scorer") or "-")
+    fixture_html = render_fixture_preview(r.get("fixture"))
+
+    # Collapse very long outputs by default; users can expand.
+    long_output = len(actual_raw) > 400
+    out_open = "" if long_output else " open"
+
     return (
-        f"<tr><td>{html.escape(r.get('id',''))}</td>"
-        f"<td><code>{html.escape((r.get('prompt') or '')[:80])}</code></td>"
-        f"<td class='{cls}'>{'PASS' if r.get('pass') else 'FAIL'}</td>"
-        f"<td>{r.get('latency_ms')}ms</td>"
-        f"<td><code>{html.escape((r.get('actual') or '')[:80])}</code></td></tr>"
+        f"<article class='item-card item-{cls}'>"
+        f"<header class='item-head'>"
+        f"<span class='item-id'>{iid}</span>"
+        f"<span class='pill pill-{cls}'>{verdict}</span>"
+        f"<span class='item-meta'>"
+        f"{latency} ms · in {tokens_in}t · out {tokens_out}t · scorer={scorer}"
+        f"</span></header>"
+        f"<div class='item-body'>"
+        f"<div class='item-prompt'><label>题目</label>"
+        f"<div class='prompt-text'>{prompt}</div>"
+        f"{fixture_html}</div>"
+        f"<div class='item-actual'>"
+        f"<details{out_open}><summary>模型作答 ({len(actual_raw)} 字符)</summary>"
+        f"<pre class='actual-text'>{actual}</pre></details></div>"
+        f"</div></article>"
     )
+
+
+def _render_item_row(r: dict) -> str:
+    """Back-compat helper: PR#18 tests still call _render_item_row.
+    Kept as a thin alias so old call sites keep working; new code
+    should call _render_item_card directly."""
+    return _render_item_card(r)
+
+
+_CATEGORY_ZH = {
+    "text_reasoning":      "文本推理",
+    "code_gen":            "代码生成",
+    "code_repair":         "代码修复",
+    "code_complete":       "代码补全",
+    "vision":              "视觉理解",
+    "ocr":                 "光学字符识别 (OCR)",
+    "asr":                 "语音识别 (ASR)",
+    "tts":                 "语音合成 (TTS)",
+    "image_gen":           "图像生成",
+    "video_gen":           "视频生成",
+    "music_gen":           "音乐生成",
+    "music_understanding": "音乐理解",
+    "video_understanding": "视频理解",
+}
+
+# PR#62: when a category is `applicable=False` because the model
+# doesn't have the relevant pipeline_tag, surface a clear Chinese
+# explanation instead of the cryptic "missing capability_tags: ..."
+# string that bleeds the orchestrator's debug log into the UI.
+_NA_REASON_ZH = {
+    "image_gen":           "该模型未声明图像生成能力（HF pipeline_tag 不含 text-to-image），跳过此类目",
+    "video_gen":           "该模型未声明视频生成能力（HF pipeline_tag 不含 text-to-video），跳过此类目",
+    "music_gen":           "该模型未声明音频/音乐生成能力，跳过此类目",
+    "tts":                 "该模型未声明 TTS 能力（HF pipeline_tag 不含 text-to-speech），跳过此类目",
+    "asr":                 "该模型未声明 ASR 能力（HF pipeline_tag 不含 automatic-speech-recognition），跳过此类目",
+    "vision":              "该模型未声明视觉理解能力（HF pipeline_tag 不含 image-text-to-text），跳过此类目",
+    "ocr":                 "该模型未声明 OCR/视觉能力，跳过此类目",
+    "video_understanding": "该模型未声明视频理解能力，跳过此类目",
+    "music_understanding": "该模型未声明音乐理解能力，跳过此类目",
+}
+
+
+def _category_label(name: str) -> str:
+    zh = _CATEGORY_ZH.get(name)
+    return f"{zh}（{name}）" if zh else name
+
+
+def _na_reason_zh(cat_name: str, raw_reason: str | None) -> str:
+    pretty = _NA_REASON_ZH.get(cat_name)
+    if pretty:
+        return pretty
+    if raw_reason and raw_reason.startswith("missing capability_tags"):
+        return f"模型未声明此类目所需的 capability_tags（{raw_reason.split(':',1)[-1].strip()}）"
+    return raw_reason or "该类目不适用于当前模型"
 
 
 def _render_capability_html(cap: dict) -> str:
@@ -1793,36 +2172,52 @@ def _render_capability_html(cap: dict) -> str:
     PR#15+: ``cap.categories`` is a dict
         { category_name: {applicable, scorer, score, pass_rate, items, reason?} }
     Each category renders as a collapsible <details> block with its own
-    pass-rate banner + items table.
+    pass-rate banner + a card grid for items.
 
     Legacy artifacts (pre-PR#15) only have ``cap.results``: rendered as a
-    single flat table for back-compat.
+    single card grid for back-compat.
     """
     if not cap:
         return ""
 
+    overall_score = html.escape(cap.get("score") or "?")
+    overall_pr = cap.get("pass_rate")
+    overall_pct = (
+        f"{overall_pr*100:.0f}%" if isinstance(overall_pr, (int, float)) else "?"
+    )
     overall = (
-        f"<p>score: <strong>{html.escape(cap.get('score') or '?')}</strong> · "
-        f"pass_rate: {cap.get('pass_rate')}</p>"
+        "<div class='cap-overall'>"
+        f"<span class='big-score'>{overall_score}</span>"
+        f"<span class='muted'> · 总通过率 {overall_pct}</span>"
+        "</div>"
     )
 
     categories = cap.get("categories") or {}
     if categories:
+        # Sort so applicable categories come first, then by name
+        sorted_cats = sorted(
+            categories.items(),
+            key=lambda kv: (not (kv[1] or {}).get("applicable"), kv[0]),
+        )
         blocks: list[str] = []
-        for cat_name in sorted(categories):
-            info = categories[cat_name] or {}
+        for cat_name, info in sorted_cats:
+            info = info or {}
             applicable = bool(info.get("applicable"))
             score = info.get("score") or "0/0"
             pass_rate = info.get("pass_rate")
             scorer = info.get("scorer") or ""
             reason = info.get("reason") or ""
+            label = _category_label(cat_name)
 
             if not applicable:
                 blocks.append(
-                    f"<details><summary class='muted'>"
-                    f"{html.escape(cat_name)} — "
-                    f"<span class='pill'>N/A</span> "
-                    f"{html.escape(reason)}</summary></details>"
+                    f"<div class='cap-cat cat-na'>"
+                    f"<div class='cat-head'>"
+                    f"<span class='cat-name'>{html.escape(label)}</span> "
+                    f"<span class='pill pill-muted'>未适用</span></div>"
+                    f"<div class='cat-na-reason muted'>"
+                    f"{html.escape(_na_reason_zh(cat_name, reason))}</div>"
+                    f"</div>"
                 )
                 continue
 
@@ -1836,27 +2231,25 @@ def _render_capability_html(cap: dict) -> str:
                 else "warn" if isinstance(pass_rate, (int, float)) and pass_rate >= 0.5
                 else "err"
             )
-            rows = "".join(_render_item_row(r) for r in items)
+            open_attr = (
+                "open" if (pass_rate is None or pass_rate < 1.0) and items else ""
+            )
+            cards = "".join(_render_item_card(r) for r in items)
             blocks.append(
-                f"<details {'open' if pass_rate not in (1, 1.0) and items else ''}>"
-                f"<summary><strong>{html.escape(cat_name)}</strong> "
-                f"<span class='pill {pass_cls}'>{score}</span> "
-                f"<span class='muted'>({pass_pct} pass · scorer={html.escape(scorer)})</span>"
-                f"</summary>"
-                "<table><thead><tr><th>id</th><th>prompt</th><th>result</th>"
-                "<th>latency</th><th>actual</th></tr></thead>"
-                f"<tbody>{rows}</tbody></table></details>"
+                f"<details class='cap-cat' {open_attr}>"
+                f"<summary class='cat-head'>"
+                f"<span class='cat-name'>{html.escape(label)}</span> "
+                f"<span class='pill pill-{pass_cls}'>{html.escape(score)}</span> "
+                f"<span class='muted'>"
+                f"通过率 {pass_pct} · 评分器 {html.escape(scorer)}"
+                f"</span></summary>"
+                f"<div class='item-grid'>{cards}</div></details>"
             )
         return overall + "".join(blocks)
 
     if cap.get("results"):
-        rows = "".join(_render_item_row(r) for r in cap["results"])
-        return (
-            overall
-            + "<table><thead><tr><th>id</th><th>prompt</th><th>result</th>"
-            "<th>latency</th><th>actual</th></tr></thead>"
-            f"<tbody>{rows}</tbody></table>"
-        )
+        cards = "".join(_render_item_card(r) for r in cap["results"])
+        return overall + f"<div class='item-grid'>{cards}</div>"
 
     return ""
 
@@ -1927,21 +2320,43 @@ def render_run_detail(run_id: str) -> str:
     cap_html = _render_capability_html(cap)
     perf_html = _render_perf_bench_html(detail.get("perf_bench") or {})
 
-    # PR#57: render the showcase summary with the <think> block stripped
-    # (artifact may have been written before PR#59 landed) and with
-    # first_impression rendered as a Chinese pill above the long body.
+    hf_id = state.get("hf_id") or ""
+
+    # PR#61: showcase rendering rebuilt as proper cards with prompt
+    # collapsibles and "first impression" headline.
     show_html = ""
     if show.get("items"):
         cards = []
         for it in show["items"]:
+            iid = html.escape(it.get("id", ""))
+            rationale = html.escape(it.get("rationale", "") or "")
+            prompt = html.escape(it.get("prompt", "") or "")
+            actual = it.get("actual", "") or ""
+            actual_h = html.escape(actual)
+            comment = html.escape(it.get("comment", "") or "")
+            tok_out = it.get("tokens_out") or 0
+            lat = it.get("latency_ms") or 0
+            long_output = len(actual) > 600
+            out_open = "" if long_output else " open"
             cards.append(
-                "<div style='border:1px solid #26262e;padding:12px;border-radius:6px;margin-bottom:10px'>"
-                f"<div class='muted' style='font-size:11px'>{html.escape(it.get('id',''))} · {it.get('tokens_out')}t out · {it.get('latency_ms')}ms</div>"
-                f"<div style='margin:4px 0;color:#b8b8c4;font-size:12px'><strong>题目意图</strong>：{html.escape(it.get('rationale',''))}</div>"
-                f"<details><summary>题目原文</summary><pre>{html.escape(it.get('prompt',''))}</pre></details>"
-                f"<details open><summary>模型作答</summary><pre>{html.escape(it.get('actual',''))}</pre></details>"
-                f"<div style='margin-top:4px;color:#e9b870;font-size:12px'><strong>系统注释</strong>：{html.escape(it.get('comment',''))}</div>"
-                "</div>"
+                f"<article class='show-card'>"
+                f"<header class='show-head'>"
+                f"<span class='item-id'>{iid}</span>"
+                f"<span class='item-meta'>{lat} ms · 输出 {tok_out} tokens</span>"
+                f"</header>"
+                f"<div class='show-body'>"
+                f"<div class='show-rationale'>"
+                f"<label>题目意图</label>"
+                f"<div>{rationale}</div></div>"
+                f"<details><summary>题目原文</summary>"
+                f"<pre class='prompt-text'>{prompt}</pre></details>"
+                f"<details{out_open}>"
+                f"<summary>模型作答 ({len(actual)} 字符)</summary>"
+                f"<pre class='actual-text'>{actual_h}</pre></details>"
+                + (f"<div class='show-comment'>"
+                   f"<label>系统注释</label><div>{comment}</div></div>"
+                   if comment else "")
+                + "</div></article>"
             )
         first = html.escape(show.get("model_first_impression") or "")
         summary_raw = show.get("summary") or ""
@@ -1952,21 +2367,25 @@ def render_run_detail(run_id: str) -> str:
             pass
         summary = html.escape(summary_raw)
         first_html = (
-            f"<p><strong>首印象</strong>：<span class='pill'>{first}</span></p>"
+            f"<div class='first-impression'>"
+            f"<label>首印象</label>"
+            f"<span class='pill pill-info'>{first}</span></div>"
             if first else
-            "<p><strong>首印象</strong>：<span class='muted'>未生成</span></p>"
+            "<div class='first-impression muted'>"
+            "<label>首印象</label>未生成</div>"
+        )
+        summary_html = (
+            f"<div class='show-summary'><label>整体评价（LLM-as-judge）</label>"
+            f"<p>{summary}</p></div>"
+            if summary else ""
         )
         show_html = (
-            first_html
-            + f"<p style='line-height:1.7;white-space:pre-wrap'>{summary}</p>"
-            + "".join(cards)
+            first_html + summary_html
+            + f"<div class='item-grid'>{''.join(cards)}</div>"
         )
 
-    # PR#57: stages table at the top — gives the user a one-glance view
-    # of which stage failed/skipped, in Chinese, with the localized
-    # failure reason highlighted. Addresses "我看为什么都是空的" by
-    # making it obvious WHY the downstream sections (READY/CAPABILITY/
-    # SHOWCASE) have no data: the run aborted earlier.
+    # Stages table — vertical timeline-style list so users see at a
+    # glance which step failed and why.
     stages_rows = []
     for st_name, st_info in (state.get("stages") or {}).items():
         st = (st_info or {}).get("status", "?")
@@ -1977,18 +2396,21 @@ def render_run_detail(run_id: str) -> str:
         err = (st_info or {}).get("error") or ""
         err_zh = failure_zh(err) if err else ""
         stages_rows.append(
-            f"<tr><td><strong>{stage_zh(st_name)}</strong>"
-            f"<div class='muted' style='font-size:10px'>{st_name}</div></td>"
-            f"<td><span class='pill {cls}'>{status_zh(st)}</span></td>"
-            f"<td>{dur_s}</td>"
-            f"<td style='font-size:12px;color:#b8b8c4'>{html.escape(err_zh)}</td></tr>"
+            f"<tr><td class='stage-cell'>"
+            f"<div class='stage-zh'>{stage_zh(st_name)}</div>"
+            f"<div class='stage-en'>{st_name}</div></td>"
+            f"<td><span class='pill pill-{cls}'>{status_zh(st)}</span></td>"
+            f"<td class='dur-cell'>{dur_s}</td>"
+            f"<td class='err-cell'>{html.escape(err_zh)}</td></tr>"
         )
     stages_table = (
-        "<table><thead><tr><th>阶段</th><th>状态</th><th>耗时</th><th>失败原因（中文）</th></tr></thead>"
+        "<table class='stages-table'>"
+        "<thead><tr><th>阶段</th><th>状态</th><th>耗时</th>"
+        "<th>失败原因（中文）</th></tr></thead>"
         f"<tbody>{''.join(stages_rows) or '<tr><td colspan=4 class=muted>无</td></tr>'}</tbody></table>"
     )
 
-    # Top-level failure summary if the run aborted/failed
+    # Top-level overall banner + key metadata pills
     overall_status = state.get("status") or "?"
     overall_status_zh = status_zh(overall_status)
     overall_fr_raw = state.get("failure_reason") or ""
@@ -1998,60 +2420,92 @@ def render_run_detail(run_id: str) -> str:
         "in_progress": "warn",
     }.get(overall_status, "muted")
     overall_banner = (
-        f"<p>整体状态：<span class='pill {overall_banner_cls}'>{overall_status_zh}</span>"
-        + (f"　·　失败原因：<span class='err'>{html.escape(overall_fr_zh)}</span>"
+        f"<div class='overall-banner'>"
+        f"<span class='pill pill-{overall_banner_cls} pill-big'>"
+        f"{overall_status_zh}</span>"
+        + (f"<span class='fail-text'>失败原因：{html.escape(overall_fr_zh)}</span>"
            if overall_fr_zh else "")
-        + "</p>"
+        + "</div>"
     )
 
-    # Key metadata pills — params / modality / publisher
     params_pill = meta.get("param_count") or cur.get("param_count") or "-"
     modality_pill = meta.get("modality") or "-"
     publisher_dict = cur.get("publisher") or meta.get("publisher") or {}
-    publisher_pill = (
+    publisher_name = (
         publisher_dict.get("name") if isinstance(publisher_dict, dict)
-        else (publisher_dict or "-")
+        else (publisher_dict or None)
     )
     license_pill = meta.get("license") or cur.get("license") or "-"
     metadata_pills = (
-        f"<span class='pill'>参数量：{html.escape(str(params_pill))}</span> "
-        f"<span class='pill'>模态：{html.escape(str(modality_pill))}</span> "
-        f"<span class='pill'>厂商：{html.escape(str(publisher_pill or '-'))}</span> "
-        f"<span class='pill'>许可证：{html.escape(str(license_pill))}</span>"
+        "<div class='meta-pills'>"
+        f"<span class='meta-pill'><label>参数量</label>"
+        f"<span class='val'>{html.escape(str(params_pill))}</span></span>"
+        f"<span class='meta-pill'><label>模态</label>"
+        f"<span class='val'>{html.escape(str(modality_pill))}</span></span>"
+        f"<span class='meta-pill'><label>厂商</label>"
+        f"<span class='val'>{hf_publisher_link(publisher_name)}</span></span>"
+        f"<span class='meta-pill'><label>许可证</label>"
+        f"<span class='val'>{html.escape(str(license_pill))}</span></span>"
+        "</div>"
+    )
+
+    hf_link_header = hf_link(
+        hf_id, run_id=None, show_run_icon=False,
+        css_class="hf-header-link",
     )
 
     return f"""<!doctype html>
-<html lang="zh"><head><meta charset="utf-8"><title>{html.escape(run_id)}</title>
-<style>
-body{{font-family:system-ui,sans-serif;background:#0c0c10;color:#e7e7ea;margin:0;padding:0}}
-header{{padding:16px 24px;background:#14141a;border-bottom:1px solid #26262e}}
-main{{padding:18px 24px;max-width:1400px;margin:0 auto}}
-section{{background:#14141a;border:1px solid #26262e;border-radius:8px;padding:14px 18px;margin-bottom:16px}}
-section h2{{font-size:14px;margin:0 0 12px;color:#a9a9b6;text-transform:uppercase;letter-spacing:0.04em}}
-table{{width:100%;border-collapse:collapse;font-size:13px}}
-th,td{{text-align:left;padding:6px 10px;border-bottom:1px solid #20202a}}
-.ok{{color:#5ad48d}} .err{{color:#ef5f64}} .muted{{color:#6a6a76}}
-.pill{{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;background:#20202a;color:#b8b8c4}}
-code{{font-family:ui-monospace,Menlo,monospace;font-size:12px}}
-pre{{background:#08080c;border:1px solid #20202a;border-radius:4px;padding:10px;font-size:11px;overflow-x:auto;max-height:360px}}
-a{{color:#6ec0ff;text-decoration:none}} a:hover{{text-decoration:underline}}
-</style></head><body>
-<header><a href="/">← 返回</a> · <strong>{html.escape(run_id)}</strong>
-<div class='muted' style='font-size:12px'>hf_id: {html.escape(state.get('hf_id') or '?')}</div>
-</header><main>
-<section><h2>概览</h2>
-{overall_banner}
-<div style='margin:8px 0'>{metadata_pills}</div>
+<html lang="zh"><head><meta charset="utf-8"><title>{html.escape(hf_id or run_id)} · heyi-eval</title>
+{_PANEL_STYLES}
+</head><body>
+<header class='page-header'>
+  <div class='header-left'>
+    <a href="/" class='back-link'>← 返回主面板</a>
+    <span class='breadcrumb-sep'>·</span>
+    <a href="/results" class='back-link'>评测结果</a>
+  </div>
+  <h1 class='page-title'>{hf_link_header}</h1>
+  <div class='header-sub muted'>
+    run_id: <code>{html.escape(run_id)}</code>
+  </div>
+</header>
+<main>
+
+<section class='card-section'>
+  <h2>整体概览</h2>
+  {overall_banner}
+  {metadata_pills}
 </section>
-<section><h2>阶段执行（按发生顺序）</h2>{stages_table}</section>
-<section><h2>能力评测（多模态分轨）</h2>{cap_html or '<div class="muted">无（运行未走到此阶段）</div>'}</section>
-<section><h2>性能基准（TTFT / TPS / 并发 / VRAM）</h2>{perf_html or '<div class="muted">无（运行未走到此阶段）</div>'}</section>
-<section><h2>展示评测（LLM 自主设计的题目 + 中文摘要）</h2>{show_html or '<div class="muted">无（运行未走到此阶段）</div>'}</section>
-<section><h2>原始 state.json</h2><pre>{esc(state)}</pre></section>
-<section><h2>原始 engine.json</h2><pre>{esc(eng)}</pre></section>
-<section><h2>原始 metadata.json（HF + curator 合并）</h2><pre>{esc(meta)}</pre></section>
-<section><h2>原始 curated.json（LLM 解读）</h2><pre>{esc(cur)}</pre></section>
-<section><h2>原始 ready.json</h2><pre>{esc(ready)}</pre></section>
+
+<section class='card-section'>
+  <h2>阶段执行（按发生顺序）</h2>
+  {stages_table}
+</section>
+
+<section class='card-section'>
+  <h2>能力评测（多模态分轨）</h2>
+  {cap_html or '<div class="muted empty-note">无 — 运行未走到此阶段</div>'}
+</section>
+
+<section class='card-section'>
+  <h2>性能基准（TTFT / TPS / 并发 / VRAM）</h2>
+  {perf_html or '<div class="muted empty-note">无 — 运行未走到此阶段</div>'}
+</section>
+
+<section class='card-section'>
+  <h2>展示评测（LLM 自主设计的题目 + 中文评价）</h2>
+  {show_html or '<div class="muted empty-note">无 — 运行未走到此阶段</div>'}
+</section>
+
+<details class='card-section raw-section'>
+  <summary><strong>原始 JSON 数据</strong>（点击展开，便于排查）</summary>
+  <h3>state.json</h3><pre>{esc(state)}</pre>
+  <h3>engine.json</h3><pre>{esc(eng)}</pre>
+  <h3>metadata.json（HF + curator 合并）</h3><pre>{esc(meta)}</pre>
+  <h3>curated.json（LLM 解读）</h3><pre>{esc(cur)}</pre>
+  <h3>ready.json</h3><pre>{esc(ready)}</pre>
+</details>
+
 </main></body></html>"""
 
 
@@ -2112,10 +2566,52 @@ class Handler(BaseHTTPRequestHandler):
             elif path.startswith("/run/"):
                 run_id = path[len("/run/"):]
                 self._html(render_run_detail(run_id))
+            elif path.startswith("/fixtures/"):
+                # PR#60: serve capability fixture images (vision/ocr
+                # input PNGs) so the run detail page can render them
+                # inline next to each test item. Strict path validation
+                # rejects '..' traversal and characters outside the
+                # tight whitelist (see _is_safe_fixture_path).
+                self._serve_fixture(path[len("/fixtures/"):])
             else:
                 self._json({"error": "not_found", "path": path}, status=404)
         except Exception as e:
             self._json({"error": str(e), "type": type(e).__name__}, status=500)
+
+    def _serve_fixture(self, rel: str) -> None:
+        if not _is_safe_fixture_path(rel):
+            self._json({"error": "bad_fixture_path"}, status=400)
+            return
+        full = _FIXTURES_ROOT / rel
+        try:
+            # Resolve real path then re-check containment — defense in
+            # depth in case a symlink lives inside the fixtures tree.
+            real = full.resolve(strict=True)
+            real.relative_to(_FIXTURES_ROOT.resolve())
+        except (OSError, ValueError):
+            self._json({"error": "not_found"}, status=404)
+            return
+        try:
+            data = real.read_bytes()
+        except OSError:
+            self._json({"error": "read_failed"}, status=500)
+            return
+        ext = real.suffix.lower()
+        ctype = {
+            ".png": "image/png", ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg", ".gif": "image/gif",
+            ".webp": "image/webp", ".svg": "image/svg+xml",
+            ".wav": "audio/wav", ".mp3": "audio/mpeg",
+            ".ogg": "audio/ogg", ".flac": "audio/flac",
+            ".mp4": "video/mp4", ".webm": "video/webm",
+        }.get(ext, "application/octet-stream")
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        # Fixtures are immutable, cache aggressively
+        self.send_header("Cache-Control", "public, max-age=86400")
+        self.end_headers()
+        self.wfile.write(data)
 
     def do_POST(self):
         """PR#55: manual interaction surface.

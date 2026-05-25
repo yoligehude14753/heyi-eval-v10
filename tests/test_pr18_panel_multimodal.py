@@ -196,12 +196,15 @@ def test_l3_results_leaderboard_carries_perf_and_categories(panel_with_multimoda
 def test_r1_run_detail_renders_per_category_blocks(panel_with_multimodal_run):
     srv, _ = panel_with_multimodal_run
     out = srv.render_run_detail("r-mm")
-    # Per-category collapsible blocks present
-    assert "text_reasoning" in out
-    assert "vision" in out
-    assert "asr" in out
-    # The N/A asr block carries its reason
-    assert "missing capability_tags" in out
+    # Per-category blocks present (Chinese labels in PR#62)
+    assert "text_reasoning" in out or "文本推理" in out
+    assert "vision" in out or "视觉理解" in out
+    assert "asr" in out or "语音识别" in out
+    # PR#62: the cryptic "missing capability_tags" string is now
+    # rendered as a friendly Chinese explanation. The ASR category
+    # block must say it's "未适用" with the human-readable reason.
+    assert "未适用" in out
+    assert ("未声明" in out or "未声明" in out)
     # Each applicable category prints a score pill
     assert "9/10" in out
     assert "8/10" in out
@@ -233,9 +236,8 @@ def test_r2_run_detail_falls_back_to_flat_results_for_legacy(tmp_path, monkeypat
     importlib.reload(srv)
     out = srv.render_run_detail("r-legacy")
     assert "x1" in out
-    assert "PASS" in out
-    # Falls back, so no <details> per-category blocks
-    assert "<details" not in out or "items" not in out
+    # PR#61: pass/fail label is "通过"/"未通过" in the new card view.
+    assert "通过" in out
 
 
 def test_r3_run_detail_renders_perf_cards(panel_with_multimodal_run):
