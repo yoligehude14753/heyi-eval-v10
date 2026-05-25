@@ -285,40 +285,26 @@ def discover_summary() -> dict:
 
 
 def candidates_lifecycle(limit: int = 500) -> dict:
-    """PR#50: per-candidate lifecycle view that joins three data sources:
+    """PR#50 + PR#52 (perf fix): per-candidate lifecycle view that joins
       - discover/candidates.jsonl  (everything we know exists on HF Hub)
       - store/queue.jsonl          (pending runs)
       - runs/<run_id>/state.json   (in_progress / terminal runs)
 
-    The result is a flat list of ``{hf_id, candidate_*, status, run_id,
-    pass_rate, score, failure_reason}`` with status in:
-      "discovered"   — known but never enqueued
-      "queued"       — in queue.jsonl, awaiting orchestrator
-      "in_progress"  — run is mid-pipeline
-      "ok" / "failed" / "aborted"
-      "skipped"      — manually skipped (future)
+    Each candidate gets status ∈ {discovered, queued, in_progress,
+    ok, failed, aborted}.
 
-    The newest discovered_at wins for sort order (descending).
+    Performance: with PR#52 backfill, candidates.jsonl now has 500k+
+    rows. Naive "build a row dict for everything, then sort" was
+    blocking the panel's single-threaded HTTP server for minutes.
+    This version streams the candidates file once, keeps small-cardinality
+    sets in full (queued / runs are O(hundreds)), and uses a top-N
+    heap for the "discovered" tail so memory stays O(limit). Total work
+    is O(n) candidates × O(1) lookups, plus a final O(limit·log·limit)
+    heap-to-list step.
     """
-    cands = _read_jsonl(DATA_ROOT / "discover" / "candidates.jsonl")
-    cand_by_id: dict[str, dict] = {}
-    for c in cands:
-        hf_id = c.get("hf_id")
-        if not hf_id:
-            continue
-        prev = cand_by_id.get(hf_id)
-        if prev is None or (c.get("discovered_at") or "") > (
-            prev.get("discovered_at") or ""
-        ):
-            cand_by_id[hf_id] = c
+    import heapq
 
-    queued = _read_jsonl(DATA_ROOT / "store" / "queue.jsonl")
-    queued_ids = {q.get("hf_id") for q in queued if q.get("hf_id")}
-
-    # Walk runs/ once and group by hf_id (keep MOST RECENT only).
-    # run-state stores ``created_at`` / ``ended_at`` as epoch floats;
-    # discover candidates store ISO timestamps. Normalise to ISO here
-    # so the merged rows can be sorted uniformly.
+    # 1) Runs: small set (hundreds), keep in full.
     runs_root = DATA_ROOT / "runs"
     by_hf: dict[str, dict] = {}
 
@@ -328,9 +314,9 @@ def candidates_lifecycle(limit: int = 500) -> dict:
         if isinstance(ts, (int, float)):
             try:
                 from datetime import UTC, datetime
-                return datetime.fromtimestamp(float(ts), tz=UTC).isoformat(
-                    timespec="seconds",
-                )
+                return datetime.fromtimestamp(
+                    float(ts), tz=UTC,
+                ).isoformat(timespec="seconds")
             except (OverflowError, OSError, ValueError):
                 return None
         return str(ts)
@@ -346,8 +332,8 @@ def candidates_lifecycle(limit: int = 500) -> dict:
             if not hf_id:
                 continue
             cur = by_hf.get(hf_id)
-            if (cur is None or
-                    (state.get("created_at") or 0) > (cur.get("_created_raw") or 0)):
+            if (cur is None or (state.get("created_at") or 0) >
+                    (cur.get("_created_raw") or 0)):
                 cap = _read_json(run_dir / "capability.json") or {}
                 by_hf[hf_id] = {
                     "run_id": state.get("run_id") or run_dir.name,
@@ -360,40 +346,96 @@ def candidates_lifecycle(limit: int = 500) -> dict:
                     "score": cap.get("score"),
                 }
 
-    # Stitch the three sources together. A row in the queue without an
-    # entry in candidates is also surfaced (manually-enqueued models).
-    rows: list[dict] = []
-    seen_in_rows: set[str] = set()
-    for hf_id, cand in cand_by_id.items():
-        run = by_hf.get(hf_id)
-        if run:
-            status = run["status"]
-        elif hf_id in queued_ids:
-            status = "queued"
-        else:
-            status = "discovered"
-        rows.append({
-            "hf_id": hf_id,
-            "status": status,
-            "discovered_at": cand.get("discovered_at"),
-            "reason": cand.get("reason"),
-            "pipeline_tag": cand.get("pipeline_tag"),
-            "downloads": cand.get("downloads"),
-            "likes": cand.get("likes"),
-            "last_modified": cand.get("last_modified"),
-            "run_id": (run or {}).get("run_id"),
-            "pass_rate": (run or {}).get("pass_rate"),
-            "score": (run or {}).get("score"),
-            "failure_reason": (run or {}).get("failure_reason"),
-            "ended_at": (run or {}).get("ended_at"),
-        })
-        seen_in_rows.add(hf_id)
+    # 2) Queue: small (max 1000s), keep in full.
+    queued = _read_jsonl(DATA_ROOT / "store" / "queue.jsonl")
+    queued_by_id: dict[str, dict] = {}
+    for q in queued:
+        hf_id = q.get("hf_id")
+        if hf_id:
+            queued_by_id[hf_id] = q
 
-    # Manual enqueues / runs not from auto-discover.
+    # 3) Stream candidates.jsonl, decide status per row, only build
+    #    full row dicts for non-"discovered" (small set) + top-N
+    #    "discovered" by discovered_at.
+    cand_path = DATA_ROOT / "discover" / "candidates.jsonl"
+    status_counts: Counter = Counter()
+    total_candidates = 0
+    non_discovered_rows: list[dict] = []      # all in_progress/ok/failed/.../queued
+    discovered_heap: list[tuple] = []         # min-heap on (anchor, hf_id)
+    # Track which hf_ids we've consumed (newest-discovered-at wins).
+    seen_cand: dict[str, str] = {}            # hf_id -> best discovered_at
+    # PR#52 perf: tally statuses during the single stream pass so we
+    # don't need a second walk over rows to count them.
+    candidate_discovered_count = 0
+    candidate_status_tally: Counter = Counter()
+
+    def _push_discovered(row: dict) -> None:
+        anchor = row.get("discovered_at") or ""
+        # Negate via reversed comparison: use a min-heap and keep size
+        # ≤ limit; final result sort handles ordering.
+        if len(discovered_heap) < limit:
+            heapq.heappush(discovered_heap, (anchor, row["hf_id"], row))
+        else:
+            if anchor > discovered_heap[0][0]:
+                heapq.heapreplace(
+                    discovered_heap, (anchor, row["hf_id"], row),
+                )
+
+    if cand_path.exists():
+        with cand_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    c = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                hf_id = c.get("hf_id")
+                if not hf_id:
+                    continue
+                total_candidates += 1
+                # Dedup: newest discovered_at wins (skip if older).
+                prev_at = seen_cand.get(hf_id)
+                this_at = c.get("discovered_at") or ""
+                if prev_at is not None and this_at <= prev_at:
+                    continue
+                seen_cand[hf_id] = this_at
+
+                run = by_hf.get(hf_id)
+                if run:
+                    status = run["status"]
+                elif hf_id in queued_by_id:
+                    status = "queued"
+                else:
+                    status = "discovered"
+                row = {
+                    "hf_id": hf_id,
+                    "status": status,
+                    "discovered_at": c.get("discovered_at"),
+                    "reason": c.get("reason"),
+                    "pipeline_tag": c.get("pipeline_tag"),
+                    "downloads": c.get("downloads"),
+                    "likes": c.get("likes"),
+                    "last_modified": c.get("last_modified"),
+                    "run_id": (run or {}).get("run_id"),
+                    "pass_rate": (run or {}).get("pass_rate"),
+                    "score": (run or {}).get("score"),
+                    "failure_reason": (run or {}).get("failure_reason"),
+                    "ended_at": (run or {}).get("ended_at"),
+                }
+                if status == "discovered":
+                    _push_discovered(row)
+                    candidate_discovered_count += 1
+                else:
+                    non_discovered_rows.append(row)
+                    candidate_status_tally[status] += 1
+
+    # 4) Runs / queue with no candidate entry — surface as "manual".
     for hf_id, run in by_hf.items():
-        if hf_id in seen_in_rows:
+        if hf_id in seen_cand:
             continue
-        rows.append({
+        non_discovered_rows.append({
             "hf_id": hf_id,
             "status": run["status"],
             "discovered_at": None,
@@ -408,12 +450,11 @@ def candidates_lifecycle(limit: int = 500) -> dict:
             "failure_reason": run.get("failure_reason"),
             "ended_at": run.get("ended_at"),
         })
-        seen_in_rows.add(hf_id)
-    for q in queued:
-        hf_id = q.get("hf_id")
-        if not hf_id or hf_id in seen_in_rows:
+        seen_cand[hf_id] = ""
+    for hf_id, q in queued_by_id.items():
+        if hf_id in seen_cand:
             continue
-        rows.append({
+        non_discovered_rows.append({
             "hf_id": hf_id,
             "status": "queued",
             "discovered_at": None,
@@ -428,21 +469,29 @@ def candidates_lifecycle(limit: int = 500) -> dict:
             "failure_reason": None,
             "ended_at": None,
         })
-        seen_in_rows.add(hf_id)
+        seen_cand[hf_id] = ""
 
-    # Sort: discovered/queued by discovered_at DESC, completed by ended_at DESC.
+    # 5) Status counts include EVERY candidate + manual rows. Tallied
+    #    during the stream + the manual loop above.
+    manual_status_tally: Counter = Counter(
+        r["status"] for r in non_discovered_rows
+        if r.get("reason") == "manual"
+    )
+    status_counts.update(candidate_status_tally)
+    status_counts.update(manual_status_tally)
+    if candidate_discovered_count:
+        status_counts["discovered"] = candidate_discovered_count
+    manual_count = sum(manual_status_tally.values())
+
+    # 6) Final row list: non-discovered (full) + discovered (top-N
+    #    by discovered_at). Sort once at the end.
+    rows = non_discovered_rows + [t[2] for t in discovered_heap]
+
     def _sort_key(r: dict) -> str:
-        # Most-recent first: ended_at if set, else discovered_at.
-        # Both are ISO strings after _epoch_to_iso normalisation, so
-        # lexicographic sort = chronological sort.
-        anchor = r.get("ended_at") or r.get("discovered_at") or ""
-        return str(anchor)
+        return str(r.get("ended_at") or r.get("discovered_at") or "")
     rows.sort(key=_sort_key, reverse=True)
+    rows = rows[:limit]
 
-    # Status histogram for summary cards.
-    status_counts: Counter = Counter(r["status"] for r in rows)
-
-    # Read backfill state so the panel can render progress.
     cursor = _read_json(DATA_ROOT / "discover" / "cursor.json") or {}
     backfill = {
         "complete": bool(cursor.get("backfill_complete", False)),
@@ -452,10 +501,10 @@ def candidates_lifecycle(limit: int = 500) -> dict:
     }
 
     return {
-        "total": len(rows),
+        "total": total_candidates + manual_count,
         "status_counts": dict(status_counts),
         "backfill": backfill,
-        "rows": rows[:limit],
+        "rows": rows,
     }
 
 
