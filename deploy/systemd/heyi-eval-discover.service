@@ -1,6 +1,6 @@
 [Unit]
 Description=heyi-eval-v10 HF model discovery tracker (loop mode)
-Documentation=https://github.com/yoligehude14753/heyi-eval-v10/blob/main/docs/PR7b_TEST_PLAN.md
+Documentation=https://github.com/yoligehude14753/heyi-eval-v10/blob/main/docs/ARCHITECTURE.md
 After=network-online.target
 Wants=network-online.target
 StartLimitBurst=5
@@ -13,7 +13,17 @@ Group=ai
 WorkingDirectory=/home/ai/heyi-eval-v10
 EnvironmentFile=-/etc/heyi-eval-v10/env
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/home/ai/heyi-eval-v10/.venv/bin/python -m discover loop
+Environment=HF_ENDPOINT=https://hf-mirror.com
+# `discover` is a package, must invoke the CLI module directly (PR#30 fix).
+# PR#53: curated daily scan — user explicitly opted *out* of the 557k-row
+# 2026 backfill firehose ("我不是要全量的，我只要基模厂商发的 和 每天热门
+# 的几个模型"). Curated = whitelist vendor orgs + a few daily-trending
+# models, deduped, ~50-200 candidates/day total.
+#   --mode curated                  → scan_curated (whitelist + trending)
+#   --interval 86400 (24h)          → one sweep per day
+ExecStart=/home/ai/heyi-eval-v10/.venv/bin/python -m discover.main loop \
+    --mode curated \
+    --interval 86400
 Restart=on-failure
 RestartSec=30s
 # discover is HF-Hub-bound, lower priority than orchestrator main loop.

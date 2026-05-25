@@ -1,6 +1,10 @@
 # heyi-eval-v10
 
-自动化模型评测 pipeline，在 nv8-6000 (`100.127.173.85` / `heyi-sh-nv8`) 上常驻运行。
+自动化模型评测 pipeline，在 nv8-6000 (`<NV8_TAILNET_IP>` / `<NV8_HOST_IP>` / `<NV8_HOSTNAME>`) 上常驻运行。
+
+> **想直接看现状架构？** → [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)（11 阶段流水线、信任域、daemon 拓扑、GPU 拓扑、不变量索引、文档索引）
+> **红线 / 不变量**：[`docs/INVARIANTS.md`](docs/INVARIANTS.md)
+> **运维 / 操作**：[`docs/USAGE.md`](docs/USAGE.md)、[`docs/RUNBOOK_NV8.md`](docs/RUNBOOK_NV8.md)
 
 ## 与 v9 的关系
 
@@ -26,41 +30,69 @@ v10 是基于 incident 教训的**架构级重写**，不是补丁。详见 [doc
 
 ## 信任域
 
-- **PROD** (heyi-engine: xrouter / minimax / glm-51 / kimi-k26) — 评测流水线**禁止触碰**
-- **ORCH** (Python orchestrator + heyi_engine client) — 拥有 docker socket 和 data dir 全权
-- **CC** (cc-agent showcase only) — 仅能 Read/Write 当前 run 的 showcase 子目录，无 shell 无 docker
-- **EPHEMERAL** (`e9-*` 前缀容器) — orchestrator 创建/销毁，cc-agent 只能 HTTP 访问
-- **DATA** (`/home/ai/heyi-eval-data/`) — orchestrator 全权，cc-agent 部分 ro
+- **PROD** — 由 `OrchestratorConfig.prod_engine_container` 指定的产线 vLLM 容器（默认 `minimax`，GPU 0-3，`:10814`）。评测流水线**只可 HTTP 访问**，不得 docker-控制（INV-1/INV-12/INV-13）
+- **ORCH** — Python orchestrator + heyi_engine client + curator + discover + panel。拥有 docker socket 与 `/home/ai/heyi-eval-data/` 全权
+- **EVAL** — `e9-*` 前缀临时容器（默认 GPU 5-7，`:18200`）。orchestrator 创建/销毁，沙箱 cc_agent 只能 HTTP 访问
+- **AGENT-SANDBOX** — cc_agent showcase 子进程，沙箱 user `heyi-eval-agent`，仅 `runs/<run_id>/showcase/` rw + 3 个 metadata 文件 ro；无 shell 无 docker socket（INV-16..INV-22）
+- **DATA** — `/home/ai/heyi-eval-data/`（orchestrator 全权，沙箱部分 ro）+ 备份 `/home/ai/heyi-eval-backups/`（INV-9：在数据根之外）
 
-## 目录结构（开发完成后）
+完整边界与守护机制见 [`docs/ARCHITECTURE.md §1`](docs/ARCHITECTURE.md#1--信任域) 与 [`docs/INVARIANTS.md`](docs/INVARIANTS.md)。
+
+## 目录结构（当前实际）
 
 ```
 heyi-eval-v10/
-├── discover/              # HF Hub 模型发现 + enqueue policy（v9 迁移）
-├── curator/               # 模型卡解读 + LLM enrich（v9 迁移，client 切换）
-├── heyi_engine/           # NEW: LLM client + auto model discovery + health
-├── orchestrator/
-│   ├── state_machine.py   # v9 迁移
-│   ├── store.py           # v9 迁移
-│   ├── validator.py       # v9 迁移
-│   ├── notify.py          # v9 迁移
-│   ├── config.py          # 重写（v10 invariants）
-│   ├── stages_py.py       # NEW: DEPLOY/READY_WAIT/CAPABILITY/CLEANUP Python 实现
-│   └── main.py            # 重写（无 CCR 依赖 + heyi_engine preflight）
-├── cc-agent/              # 重写：showcase only, no shell
-├── panel/                 # v9 迁移 + 备份卡片
-├── backup/                # NEW: 30min rsync + retain logic
+├── orchestrator/          # 11 阶段状态机 + 阶段执行 + 故障自愈 + 队列消费
+│   ├── state_machine.py   # STAGES_IN_ORDER（权威阶段定义）
+│   ├── stages.py          # 阶段分发 + ENGINE_SELECT + STAGE_MODEL + CURATE 等
+│   ├── stages_py.py       # DEPLOY / READY_WAIT / CLEANUP（docker SDK）
+│   ├── capability.py      # CAPABILITY 13 类评测 + 评分器注册
+│   ├── perf_bench.py      # PERF_BENCH（TTFT / TPS / VRAM）
+│   ├── llm_judge.py       # INV-14 跨域 VLM 评分
+│   ├── deploy_repair.py   # PR#33 规则式自愈
+│   ├── cache_evictor.py   # PR#65 LRU 缓存逐出
+│   ├── validator.py       # 阶段后不变量断言
+│   ├── store.py           # queue + runs.sqlite
+│   ├── notify.py          # outbox 事件
+│   ├── config.py          # OrchestratorConfig（含 GPU 拓扑 + 端口 + 超时）
+│   └── main.py            # 主循环 + heyi_engine preflight gate
+├── panel/                 # 只读 HTTP 面板 :8090（含手动 enqueue）
+├── cc_agent/              # 仅 SHOWCASE 计划/打分 + PR#33 LLM 自愈代理；无 shell 无 docker
+├── discover/              # HF Hub 日频发现 + enqueue policy
+├── curator/               # README → 结构化 JSON（PROD LLM）
+├── heyi_engine/           # 产线 LLM 客户端 + 自动 /v1/models 发现
+├── transformers_runner/   # ASR/TTS/diffusers/VLM 容器入口（受 INV-15 保护）
+├── backup/                # 30min rsync + 7d 保留
 ├── deploy/
-│   ├── compose.yml        # 重写（无 CCR 无 socket-proxy）
-│   ├── systemd/           # discover/enqueue/orchestrator/panel/backup units
-│   └── bootstrap_nv8.sh   # 重写
-├── sops/known_quirks.md   # v9 迁移 + Q-022/Q-023 (incident SOPs)
-├── tests/                 # 全部 pytest，覆盖率 ≥ 80%
+│   ├── systemd/           # discover/enqueue/orchestrator/panel/backup/audit/agent 9 个 unit
+│   ├── agent-sandbox/     # POSIX ACL + sudoers + socket-proxy（INV-16..22）
+│   └── env.example        # 复制到 /etc/heyi-eval-v10/env
+├── scripts/               # bootstrap_nv8.sh、verify_24h_timer.sh、build_transformers_runner.sh 等
+├── sops/
+│   ├── schemas/           # 阶段产物 JSON Schema
+│   └── known_quirks.md    # 已知部署 quirk 库
+├── tools/                 # 一次性运维 CLI（evict_eval_cache.py 等）
+├── tests/                 # pytest（~955 通过；含 INV 静态守护 + e2e + 沙箱演练）
 └── docs/
-    ├── PLAN.md            # 此 v10 架构总图
-    ├── OVERVIEW.md        # v9 迁移
-    └── USAGE.md           # v9 迁移 + v10 差异说明
+    ├── ARCHITECTURE.md    # 运行时真相
+    ├── INVARIANTS.md      # 23 条红线
+    ├── USAGE.md           # 操作手册
+    ├── RUNBOOK_NV8.md     # NV8 真机演练
+    ├── PLAN.md            # 启动期设计计划（历史，9 阶段描述已过时）
+    └── _archive/          # PR*_TEST_PLAN / PR*_REPORT 历史快照
 ```
+
+> 部署形态：**仅 systemd**（无 docker-compose）。评测容器 `e9-*` 由 orchestrator 在 DEPLOY 阶段动态 spawn。
+
+## 11 阶段流水线（权威：`orchestrator/state_machine.py::STAGES_IN_ORDER`）
+
+```
+DISCOVER → CURATE → METADATA → ENGINE_SELECT → STAGE_MODEL          ← run-level checkpoint
+                                                    ↓
+        DEPLOY → READY_WAIT → CAPABILITY → PERF_BENCH → SHOWCASE → CLEANUP   ← stage-level
+```
+
+每阶段输入 / 输出 / 失败语义见 [`docs/ARCHITECTURE.md §3`](docs/ARCHITECTURE.md#3--11-阶段流水线)。
 
 ## 开发流程
 
@@ -73,12 +105,19 @@ heyi-eval-v10/
 
 PR 序列见 [docs/PLAN.md § 7 PR 序列](docs/PLAN.md#7--pr-序列每个-pr--400-行按依赖顺序)。
 
-## 运维入口（开发完成后）
+## 运维入口
 
-- 管理面板：`http://100.127.173.85:8090`（Tailscale 内）
+- 管理面板：`http://<NV8_HOST_IP>:8090`（或 Tailnet `http://<NV8_TAILNET_IP>:8090`）
+- 产线 LLM 端点：`http://127.0.0.1:10814/v1`（heyi_engine）
+- 评测 LLM 端点：`http://127.0.0.1:18200/v1`（仅 DEPLOY 后存在）
+- 手动 enqueue：`python -m discover.main enqueue --limit 5`，或面板 `POST /api/enqueue`
+- 缓存逐出：`python tools/evict_eval_cache.py --quota-gb 200 --apply`
+- 24h 计时器自检：`bash scripts/verify_24h_timer.sh`
 - WeChat 反馈：经 `zero` 项目 `ai4wechat` + `alld` `POST /notify`
-- 故障 SOP：[sops/known_quirks.md](sops/known_quirks.md)
+- 已知 quirk：[`sops/known_quirks.md`](sops/known_quirks.md)
 
 ## License
 
-私有项目，未开源。
+MIT — 见 [LICENSE](LICENSE)。
+
+> 部署位置 / 主机 IP 在文档与脚本里以占位符出现（`<NV8_HOST_IP>` / `<NV8_TAILNET_IP>` / `<NV8_HOSTNAME>`）。本仓库不预设具体的部署网络拓扑，复用时按你自己的环境替换或通过环境变量覆盖（见 `deploy/env.example`）。

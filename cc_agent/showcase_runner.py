@@ -94,14 +94,29 @@ Do not include any preamble. Begin your response with "[" immediately.
 
 
 _GRADE_PROMPT_TEMPLATE = """\
-You graded a language model on a custom showcase suite. Read the
-results below and produce a short summary (3-6 sentences) describing
-what the model did well and where it struggled. Do not invent results.
+你刚刚在自定义 showcase 题集上评估了一个语言模型。请阅读下方的题目和模型作答，
+用 3-6 句中文写一段简短评价，覆盖：
+  1) 模型表现得好的方面；
+  2) 模型表现得弱或出错的方面；
+  3) 一个可观察到的小结论（例如：擅长代码生成但中文流畅度一般）。
 
-Showcase items and the model's responses:
+不要编造模型没有输出的内容。不要返回 JSON，不要使用 markdown 标题或编号，
+直接输出一段连贯的中文文字即可。
+
+题目与模型作答：
 {rendered_items}
+"""
 
-Output the summary as plain text — no JSON, no markdown headers.
+# PR#59: short, single-line "first impression" (gut-feel) call. Returned
+# as Chinese to match the panel's locale. Bounded to a single sentence
+# so it can render as a pill in the UI.
+_FIRST_IMPRESSION_PROMPT_TEMPLATE = """\
+基于下面的模型作答，给出一句不超过 25 个汉字的中文「首印象」结论。
+要求：直接给出结论，不要解释，不要前缀，不要标点结尾外的多余符号。
+示例：「代码题尚可，中文偶有走样」「数学推理稳，多模态未覆盖」
+
+模型作答样本：
+{rendered_items}
 """
 
 
@@ -122,10 +137,52 @@ def _strengths_blob(curated: dict[str, Any]) -> str:
     return "\n".join(parts) if parts else "(no curated strengths available)"
 
 
+# Reasoning models (DeepSeek-R1, Qwen3-Thinking, MiniMax-M2.7, Claude
+# thinking-tagged variants, etc.) emit an internal chain wrapped in
+# ``<think>...</think>`` (or the synonym ``<thinking>...</thinking>``)
+# before producing the user-facing answer. If we hand that raw text
+# to the grader LLM and pre-truncate to 600 chars, the truncation
+# usually lops off the actual answer and shows only reasoning, which
+# both confuses the grader and biases the summary toward "the model
+# struggled". ``_strip_think`` removes those blocks before grading.
+#
+# Behavior:
+#   * Matched <think>X</think> / <thinking>X</thinking> blocks are removed,
+#     case-insensitive, multi-block, DOTALL.
+#   * Unmatched trailing <think> with no closing tag (typically caused
+#     by completion_tokens cap mid-reasoning) is removed from the
+#     opening tag through end-of-string — there is no actual answer
+#     in that case.
+#   * Leading / trailing whitespace cleaned up.
+#
+# This is deliberately local to showcase_runner: PR#17 scope is
+# SHOWCASE grading only. CAPABILITY substring scoring will get the
+# same treatment in a follow-up PR.
+
+_THINK_BLOCK_RE = re.compile(
+    r"<\s*think(?:ing)?\s*>.*?<\s*/\s*think(?:ing)?\s*>",
+    flags=re.DOTALL | re.IGNORECASE,
+)
+
+_THINK_UNMATCHED_TAIL_RE = re.compile(
+    r"<\s*think(?:ing)?\s*>.*\Z",
+    flags=re.DOTALL | re.IGNORECASE,
+)
+
+
+def _strip_think(text: str) -> str:
+    """Return ``text`` with reasoning-model <think>...</think> chains removed."""
+    if not text:
+        return ""
+    out = _THINK_BLOCK_RE.sub("", text)
+    out = _THINK_UNMATCHED_TAIL_RE.sub("", out)
+    return out.strip()
+
+
 def _render_items_for_grading(items: list[dict[str, Any]]) -> str:
     out: list[str] = []
     for i, it in enumerate(items, 1):
-        actual = (it.get("actual") or "")[:600]
+        actual = _strip_think(it.get("actual") or "")[:600]
         out.append(
             f"### Item {i}: {it['id']}\n"
             f"Rationale: {it['rationale']}\n"
@@ -141,11 +198,24 @@ def _render_items_for_grading(items: list[dict[str, Any]]) -> str:
 def _extract_json_array(text: str) -> list[dict[str, Any]] | None:
     """Pull the first ``[...]`` block out of ``text`` and parse it.
 
-    Robust to LLM responses that prefix the JSON with ``Here are the
-    items:`` or wrap it in ```json fences. Returns None on parse failure.
+    Robust to:
+    - LLM responses prefixed with ``Here are the items:``
+    - ```json fences```
+    - ``<think>...</think>`` chain-of-thought blocks (PR#25); critical
+      for MiniMax-M2.7 / Qwen3-thinking / DeepSeek-R1 outputs whose
+      CoT often contains stray ``[``/``]`` inside reasoning examples
+      that pollute the old find("[") / rfind("]") heuristic. Stripping
+      upstream means the planner stops falling through to the default
+      item on every M2.7-served run.
+
+    Returns None on parse failure.
     """
     if not text:
         return None
+    # Lazy import keeps the showcase_runner unit tests free of the
+    # orchestrator import chain when running in isolation.
+    from orchestrator.llm_text_utils import strip_think_blocks
+    text = strip_think_blocks(text)
     fence_match = re.search(r"```(?:json)?\s*(\[[\s\S]*?\])\s*```", text)
     if fence_match:
         candidate = fence_match.group(1)
@@ -194,9 +264,45 @@ def _plan_items(
             f"planning failed: {e}", kind="planning_failed",
         ) from e
 
+    # PR#25: surface a diagnostic flag when the response is pure CoT
+    # so operators can spot reasoning-model truncation immediately.
+    # We tried bumping max_tokens to 6144 and 16384 in nv8 testing;
+    # MiniMax-M2.7 still consumes the whole budget inside
+    # <think>...</think> for a 5-item planning task — 28k chars of
+    # pure CoT observed without ever emitting the array. The vLLM
+    # `chat_template_kwargs={enable_thinking:false}` flag is silently
+    # ignored on this build of M2.7. The pragmatic remedy is the
+    # existing graceful fallback (default showcase item); we just
+    # make the cause crystal clear in the log instead of "non-JSON".
+
     parsed = _extract_json_array(r.text)
     if not parsed:
-        log.warning("planner returned non-JSON; falling back to default item")
+        # Diagnose the cause so operators don't have to grep for the
+        # raw response. The three cases we care about:
+        #   (a) thinking-model truncation: response is essentially
+        #       all <think>...</think> (open or closed) and the JSON
+        #       array never appears.
+        #   (b) malformed: there's a `[` but the bracket pair doesn't
+        #       parse cleanly.
+        #   (c) empty / unrelated: no `[` at all, no <think>.
+        raw = r.text or ""
+        lowered = raw.lower()
+        has_think = "<think" in lowered
+        has_close_think = "</think" in lowered
+        has_bracket = "[" in raw
+        if has_think and not has_close_think:
+            cause = "thinking_truncated"
+        elif has_think and not has_bracket:
+            cause = "thinking_only"
+        elif has_bracket:
+            cause = "malformed_json"
+        else:
+            cause = "no_array_marker"
+        preview = raw[:400].replace("\n", "\\n")
+        log.warning(
+            "planner fallback (cause=%s, total_len=%d, preview=%r)",
+            cause, len(raw), preview,
+        )
         return []
     return parsed
 
@@ -322,9 +428,15 @@ def _grade_summary(
     *,
     timeout_s: float,
 ) -> str:
-    """Ask heyi_engine for a free-text summary. Returns a fallback
-    string on engine error so the caller does not have to special-case
-    grading; per S6 this still produces a valid showcase.json."""
+    """Ask heyi_engine for a Chinese free-text summary. Returns a
+    fallback string on engine error so the caller does not have to
+    special-case grading; per S6 this still produces a valid showcase.json.
+
+    PR#59: strip <think>...</think> blocks from the LLM reply BEFORE
+    returning. The previous code returned r.text verbatim, which on
+    MiniMax-M2.7 / Qwen3-thinking models meant the panel summary cell
+    showed the raw reasoning chain instead of the actual summary.
+    """
     _ = timeout_s
     prompt = _GRADE_PROMPT_TEMPLATE.format(rendered_items=_render_items_for_grading(items))
     try:
@@ -335,17 +447,61 @@ def _grade_summary(
     except HeyiEngineError as e:
         log.warning("grading skipped: %s", e)
         return _fallback_summary(items, reason=f"grading failed: {e}")
-    text = (r.text or "").strip()
+    raw = (r.text or "").strip()
+    # Strip CoT blocks here as well as in the renderer; defense in depth
+    # so the on-disk artifact is also clean.
+    try:
+        from orchestrator.llm_text_utils import strip_think_blocks
+        text = strip_think_blocks(raw).strip()
+    except Exception:
+        text = _strip_think(raw)
     if not text:
         return _fallback_summary(items, reason="grading returned empty")
     return text
 
 
+def _first_impression(
+    grade_client: HeyiEngineClient,
+    items: list[dict[str, Any]],
+    *,
+    timeout_s: float,
+) -> str | None:
+    """PR#59: short Chinese "首印象" gut-feel summary, ~25 chars.
+
+    Best-effort: returns None on engine error so the run still completes.
+    The panel renders this as a pill above the long summary; it's the
+    "TL;DR" the user wanted instead of a blank cell.
+    """
+    _ = timeout_s
+    prompt = _FIRST_IMPRESSION_PROMPT_TEMPLATE.format(
+        rendered_items=_render_items_for_grading(items),
+    )
+    try:
+        r = grade_client.call(
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=64,
+        )
+    except HeyiEngineError as e:
+        log.warning("first_impression skipped: %s", e)
+        return None
+    raw = (r.text or "").strip()
+    try:
+        from orchestrator.llm_text_utils import strip_think_blocks
+        text = strip_think_blocks(raw).strip()
+    except Exception:
+        text = _strip_think(raw)
+    if not text:
+        return None
+    # First non-empty line, hard cap 40 chars to fit the pill.
+    line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+    return line[:40] if line else None
+
+
 def _fallback_summary(items: list[dict[str, Any]], *, reason: str) -> str:
     ok = sum(1 for it in items if not it.get("comment"))
     return (
-        f"Auto summary ({reason}). {ok}/{len(items)} items completed without "
-        f"runtime issues; substantive evaluation skipped."
+        f"自动评价（{reason}）：{ok}/{len(items)} 道题未抛出运行时错误，"
+        f"但 LLM 评分调用失败，详细评估已跳过。"
     )
 
 
@@ -465,6 +621,12 @@ def execute_showcase(
 
     # Grade — S6 returns a fallback summary on engine error.
     summary = _grade_summary(grade_client, finished, timeout_s=per_call_timeout_s)
+    # PR#59: short Chinese "首印象" gut-feel call (best-effort, never
+    # raises). Surfaces in the panel as a pill alongside the long
+    # summary so the user gets a one-glance verdict.
+    model_first_impression = _first_impression(
+        grade_client, finished, timeout_s=per_call_timeout_s,
+    )
 
     payload = {
         "stage": "SHOWCASE",
@@ -472,6 +634,7 @@ def execute_showcase(
         "hf_id": run.hf_id,
         "items": finished,
         "summary": summary,
+        "model_first_impression": model_first_impression,
         "base_url": base_url,
         "evaluated_at": datetime.now(tz=UTC).isoformat(timespec="seconds"),
         "total_duration_s": round(time.time() - t0, 3),

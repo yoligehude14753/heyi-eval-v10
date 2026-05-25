@@ -409,10 +409,94 @@ def _has_recent_successful_run(store: Store, hf_id: str, *, within_days: int = 3
     return False
 
 
+def _has_recent_failed_run(
+    store: Store, hf_id: str, *, within_hours: float = 12.0,
+) -> bool:
+    """PR#38 (post-PR#36 nv8 observation): has this hf_id recently
+    failed or been aborted? Used by enqueue() to dampen hourly cron
+    re-tries of models that always fail fast.
+
+    Live nv8 data: discover/auto-enqueue brings ``gemma-4-26B-it-GGUF``,
+    ``Andycurrent/Gemma-3-1B-...-GGUF``, ``Qwen3-Coder-Next-GGUF`` back
+    to the queue every hour. Each gets re-staged (sometimes 13 GB of
+    download, then deleted on failure) and re-deployed for ~30s before
+    failing identically. Five hours, ~70 GB disk consumed for the same
+    three failures over and over.
+
+    We only block on the *last* status to allow PR#33-style auto-repair
+    to retry once after a manual fix lands. Default window is 12 h —
+    long enough for a fix-PR turnaround, short enough that abandoned
+    models eventually re-enter the queue.
+    """
+    cutoff = time.time() - within_hours * 3600.0
+    for r in store.list_runs(limit=500):
+        if r["hf_id"] != hf_id:
+            continue
+        if r["created_at"] < cutoff:
+            continue
+        # Most recent run wins (list_runs is ordered DESC by created_at)
+        return r["status"] in ("failed", "aborted")
+    return False
+
+
+def _hf_ids_in_queue(store: Store) -> set[str]:
+    """Read queue.jsonl and return the set of hf_ids currently pending."""
+    qp = queue_path(store)
+    if not qp.exists():
+        return set()
+    out: set[str] = set()
+    import json as _json
+    for raw in qp.read_text(encoding="utf-8").splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            out.add(_json.loads(raw).get("hf_id", ""))
+        except Exception:
+            continue
+    out.discard("")
+    return out
+
+
+def _hf_ids_in_progress(store: Store) -> set[str]:
+    """Return the set of hf_ids currently active in the DB.
+
+    Includes both ``pending`` and ``in_progress`` since both consume a
+    slot and would cause duplicate work if re-enqueued. We deliberately
+    exclude terminal states (``ok``, ``failed``, ``aborted``) — a
+    failed run is allowed to be retried by re-enqueue.
+    """
+    rows = store.list_runs(limit=500)
+    return {
+        r["hf_id"]
+        for r in rows
+        if r["status"] in ("in_progress", "pending")
+    }
+
+
 def enqueue(store: Store, hf_id: str, *, skip_if_recent: bool = False) -> str | None:
-    """Add an hf_id to the queue. Returns the new run_id, or None if
-    skip_if_recent was True and we already have a recent OK run."""
+    """Add an hf_id to the queue. Returns the new run_id, or None if:
+    - skip_if_recent was True and we already have a recent OK run, OR
+    - the same hf_id is already pending in the queue or currently
+      in_progress / queued (PR#34b dedup).
+
+    The dedup is unconditional (independent of skip_if_recent) because
+    enqueueing the same model twice always wastes a download and a GPU
+    slot — we observed this when the hourly auto-enqueue timer pushed
+    the same hf_id 4× before the orchestrator finished the first run.
+    """
+    pending = _hf_ids_in_queue(store) | _hf_ids_in_progress(store)
+    if hf_id in pending:
+        print(f"skip (dedup): {hf_id} already pending/in_progress")
+        return None
     if skip_if_recent and _has_recent_successful_run(store, hf_id):
+        return None
+    # PR#38: dampen hourly cron retries of models that failed within
+    # the last 12h. Honor the same `skip_if_recent` flag (only applies
+    # to the cron/auto-discover path; manual `enqueue` CLI calls pass
+    # skip_if_recent=False and bypass this).
+    if skip_if_recent and _has_recent_failed_run(store, hf_id):
+        print(f"skip (recent-fail): {hf_id} failed/aborted in last 12h")
         return None
     qp = queue_path(store)
     qp.parent.mkdir(parents=True, exist_ok=True)
@@ -462,6 +546,63 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0 if run.status == RunStatus.OK else 1
 
 
+def _sweep_orphan_in_progress(
+    store: Store, *, stale_after_s: float = 1800.0,
+    force_all: bool = False,
+) -> int:
+    """Mark stale 'in_progress' runs as aborted on orchestrator startup.
+
+    PR#34d: when the orchestrator process is killed mid-run (systemd
+    restart, OOM, manual stop), the active run's row in runs.sqlite
+    stays 'in_progress' forever, the cache directory leaks (we saw
+    142 GB of WanVideo_comfy left behind), and worse — duplicate
+    enqueue dedup thinks the model is still being worked on. Sweep
+    any in_progress run that hasn't seen a heartbeat update for
+    longer than `stale_after_s` and re-mark it ABORTED with reason
+    'orchestrator_restart_orphan'.
+
+    PR#44 (2026-05-24 nv8): the 30-min stale_after_s default was too
+    conservative — restarting the orchestrator within 7 min of an
+    in-flight STAGE_MODEL left the row in_progress, which blocked
+    PR#38 dedup from re-enqueuing the model. ``force_all=True`` (the
+    startup-time path) skips the time check entirely: by definition,
+    anything still ``in_progress`` when the orchestrator process has
+    just started cannot be making progress, because the orchestrator
+    is the only writer.
+
+    Returns the number of runs swept.
+    """
+    now = time.time()
+    swept = 0
+    for r in store.list_runs(status=RunStatus.IN_PROGRESS, limit=200):
+        # Heartbeat = most recent of created_at / updated_at / ended_at.
+        # ended_at should be NULL for in_progress, so use the max of
+        # the others. We also defensively fall back to started_at.
+        candidates = [
+            r.get("updated_at") or 0.0,
+            r.get("created_at") or 0.0,
+            r.get("started_at") or 0.0,
+        ]
+        last_touch = max(float(x) for x in candidates if x)
+        if not force_all and last_touch and (now - last_touch) < stale_after_s:
+            continue  # still fresh, leave alone
+        run = store.get_run(r["run_id"])
+        if run is None:
+            continue
+        run.status = RunStatus.ABORTED
+        run.failure_reason = "orchestrator_restart_orphan"
+        run.ended_at = now
+        store.save_run(run)
+        swept += 1
+        age = f"stale_for={now - last_touch:.0f}s" if last_touch else "no-touch"
+        print(
+            f"[sweep] orphan in_progress -> aborted: {r['run_id']} "
+            f"({r['hf_id']}) {age}"
+            + (" [force_all]" if force_all else "")
+        )
+    return swept
+
+
 def cmd_loop(args: argparse.Namespace) -> int:
     from datetime import date as _date
     cfg = OrchestratorConfig()
@@ -469,6 +610,17 @@ def cmd_loop(args: argparse.Namespace) -> int:
     state = LoopState()
     heartbeat_interval = float(os.environ.get("HEYI_HEARTBEAT_INTERVAL", "14400"))  # 4h
     engine_remind_interval = float(os.environ.get("HEYI_ENGINE_REMIND_INTERVAL", "3600"))  # 1h
+
+    # PR#44: at process startup nothing else can be writing in_progress,
+    # so unconditionally sweep all of them. The `stale_after_s` knob is
+    # kept for any future in-loop sweep call (none today).
+    stale_after = float(os.environ.get("HEYI_ORPHAN_STALE_S", "1800"))
+    n_swept = _sweep_orphan_in_progress(
+        store, stale_after_s=stale_after, force_all=True,
+    )
+    if n_swept:
+        print(f"[startup] swept {n_swept} orphan in_progress run(s)")
+
     print(f"loop mode (stub_only={args.stub_only}), ctrl-c to stop")
 
     while True:

@@ -65,30 +65,50 @@ def _chat_body(text: str, *, prompt_tokens: int = 10,
 class CapabilityHappyTests(unittest.TestCase):
 
     def test_h1_all_pass(self):
-        """Engine returns the expected_substring for every prompt."""
+        """Engine returns the expected_substring for every prompt.
+
+        With PR#15's categorized architecture + PR#16's curated content,
+        a model tagged ``capability_tags=["text", "code"]`` runs
+        text_reasoning (10) + code_gen (5) + code_repair (5) +
+        code_complete (5) = 25 items.
+        """
         with TemporaryDirectory() as td:
             tmp = Path(td)
             cfg = _make_cfg(tmp)
             run = _make_run()
             _write_deploy(cfg, run)
+            # PR#15: capability_tags read from _meta/curated.json
+            meta_dir = cfg.run_dir(run.run_id) / "_meta"
+            meta_dir.mkdir(parents=True, exist_ok=True)
+            (meta_dir / "curated.json").write_text(json.dumps({
+                "capability_tags": ["text", "code"],
+            }), encoding="utf-8")
+
+            # Single response covering every expected_substring across the
+            # 4 text/code categories of PR#16 curated data. Brittle vs
+            # data contents on purpose — if someone changes the JSONLs,
+            # this test must be updated in lockstep.
+            _answers = (
+                "answers: 18 3 70000 624 35 366 460 260 100 90 "
+                "return a + b n % 2 factorial(n - 1) FizzBuzz [::-1] "
+                "range(n + 1) if not xs n > 0 sorted(xs) "
+                "aeiou fibonacci max( while"
+            )
 
             def fake_http(base_url, *, prompt, max_tokens, timeout_s):
-                # Return a chat body whose content includes every plausible
-                # expected_substring from the bundled slices. Brittle vs
-                # slice contents — kept narrow on purpose so test fails if
-                # someone changes the slice fixtures without updating here.
-                return (200, _chat_body("answer: 18 60 3 6 24 16 40 144 56 12 C D A B return a + b n % 2 max( [::-1] for"))
+                return (200, _chat_body(_answers))
 
             with patch.object(capability, "_http_post_chat", side_effect=fake_http) as m:
                 r = capability.execute_capability(run, cfg)
 
             self.assertTrue(r.ok, msg=r.error)
-            self.assertGreaterEqual(m.call_count, 20)  # ≥20 items in bundled slices
+            # 25 items expected (10 + 5 + 5 + 5).
+            self.assertGreaterEqual(m.call_count, 25)
 
             cap = json.loads((cfg.run_dir(run.run_id) / "capability.json").read_text())
             self.assertEqual(cap["stage"], "CAPABILITY")
             self.assertEqual(cap["pass_rate"], 1.0)
-            self.assertGreaterEqual(len(cap["results"]), 20)
+            self.assertGreaterEqual(len(cap["results"]), 25)
 
     def test_h2_custom_slice_only(self):
         with TemporaryDirectory() as td:

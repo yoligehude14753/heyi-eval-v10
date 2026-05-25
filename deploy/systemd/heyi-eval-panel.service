@@ -1,6 +1,6 @@
 [Unit]
 Description=heyi-eval-v10 read-only management panel (HTTP)
-Documentation=https://github.com/yoligehude14753/heyi-eval-v10/blob/main/docs/PR7b_TEST_PLAN.md
+Documentation=https://github.com/yoligehude14753/heyi-eval-v10/blob/main/docs/ARCHITECTURE.md
 After=network-online.target
 Wants=network-online.target
 StartLimitBurst=10

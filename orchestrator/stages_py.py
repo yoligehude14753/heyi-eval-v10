@@ -183,14 +183,24 @@ def _vllm_command(model_in_container: str, args: Mapping[str, Any], port: int) -
     Accepts both snake_case and kebab-case keys. We don't validate
     every possible flag — vllm itself does that at startup; bad flags
     surface as STARTED-then-EXITED containers and S7 catches them.
+
+    PR#35: ``args["model_path_override"]`` is a private-by-convention
+    key set by deploy_repair's GGUF strategy. When present, it
+    replaces the default container-bind path for the ``--model``
+    flag (so vLLM gets a single GGUF file path, not a directory)
+    AND is suppressed from the CLI translation so it doesn't leak
+    as ``--model-path-override``.
     """
+    actual_model = str(args.get("model_path_override") or model_in_container)
     cmd = [
-        "--model", model_in_container,
+        "--model", actual_model,
         "--host", "0.0.0.0",
         "--port", str(port),
     ]
     seen: set[str] = set()
     for k, v in args.items():
+        if k == "model_path_override":
+            continue
         flag = "--" + k.replace("_", "-")
         if flag in seen:
             continue
@@ -237,6 +247,81 @@ def _http_get_json(url: str, *, timeout: float = 5.0) -> tuple[int, dict[str, An
         return (e.code, None)
     except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
         return (0, None)
+
+
+def _http_post_json(
+    url: str,
+    body: dict[str, Any],
+    *,
+    timeout: float = 15.0,
+) -> tuple[int, dict[str, Any] | None, str]:
+    """Tiny POST helper. Returns ``(status_code, parsed_body_or_None, raw_text)``.
+
+    PR#36a: used by ``_inference_probe`` to verify a deployed engine
+    actually serves completions, not just ``/v1/models``. We need
+    the raw text on error paths (501 from transformers-runner doesn't
+    return JSON) so the repair classifier can pattern-match on
+    things like ``"NotImplementedError"`` in the body.
+    """
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data,
+        headers={"Content-Type": "application/json",
+                 "Accept": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read().decode("utf-8", errors="replace")
+            try:
+                return (r.getcode(), json.loads(raw), raw)
+            except json.JSONDecodeError:
+                return (r.getcode(), None, raw)
+    except urllib.error.HTTPError as e:
+        raw = ""
+        try:
+            raw = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        return (e.code, None, raw)
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
+        return (0, None, str(e))
+
+
+def _inference_probe(
+    base_url: str,
+    *,
+    timeout: float = 15.0,
+) -> tuple[bool, int, str]:
+    """PR#36a: smoke-test ``/v1/chat/completions`` with a 1-token call.
+
+    Returns ``(ok, status, body_excerpt)``. ``ok`` is True only when
+    the endpoint returned a 2xx and the response shape includes at
+    least one choice — anything else (4xx, 5xx, missing 'choices',
+    connection refused, timeout) is False.
+
+    A deployed engine that serves ``/v1/models`` but rejects actual
+    inference is exactly the trap PR#33 fell into on nv8 with
+    qwen35-arch GGUF and transformers-runner: the container looked
+    healthy, /v1/models returned 200, but every completion 501'd.
+    This probe makes that lie impossible.
+    """
+    status, body, raw = _http_post_json(
+        f"{base_url.rstrip('/')}/v1/chat/completions",
+        {
+            "model": "evaluated",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1,
+            "temperature": 0.0,
+        },
+        timeout=timeout,
+    )
+    if status == 200 and isinstance(body, dict):
+        choices = body.get("choices") or []
+        if choices:
+            return (True, status, "ok")
+        return (False, status, "200 OK but empty choices")
+    return (False, status, (raw or "")[:400])
 
 
 # ── GPU isolation (PR#11) ─────────────────────────────────────────────────
@@ -333,14 +418,25 @@ def _select_eval_gpus(
     return list(cfg.eval_gpus[:tp_size]), None
 
 
-def _graceful_skip(t0: float, reason: str) -> StageResult:
-    """Wrap a graceful-skip reason into the canonical StageResult shape."""
+def _graceful_skip(
+    t0: float, reason: str, *, error_kind: str = "insufficient_gpu",
+) -> StageResult:
+    """Wrap a graceful-skip reason into the canonical StageResult shape.
+
+    PR#25: ``error_kind`` is now parameterised. Historically every
+    abort path emitted ``error_kind="insufficient_gpu"`` regardless
+    of actual cause (model_missing, eval_pool_busy, port_collision,
+    etc.), which (a) made the test_s3_model_path_missing test
+    misleading and (b) made Panel grouping useless. New callers
+    pass a specific kind; the default keeps the old behaviour so
+    no caller needs an immediate update.
+    """
     return StageResult(
         ok=False,
         duration_s=time.time() - t0,
         artifacts=[],
-        error=f"insufficient_gpu: {reason}",
-        error_kind="insufficient_gpu",
+        error=f"{error_kind}: {reason}",
+        error_kind=error_kind,
         extra={"aborted": True, "reason": reason},
     )
 
@@ -353,12 +449,30 @@ def execute_deploy(
     cfg: OrchestratorConfig,
     *,
     sleep: Any = time.sleep,
+    enable_repair: bool = True,
 ) -> StageResult:
     """Spawn an e9-<engine>-<short> container serving the run's model.
 
     Side effects (only on ok=True):
         runs/<run_id>/deploy.json  with container_name + base_url + image
         runs/<run_id>/_meta/deploy.json (legacy alias for validators)
+        runs/<run_id>/_meta/deploy_repair.json (PR#33; only if repair
+            was triggered — absence means first-attempt success)
+
+    PR#33: when the first attempt fails with an engine-side error
+    (early_exit / docker_api / image_pull), the function walks a small
+    ordered list of deterministic repair strategies — adding
+    --trust-remote-code, lowering max_model_len, swapping the vLLM
+    image to :latest, swapping the engine to SGLang, falling back to
+    transformers — re-invoking the docker spawn after each plan
+    mutation. The whole attempt history (winning strategy, every
+    rejected strategy, full container log tails) is recorded into
+    _meta/deploy_repair.json so the Panel can show 'auto-fixed via
+    swap_engine_sglang' and the operator can trust the run despite
+    the divergence from the original plan.
+
+    Repair is skipped (enable_repair=False) by tests that want to
+    exercise the failure path directly.
     """
     t0 = time.time()
     rd = cfg.run_dir(run.run_id)
@@ -374,14 +488,32 @@ def execute_deploy(
             )
 
         model_host_path = _model_path_on_host(cfg, run.hf_id)
+        # PR#35: surface the first GGUF filename in the cache (if any)
+        # so deploy_repair's strategy_use_gguf_file_path can rewrite
+        # the --model arg to a concrete file rather than a directory.
+        # We pick Q4_K_M preferentially to match PR#32's narrow logic;
+        # if no Q4_K_M is present (e.g. operator already cleaned), fall
+        # back to lexicographic-first .gguf in the dir.
+        if model_host_path.exists():
+            gguf_files = sorted(p.name for p in model_host_path.glob("*.gguf"))
+            preferred = [n for n in gguf_files if "Q4_K_M" in n]
+            gguf_hint = (preferred or gguf_files or [None])[0]
+            if gguf_hint:
+                plan["_gguf_filename_hint"] = gguf_hint
         if not model_host_path.exists():
-            # Model weights not yet downloaded to eval-cache.
-            # Treat as graceful skip so the run is re-queued on next loop
-            # iteration once the model has been staged.
-            return _graceful_skip(
-                t0,
-                f"model not in eval-cache: {model_host_path}; "
-                "will retry after model is staged",
+            # PR#31: STAGE_MODEL runs immediately before DEPLOY in
+            # STAGES_IN_ORDER and is responsible for ensuring the
+            # weights are on disk (snapshot_download into model_cache_root).
+            # If DEPLOY still sees a missing path here, the pipeline
+            # ordering was bypassed (resume from old state, tests
+            # constructing runs manually, etc.) — fail hard with a
+            # diagnostic rather than the old `model_missing` graceful
+            # skip, which silently masked the bug PR#30 exposed.
+            raise StagePyError(
+                f"DEPLOY found no model at {model_host_path}; expected "
+                f"STAGE_MODEL stage to have staged it. Either the stage "
+                f"was skipped or the cache layout changed.",
+                kind="model_missing_after_stage",
             )
 
         cname = container_name_for(run.run_id, engine)
@@ -408,89 +540,445 @@ def execute_deploy(
 
         client = _docker_client()
 
-        _reuse_or_recreate(client, cname, run.run_id, engine)
+        # PR#33: extract the docker-spawn + early-exit check into a
+        # reusable helper so the repair loop can call it multiple
+        # times with mutated plans/images without copy-pasting all of
+        # the device_requests / volumes / labels boilerplate.
+        def _try_once(active_plan: dict[str, Any], active_image: str,
+                      active_engine: str) -> tuple[bool, dict[str, Any]]:
+            """Spawn one deploy attempt. Returns (ok, info_dict).
 
-        if engine == "vllm":
-            command = _vllm_command(model_in_container, vllm_args, port)
-        elif engine == "sglang":
-            command = _sglang_command(model_in_container, vllm_args, port)
-        else:  # transformers
-            command = ["serve", "--model-path", model_in_container, "--port", str(port)]
-
-        labels = {
-            LABEL_RUN: run.run_id,
-            LABEL_STAGE: StageName.DEPLOY.value,
-            LABEL_ENGINE: engine,
-        }
-        device_requests = (
-            [
-                docker.types.DeviceRequest(
-                    device_ids=[str(i) for i in selected_gpus],
-                    capabilities=[["gpu"]],
-                )
-            ]
-            if selected_gpus
-            else []
-        )
-        try:
-            container = client.containers.run(
-                image,
-                command=command,
-                name=cname,
-                detach=True,
-                remove=False,
-                labels=labels,
-                network_mode="host",
-                ipc_mode="host",
-                shm_size="16g",
-                volumes={
-                    str(model_host_path): {"bind": model_in_container, "mode": "ro"},
-                },
-                device_requests=device_requests,
-            )
-        except ImageNotFound as e:
-            raise StagePyError(f"image not found: {image}: {e}",
-                               kind="image_pull") from e
-        except APIError as e:
-            msg = str(e)
-            if "address already in use" in msg or "port is already allocated" in msg:
-                raise StagePyError(
-                    f"port {port} already in use: {e}", kind="port_in_use",
-                ) from e
-            raise StagePyError(f"docker API error: {e}", kind="docker_api") from e
-
-        sleep(0.5)
-        container.reload()
-        if container.status in ("exited", "dead"):
-            tail = _tail_logs(container, 50)
+            info_dict on success:
+              {"container": <Container>, "engine": engine, "image": image,
+               "args": vllm_args, "command": command}
+            info_dict on failure (raised exceptions are NOT propagated
+            here, they're translated into the failure dict so the
+            repair loop can inspect them):
+              {"error_kind": str, "error": str, "logs": str,
+               "engine": str, "image": str}
+            """
+            cur_args = dict(active_plan.get("vllm_args") or {})
+            cur_args.setdefault("served_model_name", "evaluated")
+            _reuse_or_recreate(client, cname, run.run_id, active_engine)
+            if active_engine == "vllm":
+                cur_cmd = _vllm_command(model_in_container, cur_args, port)
+            elif active_engine == "sglang":
+                cur_cmd = _sglang_command(model_in_container, cur_args, port)
+            else:  # transformers
+                cur_cmd = ["serve", "--model-path", model_in_container,
+                           "--port", str(port)]
             try:
-                container.remove(force=True)
-            except DockerException:
-                pass
+                container = client.containers.run(
+                    active_image,
+                    command=cur_cmd,
+                    name=cname,
+                    detach=True, remove=False,
+                    labels={
+                        LABEL_RUN: run.run_id,
+                        LABEL_STAGE: StageName.DEPLOY.value,
+                        LABEL_ENGINE: active_engine,
+                    },
+                    network_mode="host",
+                    ipc_mode="host",
+                    shm_size="16g",
+                    volumes={
+                        str(model_host_path): {
+                            "bind": model_in_container, "mode": "ro",
+                        },
+                    },
+                    device_requests=(
+                        [
+                            docker.types.DeviceRequest(
+                                device_ids=[str(i) for i in selected_gpus],
+                                capabilities=[["gpu"]],
+                            )
+                        ] if selected_gpus else []
+                    ),
+                )
+            except ImageNotFound as e:
+                return False, {
+                    "error_kind": "image_pull",
+                    "error": f"image not found: {active_image}: {e}",
+                    "logs": "",
+                    "engine": active_engine, "image": active_image,
+                }
+            except APIError as e:
+                msg = str(e)
+                if "address already in use" in msg or "port is already allocated" in msg:
+                    return False, {
+                        "error_kind": "port_in_use",
+                        "error": f"port {port} already in use: {e}",
+                        "logs": "", "engine": active_engine,
+                        "image": active_image,
+                    }
+                return False, {
+                    "error_kind": "docker_api",
+                    "error": f"docker API error: {e}",
+                    "logs": "", "engine": active_engine,
+                    "image": active_image,
+                }
+
+            # PR#35: poll the container status across an "early crash
+            # window" instead of just a single 0.5s sleep. vLLM 0.11.0
+            # against GGUF / glm_ocr / other freshly-released model
+            # types crashes ~5-15s into startup, AFTER pydantic model
+            # config validation. With the old 0.5s probe we'd return
+            # ok=True, the container would die seconds later, READY_WAIT
+            # would notice (`container_died`) but the PR#33 auto-repair
+            # loop is wired only into _try_once — so the crash was
+            # invisible to repair. By stretching the probe to ~20s, the
+            # same crashes now surface here, in the repair-aware path,
+            # and the existing strategies (swap_vllm_image_latest,
+            # swap_engine_transformers, …) actually fire.
+            early_crash_window_s = float(
+                getattr(cfg, "deploy_early_crash_window_s", 20.0)
+            )
+            poll_step_s = 0.5
+            # Drive the loop by iteration count, not wall-clock, so unit
+            # tests that inject `sleep=_NOP_SLEEP` don't hang spinning
+            # against time.time() until the wall budget elapses. In
+            # production the loop body is dominated by the injected
+            # sleep + the brief container.reload() RPC, so iteration
+            # count and wall-clock are equivalent. We add 1 to round up
+            # so a 20 s window with 0.5 s step → 40 iterations.
+            n_steps = max(1, round(early_crash_window_s / poll_step_s))
+            died = False
+            models_listed = False
+            for _ in range(n_steps):
+                sleep(poll_step_s)
+                try:
+                    container.reload()
+                except DockerException:
+                    # Container disappeared between reloads — treat as died.
+                    died = True
+                    break
+                if container.status in ("exited", "dead"):
+                    died = True
+                    break
+                # Optimistic exit: as soon as the container is healthy on
+                # /v1/models we can stop polling early. This keeps repair
+                # iterations fast on the happy path.
+                try:
+                    status, body = _http_get_json(
+                        f"http://127.0.0.1:{port}/v1/models", timeout=1.0
+                    )
+                    if status == 200 and isinstance(body, dict) and body.get("data"):
+                        models_listed = True
+                        break
+                except Exception:
+                    pass
+            if died:
+                tail = _tail_logs(container, 100)
+                try:
+                    container.remove(force=True)
+                except DockerException:
+                    pass
+                return False, {
+                    "error_kind": "early_exit",
+                    "error": f"container exited within early-crash window; "
+                             f"tail logs: {tail[:200]!r}",
+                    "logs": tail,
+                    "engine": active_engine, "image": active_image,
+                }
+            # PR#36a: a container that's "running" and listing /v1/models
+            # is not enough — we observed transformers-runner accept a
+            # GGUF directory, return 200 on /v1/models, then 501 on every
+            # chat/completions. That broke the eval (0/50 capability)
+            # while marking the run "ok". Verify with a tiny inference
+            # probe; if the engine refuses real work, surface that as a
+            # repair-visible failure so deploy_repair can swap to an
+            # engine/image combo that DOES serve completions.
+            #
+            # We only run the probe when /v1/models already listed a
+            # model — that's the gate that distinguishes "still loading"
+            # from "loaded but won't serve". Skip the probe entirely
+            # when getattr(cfg, "deploy_inference_probe_enabled") is
+            # False (tests can disable).
+            #
+            # PR#36a refinement (post-mms-300m run): the probe targets
+            # /v1/chat/completions, which is ONLY appropriate for
+            # text/code-capable models. ASR / TTS / image-gen models
+            # legitimately 501 on chat/completions — that's not a lie,
+            # the engine just doesn't serve text. Read capability_tags
+            # from <run>/_meta/curated.json and only fire the probe
+            # when "text" or "code" is among them.
+            #
+            # PR#47 (post-speecht5 nv8 21:52 run): the original gate
+            # asked "any text/code tag present?" but missed that
+            # TTS / image-gen models legitimately have ``text`` in
+            # capability_tags because the INPUT is text. The fix is
+            # to check for *output* tags that don't serve chat/
+            # completions; if ANY of those are present, skip the
+            # probe regardless of whether "text" is also there.
+            probe_enabled = getattr(
+                cfg, "deploy_inference_probe_enabled", True
+            )
+            probe_applicable = False
+            # Capability tags that indicate the model's OUTPUT is not
+            # text. Even if "text" appears alongside, the model still
+            # cannot serve chat/completions, so the probe must be
+            # skipped or it would false-flag.
+            _non_chat_output_tags = {
+                "tts", "asr",
+                "image_gen", "video_gen", "music_gen",
+                "embedding",
+            }
+            _text_like = {"text", "code"}
+            if probe_enabled and models_listed:
+                cap_tags: list[str] = []
+                try:
+                    cpath = rd / "_meta" / "curated.json"
+                    if cpath.exists():
+                        cobj = json.loads(cpath.read_text(encoding="utf-8"))
+                        raw = cobj.get("capability_tags") or []
+                        if isinstance(raw, list):
+                            cap_tags = [str(t).lower() for t in raw]
+                except Exception:
+                    cap_tags = []
+                if cap_tags:
+                    if any(t in _non_chat_output_tags for t in cap_tags):
+                        # TTS / ASR / image_gen / etc — output is non-text,
+                        # chat/completions is not the right endpoint.
+                        probe_applicable = False
+                    elif any(t in _text_like for t in cap_tags):
+                        # Pure text/code model — probe.
+                        probe_applicable = True
+                    else:
+                        # vision / audio only (no non-chat-output tag,
+                        # no text-like tag): probably an audio-understanding
+                        # or vision-understanding model. Skip the probe to
+                        # be safe; those endpoints aren't chat/completions
+                        # either.
+                        probe_applicable = False
+                else:
+                    # No tags emitted at all — defaultsafely probe (vllm
+                    # default routing is text-gen so chat/completions is
+                    # the expected endpoint).
+                    probe_applicable = True
+            if probe_applicable:
+                probe_timeout = float(
+                    getattr(cfg, "deploy_inference_probe_timeout_s", 20.0)
+                )
+                ok_inf, status, excerpt = _inference_probe(
+                    f"http://127.0.0.1:{port}", timeout=probe_timeout,
+                )
+                if not ok_inf:
+                    # Surface as early_exit-equivalent so the existing
+                    # repair loop reacts. The logs field carries the
+                    # response body so the classifier can pattern-match
+                    # on "NotImplementedError" / "501" / etc.
+                    tail = _tail_logs(container, 100)
+                    combined_logs = (
+                        f"[inference_probe] HTTP {status}: {excerpt}\n\n"
+                        f"[container_logs_tail]\n{tail}"
+                    )
+                    try:
+                        container.remove(force=True)
+                    except DockerException:
+                        pass
+                    return False, {
+                        "error_kind": "inference_broken",
+                        "error": (
+                            f"engine listed /v1/models but chat/completions "
+                            f"returned HTTP {status}: {excerpt[:200]!r}"
+                        ),
+                        "logs": combined_logs,
+                        "engine": active_engine, "image": active_image,
+                    }
+            return True, {
+                "container": container, "engine": active_engine,
+                "image": active_image, "args": cur_args, "command": cur_cmd,
+            }
+
+        # ── first attempt ──
+        ok, info = _try_once(plan, image, engine)
+        repair_log: dict[str, Any] | None = None
+
+        # ── PR#33 repair loop (extended in PR#36a to cover inference_broken) ──
+        if not ok and enable_repair and info["error_kind"] in (
+                "early_exit", "image_pull", "docker_api",
+                "inference_broken"):
+            from . import deploy_repair as dr
+
+            failure = dr.DeployFailure(
+                engine=info["engine"], image=info["image"],
+                error_kind=info["error_kind"], logs=info["logs"],
+            )
+            fcls = failure.classify()
+            print(f"  [DEPLOY] first attempt failed: {info['error_kind']} "
+                  f"({fcls}); engaging deploy_repair")
+
+            attempts_record: list[dict[str, Any]] = [{
+                "strategy": "(initial)",
+                "engine": info["engine"], "image": info["image"],
+                "ok": False, "error_kind": info["error_kind"],
+                "error": info["error"][:500],
+                "logs_tail": info["logs"][-500:],
+            }]
+            # PR#36a: re-propose strategies after EACH failed attempt so
+            # the classifier can react to evolving failure shapes. The
+            # canonical example is the GGUF chain:
+            #   1) early_exit / gguf_needs_file_path
+            #      → use_gguf_file_path (vllm) proposed
+            #   2) early_exit / model_type_unknown (qwen35 unsupported)
+            #      → swap_engine_transformers proposed
+            #   3) inference_broken (transformers can't serve GGUF)
+            #      → only now should swap_vllm_image_latest /
+            #        swap_engine_sglang be proposed
+            # Before this change, the strategy list was frozen at step 1
+            # and steps 2-3 would never reach the strategies that
+            # actually fit them.
+            seen_strategies: set[str] = set()
+            all_proposed: list[str] = []
+            current_failure = failure
+            winning: dr.StrategyResult | None = None
+            max_iterations = 8
+            iter_count = 0
+            while iter_count < max_iterations:
+                iter_count += 1
+                proposals = dr.propose_attempts(plan, current_failure)
+                # Filter out strategies we've already tried this run
+                fresh = [p for p in proposals if p.name not in seen_strategies]
+                if not fresh:
+                    if iter_count == 1:
+                        print("  [DEPLOY] repair: no applicable strategies")
+                    else:
+                        print(
+                            f"  [DEPLOY] repair: no new strategies applicable "
+                            f"after iter {iter_count - 1}"
+                        )
+                    break
+                print(f"  [DEPLOY] repair iter {iter_count}: "
+                      f"{[p.name for p in fresh]} (cls="
+                      f"{current_failure.classify()})")
+                tried_any = False
+                for proposal in fresh:
+                    seen_strategies.add(proposal.name)
+                    if proposal.name not in all_proposed:
+                        all_proposed.append(proposal.name)
+                    cand_plan = proposal.new_plan or plan
+                    cand_engine = (cand_plan.get("engine") or engine).lower()
+                    cand_image = proposal.new_image or _ENGINE_IMAGES.get(
+                        cand_engine, image)
+                    t_strat = time.time()
+                    ok2, info2 = _try_once(cand_plan, cand_image, cand_engine)
+                    attempts_record.append({
+                        "strategy": proposal.name,
+                        "engine": cand_engine, "image": cand_image,
+                        "notes": proposal.notes,
+                        "duration_s": round(time.time() - t_strat, 1),
+                        "ok": ok2,
+                        "error_kind": info2.get("error_kind") if not ok2 else None,
+                        "error": (info2.get("error") or "")[:500] if not ok2 else None,
+                        "logs_tail": (info2.get("logs") or "")[-500:] if not ok2 else None,
+                    })
+                    tried_any = True
+                    if ok2:
+                        winning = proposal
+                        info = info2
+                        plan = cand_plan
+                        engine = cand_engine
+                        image = cand_image
+                        ok = True
+                        break
+                    # Failure: build the failure object for the NEXT
+                    # round so re-classification can route to new
+                    # strategies on the evolved shape.
+                    current_failure = dr.DeployFailure(
+                        engine=cand_engine, image=cand_image,
+                        error_kind=info2.get("error_kind") or "early_exit",
+                        logs=info2.get("logs") or "",
+                    )
+                    # Update the running plan/engine/image so subsequent
+                    # propose_attempts sees the engine we just tried
+                    # (otherwise swap_engine_sglang would keep getting
+                    # rejected with "already on sglang" or
+                    # "not a vllm failure").
+                    plan = cand_plan
+                    engine = cand_engine
+                    image = cand_image
+                if ok or not tried_any:
+                    break
+            proposals = []  # for repair_log compatibility below
+            for name in all_proposed:
+                proposals.append(dr.StrategyResult(name, None))
+
+            # ── PR#33 LLM-agent escalation ──
+            # If rule-based strategies all failed, ask the MiniMax-M2.7
+            # judge for a free-form proposal. The agent gets the
+            # failure logs + curated metadata + every previous attempt
+            # and is REQUIRED to propose a non-no-op change. We try
+            # up to `cfg.deploy_repair_agent_attempts` agent proposals
+            # in series.
+            agent_summary: dict[str, Any] | None = None
+            if not ok and cfg.deploy_repair_agent_enabled:
+                agent_summary = _attempt_agent_repair(
+                    rd=rd,
+                    cfg=cfg,
+                    hf_id=run.hf_id,
+                    failure=failure,
+                    engine=engine,
+                    image=image,
+                    plan=plan,
+                    attempts_record=attempts_record,
+                    try_once=_try_once,
+                )
+                if agent_summary and agent_summary.get("ok"):
+                    info = agent_summary["info"]
+                    plan = agent_summary["plan"]
+                    engine = agent_summary["engine"]
+                    image = agent_summary["image"]
+                    ok = True
+                    winning = dr.StrategyResult(
+                        name=f"agent:{agent_summary['strategy']}",
+                        new_plan=plan, new_image=image,
+                        notes=agent_summary.get("diagnosis", "")[:200],
+                    )
+
+            repair_log = {
+                "stage": "DEPLOY_REPAIR",
+                "failure_class": fcls,
+                "ok": ok,
+                "winning_strategy": winning.name if winning else None,
+                "attempts": attempts_record,
+                "strategies_proposed": [p.name for p in proposals],
+                "agent_escalation": agent_summary,
+            }
+            _write_artifact(rd / "_meta", "deploy_repair.json", repair_log)
+
+        # ── translate the final outcome ──
+        if not ok:
+            # Re-raise as StagePyError so the outer try/except records
+            # the same shape as pre-PR#33.
             raise StagePyError(
-                f"container exited immediately; tail logs: {tail!r}",
-                kind="early_exit",
-                logs=tail,
+                info["error"], kind=info["error_kind"],
+                logs=info.get("logs", ""),
             )
 
         base_url = f"http://127.0.0.1:{port}"
         deploy_payload = {
             "stage": "DEPLOY",
-            "engine": engine,
-            "engine_image": image,
+            "engine": info["engine"],
+            "engine_image": info["image"],
             "container_name": cname,
             "base_url": base_url,
             "model_path_host": str(model_host_path),
             "model_path_container": model_in_container,
             "started_at": datetime.now(tz=UTC).isoformat(timespec="seconds"),
         }
+        if repair_log is not None:
+            deploy_payload["repaired_via"] = repair_log["winning_strategy"]
+            deploy_payload["repair_attempts"] = len(repair_log["attempts"])
         _write_artifact(rd, "deploy.json", deploy_payload)
         _write_artifact(rd / "_meta", "deploy.json", deploy_payload)
 
+        artifacts = ["deploy.json", "_meta/deploy.json"]
+        if repair_log is not None:
+            artifacts.append("_meta/deploy_repair.json")
         return StageResult(
             ok=True,
             duration_s=time.time() - t0,
-            artifacts=["deploy.json", "_meta/deploy.json"],
+            artifacts=artifacts,
             payload=deploy_payload,
             rc=0,
             container_name=cname,
@@ -551,6 +1039,187 @@ def _write_artifact(directory: Path, filename: str, payload: dict[str, Any]) -> 
         json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+
+def _attempt_agent_repair(
+    *,
+    rd: Path,
+    cfg: OrchestratorConfig,
+    hf_id: str,
+    failure: Any,           # deploy_repair.DeployFailure
+    engine: str,
+    image: str,
+    plan: dict[str, Any],
+    attempts_record: list[dict[str, Any]],
+    try_once: Callable[..., tuple[bool, dict[str, Any]]],
+) -> dict[str, Any] | None:
+    """PR#33 LLM-agent escalation. Returns a summary dict that includes
+    ``ok`` and (on success) the winning info/plan/engine/image so the
+    caller can install it as if a rule-based strategy had won. Always
+    returns a dict so the repair_log can record the escalation
+    transparently (proposals_seen, why_each_failed, etc.) — even when
+    the agent itself failed to propose anything usable.
+    """
+    try:
+        from cc_agent import deploy_repair_agent as agent_mod
+        from heyi_engine import HeyiEngineClient
+    except Exception as e:  # pragma: no cover — env misconfig only
+        return {
+            "ok": False,
+            "phase": "import",
+            "error": f"could not import LLM-agent dependencies: {e}",
+            "proposals": [],
+        }
+
+    # Load curated context (best effort — agent works with thinner data).
+    curated = {}
+    modelcard = ""
+    try:
+        cpath = rd / "_meta" / "curated.json"
+        if cpath.exists():
+            curated = json.loads(cpath.read_text(encoding="utf-8"))
+        mpath = rd / "_meta" / "modelcard.md"
+        if mpath.exists():
+            modelcard = mpath.read_text(encoding="utf-8")
+    except OSError:
+        pass
+
+    client = HeyiEngineClient(
+        base_url=cfg.engine_url, api_key=cfg.engine_api_key,
+    )
+
+    proposals_log: list[dict[str, Any]] = []
+    max_attempts = int(getattr(cfg, "deploy_repair_agent_attempts", 3))
+    cur_engine, cur_image, cur_plan = engine, image, plan
+    for attempt_i in range(max_attempts):
+        t0 = time.time()
+        # Build previous_attempts for the agent: rule-based attempts +
+        # any prior agent proposals that actually got EXECUTED
+        # (parse-error / engine-error rows are skipped because they
+        # never proposed a concrete strategy to mark as 'tried').
+        agent_priors = []
+        for p in proposals_log:
+            proposal = p.get("proposal")
+            if not isinstance(proposal, dict):
+                continue
+            agent_priors.append({
+                "strategy": proposal.get("strategy") or "agent_freeform",
+                "engine": proposal.get("engine") or cur_engine,
+                "image": proposal.get("image") or cur_image,
+                "ok": p.get("ok", False),
+                "error_kind": p.get("error_kind"),
+            })
+        try:
+            prop = agent_mod.propose_repair(
+                hf_id=hf_id, curated=curated, modelcard=modelcard,
+                failure_class=failure.classify(),
+                log_tail=failure.logs,
+                engine_plan=cur_plan,
+                previous_attempts=attempts_record + agent_priors,
+                client=client,
+                judge_model_name=getattr(cfg, "judge_model_name", "MiniMax-M2.7"),
+                timeout_s=float(getattr(cfg, "deploy_repair_agent_timeout_s", 90.0)),
+            )
+        except Exception as e:
+            proposals_log.append({
+                "attempt": attempt_i + 1,
+                "ok": False,
+                "phase": "propose",
+                "error": f"{type(e).__name__}: {e}",
+                "duration_s": round(time.time() - t0, 1),
+            })
+            continue
+
+        if not prop.ok:
+            proposals_log.append({
+                "attempt": attempt_i + 1,
+                "ok": False,
+                "phase": "propose",
+                "error": prop.error,
+                "raw_response_head": (prop.raw_response or "")[:300],
+                "duration_s": round(time.time() - t0, 1),
+            })
+            continue
+
+        # Build candidate plan + image + engine from proposal.
+        cand_plan = dict(cur_plan)
+        if prop.vllm_args:
+            new_args = dict(cur_plan.get("vllm_args") or {})
+            new_args.update(prop.vllm_args)
+            cand_plan["vllm_args"] = new_args
+        if prop.engine:
+            cand_plan["engine"] = prop.engine
+        cand_engine = (cand_plan.get("engine") or cur_engine).lower()
+        cand_image = prop.image or _ENGINE_IMAGES.get(cand_engine, cur_image)
+
+        # Run the candidate.
+        t_run = time.time()
+        ok2, info2 = try_once(cand_plan, cand_image, cand_engine)
+        prop_summary = {
+            "strategy": prop.strategy,
+            "engine": prop.engine,
+            "image": prop.image,
+            "vllm_args": prop.vllm_args,
+            "diagnosis": prop.diagnosis[:300],
+            "rationale": prop.rationale[:300],
+        }
+        proposals_log.append({
+            "attempt": attempt_i + 1,
+            "ok": ok2,
+            "phase": "execute",
+            "proposal": prop_summary,
+            "propose_duration_s": round(time.time() - t0 - (time.time() - t_run), 1),
+            "execute_duration_s": round(time.time() - t_run, 1),
+            "error_kind": info2.get("error_kind") if not ok2 else None,
+            "error": (info2.get("error") or "")[:500] if not ok2 else None,
+            "logs_tail": (info2.get("logs") or "")[-500:] if not ok2 else None,
+        })
+        # Also append to the outer attempts_record so any further
+        # agent calls see this as already-tried.
+        attempts_record.append({
+            "strategy": f"agent:{prop.strategy}",
+            "engine": cand_engine, "image": cand_image,
+            "notes": prop.rationale[:200],
+            "duration_s": round(time.time() - t_run, 1),
+            "ok": ok2,
+            "error_kind": info2.get("error_kind") if not ok2 else None,
+            "error": (info2.get("error") or "")[:500] if not ok2 else None,
+            "logs_tail": (info2.get("logs") or "")[-500:] if not ok2 else None,
+        })
+
+        if ok2:
+            return {
+                "ok": True,
+                "strategy": prop.strategy,
+                "diagnosis": prop.diagnosis,
+                "rationale": prop.rationale,
+                "info": info2,
+                "plan": cand_plan,
+                "engine": cand_engine,
+                "image": cand_image,
+                "proposals": proposals_log,
+                "winning_attempt": attempt_i + 1,
+            }
+        # Update "current" to the just-tried so next agent proposal
+        # sees fresh failure context.
+        cur_plan, cur_engine, cur_image = cand_plan, cand_engine, cand_image
+        # Update failure object's logs for next iteration so the agent
+        # diagnoses the NEW error, not the original.
+        # (failure is a frozen dataclass; rebuild it.)
+        import dataclasses
+        failure = dataclasses.replace(
+            failure,
+            engine=cand_engine, image=cand_image,
+            error_kind=info2.get("error_kind") or failure.error_kind,
+            logs=info2.get("logs") or failure.logs,
+        )
+
+    return {
+        "ok": False,
+        "phase": "exhausted",
+        "proposals": proposals_log,
+        "max_attempts": max_attempts,
+    }
 
 
 # ── READY_WAIT ────────────────────────────────────────────────────────────

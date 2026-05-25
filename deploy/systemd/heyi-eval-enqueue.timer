@@ -1,0 +1,19 @@
+[Unit]
+Description=heyi-eval-v10 quarter-hourly auto-enqueue trigger for newly discovered models
+Documentation=https://github.com/yoligehude14753/heyi-eval-v10/blob/main/docs/ARCHITECTURE.md
+
+[Timer]
+OnBootSec=5min
+# PR#56: dropped 1h → 15min cadence. The user expected "持续监控" and was
+# seeing "队列 0 pending" frequently because the orchestrator drains the
+# 3-model batch in under an hour, then the queue sits empty for ~50min
+# waiting for the next hourly trigger. 15 minutes is short enough that
+# the queue almost always has something pending; the dedup logic in
+# orchestrator.enqueue prevents double-runs of the same hf_id.
+OnUnitActiveSec=15min
+# Randomize by 30s to avoid lockstep bursts hitting the orchestrator.
+RandomizedDelaySec=30s
+Unit=heyi-eval-enqueue.service
+
+[Install]
+WantedBy=timers.target

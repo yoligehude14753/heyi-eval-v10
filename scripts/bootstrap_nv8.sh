@@ -22,16 +22,18 @@ SYSTEMD_DIR="/etc/systemd/system"
 UNITS_SERVICES=(
   heyi-eval-orchestrator.service
   heyi-eval-discover.service
+  heyi-eval-enqueue.service
   heyi-eval-panel.service
   heyi-eval-notify-sync.service
   heyi-eval-backup.service
 )
-UNITS_TIMERS=(heyi-eval-backup.timer)
+UNITS_TIMERS=(heyi-eval-backup.timer heyi-eval-enqueue.timer)
 UNITS_TO_ENABLE=(
   heyi-eval-orchestrator.service
   heyi-eval-discover.service
   heyi-eval-panel.service
   heyi-eval-backup.timer
+  heyi-eval-enqueue.timer
 )
 
 DRY_RUN="${DRY_RUN:-0}"
@@ -61,7 +63,7 @@ run()  {
 step "preflight"
 hn="$(hostname)"
 log "hostname=${hn}"
-if [[ "$FORCE" != "1" ]] && [[ "$hn" != *nv8* ]] && [[ "$hn" != *heyi-sh-nv8* ]]; then
+if [[ "$FORCE" != "1" ]] && [[ "$hn" != *nv8* ]]; then
   echo "refuse: hostname '${hn}' is not nv8. Re-run with --force to override." >&2
   exit 1
 fi
@@ -166,12 +168,111 @@ for u in "${UNITS_SERVICES[@]}" "${UNITS_TIMERS[@]}"; do
     run "sudo install -m 0644 '${src}' '${dst}'"
   fi
 done
+# PR#22a agent sandbox slice + template unit. Installed but NOT enabled
+# — `heyi-eval-agent.slice` activates lazily, `heyi-eval-agent@%i` is
+# template-only (started by the orchestrator per run). See
+# docs/RUNBOOK_NV8.md §13.
+for u in heyi-eval-agent.slice "heyi-eval-agent@.service"; do
+  src="${REPO_ROOT}/deploy/systemd/${u}"
+  dst="${SYSTEMD_DIR}/${u}"
+  if [[ ! -f "$src" ]]; then
+    log "skip ${u} (source missing — sandbox PR not yet applied)"
+    continue
+  fi
+  if [[ -f "$dst" ]] && cmp -s "$src" "$dst" 2>/dev/null; then
+    log "${u} (unchanged)"
+  else
+    log "${u} (installing — sandbox)"
+    run "sudo install -m 0644 '${src}' '${dst}'"
+  fi
+done
 run "sudo systemctl daemon-reload"
 
 for u in "${UNITS_TO_ENABLE[@]}"; do
   log "enable+start ${u}"
   run "sudo systemctl enable --now '${u}'"
 done
+
+# ── 4b. agent sandbox (PR#22a) ──────────────────────────────────────────────
+step "agent sandbox (PR#22a)"
+SANDBOX_DIR="${REPO_ROOT}/deploy/agent-sandbox"
+if [[ -d "$SANDBOX_DIR" ]]; then
+  # setup_agent_user.sh + acl_install.sh are idempotent; sudoers install
+  # is a no-op when the file is byte-identical.
+  run "sudo bash '${SANDBOX_DIR}/setup_agent_user.sh'"
+  run "sudo bash '${SANDBOX_DIR}/acl_install.sh'"
+  # Audit daemon + CLI client (PR#22b-M2). The setuid wrapper from M1
+  # was removed because NoNewPrivileges=true in the agent unit blocks
+  # `sudo`'s setuid — the daemon takes its place via a unix socket.
+  if [[ -f "${SANDBOX_DIR}/heyi-eval-agent-audit-client.py" ]]; then
+    run "sudo install -m 0755 -o root -g root '${SANDBOX_DIR}/heyi-eval-agent-audit-client.py' /usr/local/bin/heyi-eval-agent-audit-client"
+  fi
+  if [[ -f "${SANDBOX_DIR}/heyi-eval-agent-prepare" ]]; then
+    run "sudo install -m 0755 -o root -g root '${SANDBOX_DIR}/heyi-eval-agent-prepare' /usr/local/sbin/heyi-eval-agent-prepare"
+  fi
+  if [[ -f "${SANDBOX_DIR}/heyi-eval-agent-run" ]]; then
+    run "sudo install -m 0755 -o root -g root '${SANDBOX_DIR}/heyi-eval-agent-run' /usr/local/bin/heyi-eval-agent-run"
+  fi
+  # Install + enable the audit daemon. It must be listening BEFORE any
+  # agent unit is started; ordering is also encoded as `Before=` in the
+  # agent template unit.
+  if [[ -f "${REPO_ROOT}/deploy/systemd/heyi-eval-audit.service" ]]; then
+    if ! cmp -s "${REPO_ROOT}/deploy/systemd/heyi-eval-audit.service" \
+                /etc/systemd/system/heyi-eval-audit.service 2>/dev/null; then
+      log "installing heyi-eval-audit.service"
+      run "sudo install -m 0644 '${REPO_ROOT}/deploy/systemd/heyi-eval-audit.service' /etc/systemd/system/heyi-eval-audit.service"
+      run "sudo systemctl daemon-reload"
+    fi
+    run "sudo systemctl enable --now heyi-eval-audit.service"
+    # Quick health probe: socket must exist and respond.
+    if ! sudo test -S /run/heyi-eval-agent-audit.sock; then
+      die "heyi-eval-audit.service did not produce /run/heyi-eval-agent-audit.sock"
+    fi
+  fi
+  if ! cmp -s "${SANDBOX_DIR}/sudoers.d/heyi-eval-agent" \
+              /etc/sudoers.d/heyi-eval-agent 2>/dev/null; then
+    log "installing sudoers.d/heyi-eval-agent"
+    run "sudo install -m 0440 '${SANDBOX_DIR}/sudoers.d/heyi-eval-agent' /etc/sudoers.d/heyi-eval-agent"
+    run "sudo visudo -c -f /etc/sudoers.d/heyi-eval-agent"
+  else
+    log "sudoers.d/heyi-eval-agent (unchanged)"
+  fi
+  # PR#22b-M3: harvest helper + orchestrator sudoers. The helper is a
+  # tiny root script the `ai` user can invoke via NOPASSWD sudo to copy
+  # the agent's per-run outbox out of the 0750 HOME and chown it to ai:ai.
+  if [[ -f "${SANDBOX_DIR}/heyi-eval-agent-harvest" ]]; then
+    run "sudo install -m 0755 -o root -g root '${SANDBOX_DIR}/heyi-eval-agent-harvest' /usr/local/sbin/heyi-eval-agent-harvest"
+  fi
+  ORCH_SUDOERS_SRC="${REPO_ROOT}/deploy/sudoers.d/heyi-eval-orchestrator"
+  if [[ -f "$ORCH_SUDOERS_SRC" ]]; then
+    # CRITICAL: validate the SOURCE file BEFORE installing — the
+    # orchestrator's own sudoers explicitly denies visudo to ai
+    # (HEYI_EVAL_ORCH_FORBIDDEN) so post-install verification with
+    # `sudo visudo` is self-blocked. `visudo -c -f <regular-file>`
+    # parses without needing root or write access.
+    run "visudo -c -f '${ORCH_SUDOERS_SRC}'"
+    if ! cmp -s "$ORCH_SUDOERS_SRC" /etc/sudoers.d/heyi-eval-orchestrator 2>/dev/null; then
+      log "installing sudoers.d/heyi-eval-orchestrator"
+      run "sudo install -m 0440 '${ORCH_SUDOERS_SRC}' /etc/sudoers.d/heyi-eval-orchestrator"
+    else
+      log "sudoers.d/heyi-eval-orchestrator (unchanged)"
+    fi
+  fi
+  # Agent-side docker-socket-proxy. We use the orchestrator's docker
+  # daemon (the user is in `docker`), but the agent will reach it via
+  # 127.0.0.1:2377 read-only — see INV-17.
+  run "cd '${SANDBOX_DIR}' && sudo docker compose -f compose.agent-socket-proxy.yml up -d"
+  if [[ "$DRY_RUN" != "1" ]]; then
+    sleep 4
+    if ! curl -sf --max-time 3 http://127.0.0.1:2377/_ping >/dev/null; then
+      echo "bootstrap exit 1: heyi-eval-agent-socket-proxy did not become healthy" >&2
+      exit 1
+    fi
+    log "agent-socket-proxy: 127.0.0.1:2377 healthy"
+  fi
+else
+  log "skip agent sandbox (deploy/agent-sandbox missing — not yet on this branch)"
+fi
 
 # ── 5. health check ─────────────────────────────────────────────────────────
 step "health check"
@@ -209,5 +310,7 @@ log "env:     ${ENV_FILE}"
 log "python:  ${PYTHON_BIN}"
 log "panel:   http://$(hostname -I | awk '{print $1}'):8090"
 log "units:   $(IFS=,; echo "${UNITS_TO_ENABLE[*]}")"
+log "sandbox: $(systemctl list-unit-files heyi-eval-agent@.service 2>/dev/null | tail -1 || echo 'not installed')"
 log "next:    journalctl -u heyi-eval-orchestrator.service -f"
+log "verify:  sudo bash deploy/agent-sandbox/drills/run_all.sh   # all 5 sandbox drills"
 echo "bootstrap_nv8 done."

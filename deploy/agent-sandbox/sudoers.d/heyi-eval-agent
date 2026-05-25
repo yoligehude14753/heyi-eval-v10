@@ -1,0 +1,65 @@
+# heyi-eval-agent sudoers whitelist (INV-19 / INV-20)
+#
+# Install with:
+#   sudo install -m 0440 \
+#     deploy/agent-sandbox/sudoers.d/heyi-eval-agent \
+#     /etc/sudoers.d/heyi-eval-agent
+#   sudo visudo -c -f /etc/sudoers.d/heyi-eval-agent
+#
+# Whitelist is intentionally minimal. The agent NEVER needs:
+#   - to restart heyi-engine / minimax / xrouter (production trust domain)
+#   - to manage networks / images / volumes (docker-socket-proxy handles it)
+#   - to install packages (sandboxed; rebuild image instead)
+#   - generic file ops (covered by ACLs)
+#
+# Whitelist below: only `systemctl <verb> heyi-eval-orchestrator.service`
+# for non-destructive verbs that let the agent bounce its OWN supervisor
+# after deploying a code change. Everything else is denied.
+
+Cmnd_Alias HEYI_EVAL_ORCH_BOUNCE = \
+    /bin/systemctl restart heyi-eval-orchestrator.service, \
+    /bin/systemctl status  heyi-eval-orchestrator.service, \
+    /usr/bin/systemctl restart heyi-eval-orchestrator.service, \
+    /usr/bin/systemctl status  heyi-eval-orchestrator.service
+
+# NOTE on the (removed) HEYI_EVAL_AUDIT_RECORD alias:
+# PR#22b-M1 shipped a setuid `heyi-eval-agent-audit-record` wrapper
+# fronted by sudoers. PR#22b-M2 *removed* it because `sudo` is
+# fundamentally incompatible with the unit's `NoNewPrivileges=true`
+# (sudo refuses to setuid when no_new_privs is set on the calling
+# process). The wrapper worked for ad-hoc `sudo -u` drills but NOT
+# from inside heyi-eval-agent@%i.service.
+#
+# The replacement path is the unix-socket audit daemon
+# (`heyi-eval-audit.service` → /run/heyi-eval-agent-audit.sock); the
+# agent connects directly to that socket, no sudo / no setuid /
+# no privilege change. INV-21 still holds — see daemon source.
+
+# Explicit DENY list — keeps any future inheritance from breaking the
+# trust boundary even if a parent rule changes.
+Cmnd_Alias HEYI_EVAL_FORBIDDEN = \
+    /bin/systemctl * heyi-engine*, \
+    /bin/systemctl * minimax*, \
+    /usr/bin/systemctl * heyi-engine*, \
+    /usr/bin/systemctl * minimax*, \
+    /bin/systemctl * docker*, \
+    /usr/bin/systemctl * docker*, \
+    /usr/sbin/visudo, \
+    /usr/sbin/useradd, \
+    /usr/sbin/userdel, \
+    /usr/sbin/usermod, \
+    /bin/su, \
+    /bin/su -, \
+    /usr/bin/passwd, \
+    /usr/bin/chsh
+
+heyi-eval-agent ALL=(root) NOPASSWD: HEYI_EVAL_ORCH_BOUNCE
+heyi-eval-agent ALL=(ALL)       !HEYI_EVAL_FORBIDDEN
+
+# Hard ceiling on env vars the agent can inherit through sudo.
+Defaults:heyi-eval-agent !env_reset
+Defaults:heyi-eval-agent env_keep -= "*"
+Defaults:heyi-eval-agent env_keep += "HEYI_EVAL_RUN_ID HEYI_EVAL_AGENT_RUN_DIR"
+Defaults:heyi-eval-agent secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Defaults:heyi-eval-agent log_input,log_output
+Defaults:heyi-eval-agent iolog_dir="/var/log/sudo-io/heyi-eval-agent"

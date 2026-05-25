@@ -1,0 +1,10 @@
+{"id": "img-001", "prompt": "A photograph of a red apple on a wooden table.", "expected_description": "a red apple on a wooden surface"}
+{"id": "img-002", "prompt": "A cat sitting on a chair, photograph.", "expected_description": "a cat sitting on or near a chair"}
+{"id": "img-003", "prompt": "A sailboat on a calm blue ocean at sunset.", "expected_description": "a sailboat on water"}
+{"id": "img-004", "prompt": "A bowl of fresh strawberries.", "expected_description": "strawberries in a bowl or container"}
+{"id": "img-005", "prompt": "A snowy mountain peak under a clear blue sky.", "expected_description": "a snow-covered mountain"}
+{"id": "img-006", "prompt": "A yellow school bus parked outside a school.", "expected_description": "a yellow bus"}
+{"id": "img-007", "prompt": "A close-up of a sunflower with bright yellow petals.", "expected_description": "a sunflower with yellow petals"}
+{"id": "img-008", "prompt": "A coffee cup with steam rising from it on a desk.", "expected_description": "a coffee cup or mug"}
+{"id": "img-009", "prompt": "A vintage bicycle leaning against a brick wall.", "expected_description": "a bicycle"}
+{"id": "img-010", "prompt": "A golden retriever puppy in a grassy field.", "expected_description": "a dog, likely a golden retriever or similar light-colored breed"}

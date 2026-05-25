@@ -73,18 +73,104 @@ class OrchestratorConfig:
         default_factory=lambda: _env_path("HEYI_EVAL_BACKUPS", "~/heyi-eval-backups")
     )
 
-    # heyi_engine (local LLM, v10). The model name is auto-discovered from
-    # /v1/models — there is no model-name field here.
+    # heyi_engine (local LLM, v10). On nv8 this is the MiniMax-M2.7
+    # vLLM container `minimax` serving on port 10814 (TP=4, GPU 0-3).
+    # Three reachable paths per `rules/42-heyi-m27-api.md`:
+    #   (A) nv8-local       http://127.0.0.1:10814    (this default)
+    #   (B) Tailscale       http://<NV8_TAILNET_IP>:10814
+    #   (C) trycloudflare   read /home/ai/cf-m27-url.txt (URL is dynamic)
+    # When you're on the mac dev box, export HEYI_ENGINE_URL to (B) or (C).
     engine_url: str = os.environ.get("HEYI_ENGINE_URL", "http://127.0.0.1:10814")
     engine_api_key: str | None = os.environ.get("HEYI_ENGINE_API_KEY")
+    # PR#23: pin the model name. M2.7 vLLM serves model
+    # "MiniMax-M2.7" and previously llm_judge.py hard-coded "auto"
+    # (which vLLM accepts as "first registered model" but breaks the
+    # day someone serves two models on the same endpoint). Pinned to
+    # match the rules/42-heyi-m27-api.md contract.
+    judge_model_name: str = os.environ.get("HEYI_EVAL_JUDGE_MODEL", "MiniMax-M2.7")
+
+    # PR#33: DEPLOY auto-repair (rule-based + LLM-agent escalation).
+    # When enabled, a DEPLOY failure with one of
+    # {early_exit, image_pull, docker_api} triggers `deploy_repair`
+    # which walks rule-based strategies first, then (if exhausted)
+    # asks the judge LLM for free-form proposals. Each proposal is
+    # validated + sandboxed (no docker access; agent only emits JSON).
+    # Disable via env HEYI_EVAL_DEPLOY_REPAIR_AGENT=0.
+    deploy_repair_agent_enabled: bool = (
+        os.environ.get("HEYI_EVAL_DEPLOY_REPAIR_AGENT", "1") != "0"
+    )
+    deploy_repair_agent_attempts: int = int(
+        os.environ.get("HEYI_EVAL_DEPLOY_REPAIR_AGENT_ATTEMPTS", "3")
+    )
+    deploy_repair_agent_timeout_s: float = float(
+        os.environ.get("HEYI_EVAL_DEPLOY_REPAIR_AGENT_TIMEOUT_S", "90")
+    )
+
+    # PR#35: how long DEPLOY's _try_once polls container status before
+    # declaring "this attempt is healthy". vLLM model-config validation
+    # for new architectures (glm_ocr, GGUF, …) fails ~5-15 s into
+    # startup; with a too-short window the crash escapes the repair
+    # loop and surfaces in READY_WAIT instead (where PR#33 isn't
+    # wired). 20 s is short enough not to delay legitimate cold
+    # starts (real vLLM ready-times for 7-27 B text models are
+    # 30-60 s, so the container is comfortably still "starting"
+    # at the 20 s mark) and long enough to catch every crash we've
+    # observed live. Override via HEYI_EVAL_DEPLOY_EARLY_CRASH_S.
+    deploy_early_crash_window_s: float = float(
+        os.environ.get("HEYI_EVAL_DEPLOY_EARLY_CRASH_S", "20")
+    )
+
+    # PR#36a: verify the deployed engine actually serves
+    # chat/completions before letting the run advance into
+    # CAPABILITY. /v1/models can return 200 while the engine
+    # NotImplementedError's every completion (transformers-runner
+    # + GGUF on nv8). The probe is gated by the model already
+    # showing up in /v1/models, so cold starts don't spuriously
+    # trip it.
+    deploy_inference_probe_enabled: bool = (
+        os.environ.get("HEYI_EVAL_INFERENCE_PROBE", "1") != "0"
+    )
+    deploy_inference_probe_timeout_s: float = float(
+        os.environ.get("HEYI_EVAL_INFERENCE_PROBE_TIMEOUT_S", "20")
+    )
+
+    # PR#34c: wall-clock budget for snapshot_download inside STAGE_MODEL.
+    # Default 30 min — long enough for legitimate ~50 GB downloads on the
+    # hf-mirror, short enough to surface a CLOSE-WAIT hang as a real
+    # failure instead of pinning the queue. Set 0 to disable the budget.
+    stage_model_download_timeout_s: float = float(
+        os.environ.get("HEYI_EVAL_STAGE_MODEL_TIMEOUT_S", "1800")
+    )
 
     # HF mirror endpoint
     hf_endpoint: str = os.environ.get("HF_ENDPOINT", "https://hf-mirror.com")
+
+    # PR#40: HF auth token for gated repos (gemma-3, llama-3+, voxtral,
+    # mistralai/Magistral, etc) and for higher mirror rate limits.
+    # Reads both env var names because:
+    #   - huggingface_hub legacy: HUGGING_FACE_HUB_TOKEN
+    #   - huggingface_hub current: HF_TOKEN
+    # If both are set, HF_TOKEN wins. Empty string is treated as None
+    # (so `unset HF_TOKEN` and `export HF_TOKEN=` behave identically).
+    hf_token: str | None = field(
+        default_factory=lambda: (
+            os.environ.get("HF_TOKEN")
+            or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+            or None
+        ) or None
+    )
 
     # vllm provider
     model_cache_root: Path = field(
         default_factory=lambda: _env_path("HEYI_EVAL_MODEL_CACHE", "/DATA/Model/_eval-cache")
     )
+    # PR#65: LRU eviction quota for model_cache_root. When the cache
+    # exceeds this on staging, the evictor drops oldest evictable
+    # entries (orphan → failed_only → safe) until under quota. Default
+    # 200 GB; override via env for boxes with bigger /DATA.
+    cache_quota_bytes: int = int(
+        os.environ.get("HEYI_EVAL_CACHE_QUOTA_GB", "200")
+    ) * 1024 * 1024 * 1024
     vllm_port: int = int(os.environ.get("HEYI_EVAL_VLLM_PORT", "18200"))
 
     # production LLM (the vLLM container that heyi_engine talks to on :10814).
@@ -110,11 +196,18 @@ class OrchestratorConfig:
 
     # evaluation-side GPU pool (the eval pipeline spawns e9-* containers
     # restricted to these GPU indices; PR#11 wires the actual injection).
-    # Default (4,5,6,7) is the steady-state complement of prod_engine_gpus.
-    # If empty (HEYI_EVAL_EVAL_GPUS=""), PR#11 graceful-skip path activates.
+    #
+    # PR#23 (2026-05) shrinks default from (4,5,6,7) → (5,6,7) because
+    # GPU 4 on nv8 is occupied by the ComfyUI host process
+    # (`python main.py --port 8188`, ~93 GB). Production (M2.7) holds
+    # (0,1,2,3) and the eval pipeline must not touch GPU 4. Setting
+    # HEYI_EVAL_EVAL_GPUS="" still activates PR#11 graceful-skip.
+    # Any model whose tensor_parallel_size > len(eval_gpus)=3 is now
+    # gated at ENGINE_SELECT (PR#23 oversize gate) and aborted with
+    # metadata-only — see orchestrator/stages.py + INV-23.
     eval_gpus: tuple[int, ...] = field(
         default_factory=lambda: _parse_gpu_tuple(
-            "HEYI_EVAL_EVAL_GPUS", (4, 5, 6, 7)
+            "HEYI_EVAL_EVAL_GPUS", (5, 6, 7)
         )
     )
 
@@ -122,10 +215,11 @@ class OrchestratorConfig:
     docker_socket: str = os.environ.get("HEYI_EVAL_DOCKER_SOCK", "/var/run/docker.sock")
 
     # stage timeouts (wall-clock seconds)
-    deploy_timeout_s: int = int(os.environ.get("HEYI_EVAL_DEPLOY_TIMEOUT", "600"))           # 10 min
-    capability_timeout_s: int = int(os.environ.get("HEYI_EVAL_CAPABILITY_TIMEOUT", "900"))   # 15 min
-    showcase_timeout_s: int = int(os.environ.get("HEYI_EVAL_SHOWCASE_TIMEOUT", "3600"))      # 60 min
-    cleanup_timeout_s: int = int(os.environ.get("HEYI_EVAL_CLEANUP_TIMEOUT", "300"))         #  5 min
+    deploy_timeout_s: int = int(os.environ.get("HEYI_EVAL_DEPLOY_TIMEOUT", "600"))              # 10 min
+    capability_timeout_s: int = int(os.environ.get("HEYI_EVAL_CAPABILITY_TIMEOUT", "900"))      # 15 min
+    perf_bench_timeout_s: int = int(os.environ.get("HEYI_EVAL_PERF_BENCH_TIMEOUT", "300"))      #  5 min
+    showcase_timeout_s: int = int(os.environ.get("HEYI_EVAL_SHOWCASE_TIMEOUT", "3600"))         # 60 min
+    cleanup_timeout_s: int = int(os.environ.get("HEYI_EVAL_CLEANUP_TIMEOUT", "300"))            #  5 min
 
     @property
     def runs_dir(self) -> Path:
@@ -149,6 +243,7 @@ class OrchestratorConfig:
         return {
             "DEPLOY": self.deploy_timeout_s,
             "CAPABILITY": self.capability_timeout_s,
+            "PERF_BENCH": self.perf_bench_timeout_s,
             "SHOWCASE": self.showcase_timeout_s,
             "CLEANUP": self.cleanup_timeout_s,
         }.get(stage_name, 600)

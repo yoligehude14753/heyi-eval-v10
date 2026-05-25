@@ -1,0 +1,18 @@
+[Unit]
+Description=heyi-eval-v10 agent cgroup (PR#22a sandbox)
+Documentation=https://github.com/yoligehude14753/heyi-eval-v10/blob/main/docs/INVARIANTS.md
+# This slice is the cgroup roof for every sandboxed agent instance. We
+# pin global resource ceilings here (not on the per-instance service)
+# so that no matter how many @<run-id>.service instances we spawn in
+# parallel — under PR#22b's queue logic — the combined footprint
+# stays bounded.
+
+[Slice]
+# Total cap for ALL concurrent agent runs combined. Production LLM
+# (minimax) sits in the implicit root system slice and gets priority
+# via INV-1.
+MemoryMax=8G
+MemoryHigh=6G
+CPUWeight=20
+TasksMax=512
+IOWeight=30

@@ -18,7 +18,7 @@
 #   - require Python (pure bash + ssh + rsync)
 #
 # Environment overrides:
-#   NV8_SSH_TARGET    — e.g. "ai@heyi-sh-nv8" (default below)
+#   NV8_SSH_TARGET    — REQUIRED, e.g. "ai@my-host" or "ai@10.0.0.5"
 #   NV8_BACKUPS_PATH  — remote backups dir (default ~/heyi-eval-backups)
 #   MAC_MIRROR_ROOT   — local mirror dir   (default ~/heyi-eval-mirror)
 #   MAC_MIRROR_KEEP_DAYS — int, default 30
@@ -30,7 +30,7 @@
 
 set -euo pipefail
 
-NV8_SSH_TARGET="${NV8_SSH_TARGET:-ai@heyi-sh-nv8}"
+NV8_SSH_TARGET="${NV8_SSH_TARGET:?NV8_SSH_TARGET is required, e.g. ai@my-nv8-host or ai@10.0.0.5}"
 NV8_BACKUPS_PATH="${NV8_BACKUPS_PATH:-/home/ai/heyi-eval-backups}"
 MAC_MIRROR_ROOT="${MAC_MIRROR_ROOT:-$HOME/heyi-eval-mirror}"
 MAC_MIRROR_KEEP_DAYS="${MAC_MIRROR_KEEP_DAYS:-30}"

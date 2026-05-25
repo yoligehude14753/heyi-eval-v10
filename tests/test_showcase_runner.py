@@ -315,7 +315,8 @@ class ShowcaseSadTests(unittest.TestCase):
             )
             self.assertTrue(r.ok)
             sc_doc = json.loads((cfg.run_dir(run.run_id) / "showcase.json").read_text())
-            self.assertIn("Auto summary", sc_doc["summary"])
+            # PR#59: fallback summary is now in Chinese ("自动评价").
+            self.assertIn("自动评价", sc_doc["summary"])
 
 
 # ── E series ──────────────────────────────────────────────────────────────

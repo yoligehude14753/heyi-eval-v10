@@ -1,0 +1,15 @@
+# transformers-runner additional deps layered on
+# voipmonitor/llm-pytorch-blackwell:nightly. That base ships
+# torch / transformers / numpy / Pillow / accelerate / safetensors,
+# so we only add what's actually missing.
+#
+# Bumping a major version requires re-running the smoke matrix from
+# RUNBOOK_NV8.md §12 (whisper-small / SD1.5 / SpeechT5 / Qwen2-VL-2B).
+
+# Diffusion pipelines — used by /v1/images/generations (and PR#22+
+# video_gen). Pinned to a version compatible with transformers 5.x.
+diffusers>=0.32,<0.36
+
+# Audio I/O + resampling — needed by Whisper + SpeechT5 + MusicGen
+soundfile>=0.12,<0.14
+librosa>=0.10,<0.12

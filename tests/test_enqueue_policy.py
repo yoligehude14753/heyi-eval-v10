@@ -53,9 +53,10 @@ class PolicyTests(unittest.TestCase):
         self.assertTrue(allow, reason)
 
     def test_private_rejected(self):
+        # PR#57: reason text is localized to Chinese.
         allow, reason = _enqueue_policy_passes(_cand("X/Y", private=True), _args())
         self.assertFalse(allow)
-        self.assertIn("private", reason)
+        self.assertTrue("私有" in reason or "受限" in reason, reason)
 
     def test_gated_rejected(self):
         allow, _reason = _enqueue_policy_passes(_cand("X/Y", gated=True), _args())
@@ -65,7 +66,9 @@ class PolicyTests(unittest.TestCase):
         c = _cand("X/Y", pipeline_tag="text-to-image")
         allow, reason = _enqueue_policy_passes(c, _args())
         self.assertFalse(allow)
+        # PR#57: Chinese rendering keeps the raw pipeline tag inline.
         self.assertIn("text-to-image", reason)
+        self.assertTrue("不支持" in reason or "pipeline_tag" in reason, reason)
 
     def test_asr_supported(self):
         c = _cand("X/Y", pipeline_tag="automatic-speech-recognition")
@@ -78,14 +81,24 @@ class PolicyTests(unittest.TestCase):
         self.assertTrue(allow)
 
     def test_low_signal_rejected(self):
-        c = _cand("X/Y", downloads=10, likes=2)
+        # PR#56: whitelist candidates bypass the dl/likes gate (we trust
+        # the vendor). Use ``reason="trending"`` so the threshold applies.
+        c = _cand("X/Y", downloads=10, likes=2, reason="trending")
         allow, reason = _enqueue_policy_passes(c, _args())
         self.assertFalse(allow)
-        self.assertIn("low signal", reason)
+        # PR#57: reason text is localized to Chinese.
+        self.assertIn("信号过低", reason)
+
+    def test_pr56_whitelist_bypasses_low_signal(self):
+        """A whitelisted vendor's fresh release with zero downloads must
+        STILL be admitted — PR#56 trust-the-vendor policy."""
+        c = _cand("Qwen/Brand-New", downloads=0, likes=0, reason="whitelist")
+        allow, reason = _enqueue_policy_passes(c, _args())
+        self.assertTrue(allow, reason)
 
     def test_high_likes_alone_passes(self):
         """Downloads low but likes high — OR logic should admit."""
-        c = _cand("X/Y", downloads=10, likes=200)
+        c = _cand("X/Y", downloads=10, likes=200, reason="trending")
         allow, _ = _enqueue_policy_passes(c, _args())
         self.assertTrue(allow)
 
@@ -157,19 +170,101 @@ class DedupTests(unittest.TestCase):
             new_id = enqueue(store, "X/Y", skip_if_recent=False)
             self.assertIsNotNone(new_id)
 
+    # PR#38: recent-failure dampening on the cron path
+    def test_enqueue_skip_if_recent_blocks_on_recent_failure(self):
+        """PR#38: cron auto-enqueue (skip_if_recent=True) must NOT
+        re-enqueue a model that failed in the last 12 h. Live nv8
+        observed 4-5× repeats of the same fast-fail models per day."""
+        from orchestrator.main import _has_recent_failed_run
+        with tempfile.TemporaryDirectory() as td:
+            store = Store(Path(td))
+            r = Run(run_id="r-1", hf_id="X/Y")
+            r.status = RunStatus.FAILED
+            r.created_at = time.time() - 3600  # 1h ago
+            r.ended_at = r.created_at + 30
+            store.save_run(r)
+
+            self.assertTrue(_has_recent_failed_run(store, "X/Y"))
+            result = enqueue(store, "X/Y", skip_if_recent=True)
+            self.assertIsNone(result, "cron should skip recently-failed")
+
+    def test_enqueue_skip_if_recent_blocks_on_recent_aborted(self):
+        """Aborted is also a 'recent fail' signal — typically oversize
+        gating; no point in re-trying within 12 h."""
+        with tempfile.TemporaryDirectory() as td:
+            store = Store(Path(td))
+            r = Run(run_id="r-1", hf_id="X/Y")
+            r.status = RunStatus.ABORTED
+            r.created_at = time.time() - 1800  # 30min ago
+            r.ended_at = r.created_at + 5
+            store.save_run(r)
+
+            result = enqueue(store, "X/Y", skip_if_recent=True)
+            self.assertIsNone(result)
+
+    def test_enqueue_manual_path_still_adds_failed(self):
+        """Manual CLI (`orchestrator.main enqueue`) passes
+        skip_if_recent=False and MUST still allow re-running failed
+        models — that's the only way to retest after a fix."""
+        with tempfile.TemporaryDirectory() as td:
+            store = Store(Path(td))
+            r = Run(run_id="r-1", hf_id="X/Y")
+            r.status = RunStatus.FAILED
+            r.created_at = time.time() - 600
+            store.save_run(r)
+
+            new_id = enqueue(store, "X/Y", skip_if_recent=False)
+            self.assertIsNotNone(new_id, "manual enqueue must bypass "
+                                         "the recent-fail block")
+
+    def test_enqueue_skip_old_failure_does_not_block(self):
+        """A failure from 15 h ago should NOT block; the 12 h window
+        expires."""
+        with tempfile.TemporaryDirectory() as td:
+            store = Store(Path(td))
+            r = Run(run_id="r-1", hf_id="X/Y")
+            r.status = RunStatus.FAILED
+            r.created_at = time.time() - 15 * 3600
+            r.ended_at = r.created_at + 30
+            store.save_run(r)
+
+            new_id = enqueue(store, "X/Y", skip_if_recent=True)
+            self.assertIsNotNone(new_id, "cron must retry after 12h "
+                                         "backoff window")
+
+    def test_has_recent_failed_run_window_param(self):
+        """Custom window parameter works."""
+        from orchestrator.main import _has_recent_failed_run
+        with tempfile.TemporaryDirectory() as td:
+            store = Store(Path(td))
+            r = Run(run_id="r-1", hf_id="X/Y")
+            r.status = RunStatus.FAILED
+            r.created_at = time.time() - 6 * 3600  # 6h ago
+            store.save_run(r)
+            self.assertTrue(_has_recent_failed_run(
+                store, "X/Y", within_hours=12))
+            self.assertFalse(_has_recent_failed_run(
+                store, "X/Y", within_hours=4))
+
 
 class CmdEnqueueIntegrationTests(unittest.TestCase):
 
     def test_full_flow_filters_and_enqueues(self):
-        """Three candidates: one good, one private, one low-signal.
-        Should enqueue only the first."""
+        """Three candidates: one good (whitelist+high signal), one
+        private (always rejected), one low-signal trending (rejected by
+        PR#56 threshold). Should enqueue only the first.
+
+        PR#56: the original ``bad/lowsig`` fixture had reason="whitelist"
+        which now bypasses the dl/likes gate (trust-the-vendor). Force
+        reason="trending" so the threshold still applies."""
         with tempfile.TemporaryDirectory() as td:
             data_root = Path(td)
             cands_path = data_root / "discover" / "candidates.jsonl"
             append_candidates(cands_path, [
                 _cand("good/model", downloads=200_000, likes=100),
                 _cand("bad/private", private=True, downloads=200_000),
-                _cand("bad/lowsig", downloads=10, likes=2),
+                _cand("bad/lowsig", downloads=10, likes=2,
+                      reason="trending"),
             ])
             args = _args(limit=10)
             with mock.patch("discover.main._default_data_root",

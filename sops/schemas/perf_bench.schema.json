@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://heyi-eval.local/schemas/perf_bench.schema.json",
+  "title": "PERF_BENCH stage artifact (perf_bench.json) — PR#14",
+  "type": "object",
+  "required": ["stage", "applicable", "engine", "completed_at", "warnings"],
+  "properties": {
+    "stage": { "const": "PERF_BENCH" },
+    "applicable": { "type": "boolean" },
+    "engine": { "type": "string", "minLength": 1 },
+    "capability_tags": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "completed_at": { "type": "string" },
+    "warnings": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "reason": { "type": "string" },
+    "ttft_ms":     { "$ref": "#/$defs/Summary" },
+    "tps_single":  { "$ref": "#/$defs/Summary" },
+    "concurrent": {
+      "type": "object",
+      "required": ["n", "aggregate_tps", "total_completion_tokens", "wall_ms"],
+      "properties": {
+        "n": { "type": "integer", "minimum": 1 },
+        "aggregate_tps": { "type": ["number", "null"] },
+        "total_completion_tokens": { "type": "integer", "minimum": 0 },
+        "wall_ms": { "type": "number", "minimum": 0 }
+      }
+    },
+    "vram_mib": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": { "type": "integer", "minimum": 0 }
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "Summary": {
+      "type": "object",
+      "required": ["n"],
+      "properties": {
+        "n":    { "type": "integer", "minimum": 0 },
+        "p50":  { "type": ["number", "null"] },
+        "p95":  { "type": ["number", "null"] },
+        "mean": { "type": ["number", "null"] }
+      }
+    }
+  }
+}

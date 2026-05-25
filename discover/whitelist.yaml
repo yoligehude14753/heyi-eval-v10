@@ -51,8 +51,17 @@ tracker:
 
   # Trending sweep — catch breakouts not in whitelist.
   # Either threshold passes admits the model.
-  min_downloads_30d: 100000
-  min_likes: 200
+  # PR#53: lowered from 100k/200 → 5k/30 to match the user's intent of
+  # "daily hot models" rather than only mega-viral ones. With
+  # ``trending_sweep_limit`` low (40) and the recency window applied,
+  # the threshold gates noise, not legitimate new releases.
+  min_downloads_30d: 5000
+  min_likes: 30
+
+  # PR#53: trending sweep only considers models touched in the last N
+  # days. Without this the "trending" list was dominated by the same
+  # ancient bert/llama-2 checkpoints day after day.
+  min_trending_recency_days: 14
 
   # Only consider models with last_modified ≥ this date.
   # Bumped to 2026 — we don't care about older models for v9.
@@ -72,5 +81,8 @@ tracker:
     - video-to-text
 
   # Caps to keep one round bounded (don't hammer hf-mirror.com).
-  per_org_limit: 50
-  trending_sweep_limit: 200
+  # PR#53: user requested "基模厂商发的 + 每天热门的几个模型" — narrow,
+  # high-signal, daily-incremental. Old defaults (50 per org × 35 orgs
+  # + 200 trending) plus the 557k 2026 backfill blew the panel up.
+  per_org_limit: 30
+  trending_sweep_limit: 40

@@ -1,7 +1,7 @@
 [project]
 name = "heyi-eval-v10"
 version = "0.1.0"
-description = "Automated model evaluation pipeline for nv8-6000 (heyi-sh-nv8). v10 = post-incident architecture rewrite."
+description = "Automated model evaluation pipeline for nv8-6000 (<NV8_HOSTNAME>). v10 = post-incident architecture rewrite."
 requires-python = ">=3.11"
 readme = "README.md"
 

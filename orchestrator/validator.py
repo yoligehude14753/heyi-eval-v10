@@ -139,6 +139,31 @@ def validate_capability(
     return payload
 
 
+def validate_perf_bench(
+    run_dir: Path,
+    *,
+    schema_root: Path | None = None,
+) -> dict[str, Any]:
+    """PERF_BENCH OK = perf_bench.json exists, schema-valid.
+
+    PR#14: PERF_BENCH never hard-fails the run. We only validate the
+    artifact is present and well-formed; degraded probes (empty
+    samples, missing VRAM) are not validator-level errors. The panel
+    surfaces them via the artifact's ``warnings`` field.
+    """
+    payload = _require_file(run_dir / "perf_bench.json", "perf_bench.json")
+    if schema_root is not None:
+        _validate_schema(
+            payload, schema_root / "perf_bench.schema.json", "perf_bench.json",
+        )
+    if payload.get("stage") != "PERF_BENCH":
+        raise ValidationError(
+            f"PERF_BENCH: 'stage' field is "
+            f"{payload.get('stage')!r}, expected 'PERF_BENCH'",
+        )
+    return payload
+
+
 def validate_showcase(
     run_dir: Path,
     *,

@@ -24,8 +24,10 @@ stages have consistent observability.
 """
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from . import notify
@@ -243,8 +245,22 @@ def _execute_metadata_stage(
     hf_info: dict[str, Any] = {}
     try:
         from huggingface_hub import HfApi  # type: ignore[import-not-found]
-        api = HfApi(endpoint=cfg.hf_endpoint)
+        token = getattr(cfg, "hf_token", None) or None
+        api = (
+            HfApi(endpoint=cfg.hf_endpoint, token=token)
+            if token else HfApi(endpoint=cfg.hf_endpoint)
+        )
         info = api.model_info(run.hf_id, files_metadata=False)
+        # PR#43: also pull the file list so ENGINE_SELECT can reject
+        # "not actually a model" repos (e.g. kyutai/tts-voices, which
+        # is 8.7 GB of voice embeddings without any inference entry
+        # point). Cheap single-HEAD-like call; failures are tolerated.
+        siblings: list[str] = []
+        try:
+            siblings = list(api.list_repo_files(run.hf_id))
+        except Exception as fe:
+            print(f"  [metadata] list_repo_files non-fatal: "
+                  f"{type(fe).__name__}: {fe}")
         hf_info = {
             "id": info.id,
             "author": getattr(info, "author", None),
@@ -255,6 +271,7 @@ def _execute_metadata_stage(
             "library_name": getattr(info, "library_name", None),
             "pipeline_tag": getattr(info, "pipeline_tag", None),
             "tags": list(getattr(info, "tags", []) or []),
+            "siblings": siblings,
             "last_modified": str(getattr(info, "last_modified", None) or ""),
         }
     except Exception as e:
@@ -331,23 +348,100 @@ def _execute_engine_select_stage(
             metadata = {}
 
     modality = (metadata.get("modality") or "unknown").lower()
-    pipeline_tag = ((metadata.get("hf_info") or {}).get("pipeline_tag") or "").lower()
+    hf_info = metadata.get("hf_info") or {}
+    pipeline_tag = (hf_info.get("pipeline_tag") or "").lower()
+
+    # PR#43: reject "not a model" repos before STAGE_MODEL wastes GBs
+    # on voice embedding packs etc. Only fires when we actually have a
+    # sibling list (METADATA may have failed to fetch it — in that case
+    # we let the run through and rely on DEPLOY / PR#36 honesty gate).
+    siblings = hf_info.get("siblings") or []
+    if siblings:
+        runnable, why = _is_runnable_model_repo(siblings)
+        if not runnable:
+            plan = {
+                "stage": "ENGINE_SELECT",
+                "hf_id": run.hf_id,
+                "engine": "metadata_only",
+                "engine_image": None,
+                "reason": f"not_a_model: {why}",
+                "fallback_engine": None,
+                "vllm_args": {},
+                "eval_pool_size": len(cfg.eval_gpus),
+                "eval_pool_gpus": list(cfg.eval_gpus),
+                "not_a_model": True,
+                "siblings_sample": siblings[:8],
+            }
+            (meta_dir / "engine.json").write_text(
+                json.dumps(plan, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            skip_reason = (
+                f"not_a_model: HF repo lacks any runnable model entry "
+                f"point ({why}); siblings sample={siblings[:5]}; "
+                f"metadata captured at _meta/metadata.json + "
+                f"_meta/engine.json, no DEPLOY"
+            )
+            return StageResult(
+                ok=False, duration_s=time.time() - t0,
+                artifacts=["_meta/engine.json"],
+                payload={"engine": "metadata_only", "not_a_model": True},
+                rc=0,
+                error=f"not_a_model_skip: {skip_reason}",
+                error_kind="not_a_model_skip",
+                extra={"aborted": True, "reason": skip_reason},
+            )
 
     engine, image, reason, fallback = _pick_engine(modality, pipeline_tag,
-                                                   library_name=(metadata.get("hf_info") or {}).get("library_name"))
+                                                   library_name=hf_info.get("library_name"))
+
+    vllm_args = _vllm_args_hint(metadata)
+
+    # PR#23: oversize gate (INV-23). On nv8 the steady-state eval pool
+    # is GPU 5-7 (len=3); a model requesting tp_size > 3 (typically
+    # 70B+ with TP=4) can never fit. Detect it HERE in ENGINE_SELECT
+    # — before we burn time pulling a 130 GB checkpoint or fighting
+    # the docker daemon — and abort with metadata-only so the row
+    # still surfaces in the Panel with hf metadata captured.
+    #
+    # Per user contract (rules/42-heyi-m27-api.md): "超大参数模型
+    # 可以收集并备注,不用测了". This is the abort that materialises
+    # that policy.
+    tp_size = int((vllm_args or {}).get("tensor_parallel_size", 1) or 1)
+    oversize = tp_size > len(cfg.eval_gpus)
 
     plan = {
         "stage": "ENGINE_SELECT",
         "hf_id": run.hf_id,
-        "engine": engine,
+        "engine": engine if not oversize else "metadata_only",
         "engine_image": image,
         "reason": reason,
         "fallback_engine": fallback,
-        # cc-agent reads these env vars to actually launch the inner container
-        "vllm_args": _vllm_args_hint(metadata),
+        "vllm_args": vllm_args,
+        "eval_pool_size": len(cfg.eval_gpus),
+        "eval_pool_gpus": list(cfg.eval_gpus),
+        "oversize": oversize,
     }
     (meta_dir / "engine.json").write_text(
         json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    if oversize:
+        skip_reason = (
+            f"oversize: model needs tensor_parallel_size={tp_size} but "
+            f"eval pool has {len(cfg.eval_gpus)} GPUs "
+            f"({list(cfg.eval_gpus)}); metadata captured at "
+            f"_meta/metadata.json + _meta/engine.json, no DEPLOY"
+        )
+        return StageResult(
+            ok=False, duration_s=time.time() - t0,
+            artifacts=["_meta/engine.json"],
+            payload={"engine": "metadata_only", "oversize": True},
+            rc=0,
+            error=f"oversize_skip: {skip_reason}",
+            error_kind="oversize_skip",
+            extra={"aborted": True, "reason": skip_reason, "tp_size": tp_size,
+                   "eval_pool_size": len(cfg.eval_gpus)},
+        )
 
     return StageResult(
         ok=True, duration_s=time.time() - t0,
@@ -355,6 +449,181 @@ def _execute_engine_select_stage(
         payload={"engine": engine, "fallback": fallback},
         rc=0,
     )
+
+
+def _execute_stage_model_stage(
+    run: Run, cfg: OrchestratorConfig,
+) -> StageResult:
+    """PR#31: download model weights into the orchestrator's local
+    cache so DEPLOY's bind-mount is guaranteed to find them.
+
+    Reads ``_meta/engine.json`` and ``_meta/metadata.json`` for context,
+    delegates the heavy lifting to ``orchestrator.model_stager``.
+    Idempotent on already-staged dirs and INV-23-aware (oversize models
+    are skipped without download).
+    """
+    import json as _json
+
+    from . import model_stager
+    t0 = time.time()
+    rd = cfg.run_dir(run.run_id)
+    meta_dir = rd / "_meta"
+
+    engine_plan: dict[str, Any] = {}
+    ep = meta_dir / "engine.json"
+    if ep.exists():
+        try:
+            engine_plan = _json.loads(ep.read_text(encoding="utf-8"))
+        except Exception:
+            engine_plan = {}
+
+    metadata: dict[str, Any] = {}
+    mp = meta_dir / "metadata.json"
+    if mp.exists():
+        try:
+            metadata = _json.loads(mp.read_text(encoding="utf-8"))
+        except Exception:
+            metadata = {}
+
+    target_dir = cfg.model_cache_root / cfg.hf_local_dir(run.hf_id)
+
+    # PR#65: enable LRU eviction inside ensure_model_staged. Reads
+    # quota from config (default 200 GB) so the eval-cache stops
+    # growing unboundedly. runs_root tells the evictor where to look
+    # for status=ok markers.
+    cache_quota_bytes = int(getattr(cfg, "cache_quota_bytes", None)
+                            or 200 * 1024 * 1024 * 1024)
+    runs_root = cfg.data_root / "runs"
+
+    result = model_stager.ensure_model_staged(
+        hf_id=run.hf_id,
+        target_dir=target_dir,
+        metadata=metadata,
+        engine_plan=engine_plan,
+        hf_endpoint=os.environ.get(
+            "HF_ENDPOINT",
+            getattr(cfg, "hf_endpoint", None) or "https://hf-mirror.com",
+        ),
+        hf_token=getattr(cfg, "hf_token", None),
+        download_timeout_s=float(
+            getattr(cfg, "stage_model_download_timeout_s", 0.0)
+        ) or None,
+        cache_quota_bytes=cache_quota_bytes,
+        runs_root=runs_root,
+    )
+    artifact = model_stager.write_provenance(rd, result)
+
+    if result.ok:
+        return StageResult(
+            ok=True, duration_s=time.time() - t0,
+            artifacts=[str(artifact.relative_to(rd))],
+            payload={
+                "bytes_on_disk": result.bytes_on_disk,
+                "files": result.files,
+                "target_dir": result.target_dir,
+                "already_staged": (result.extra or {}).get("already_staged", False),
+            },
+            rc=0,
+        )
+
+    # Graceful skip (oversize from ENGINE_SELECT or disk-full) — let the
+    # pipeline turn the run into ABORTED (PR#11 contract).
+    if result.skipped:
+        return StageResult(
+            ok=False, duration_s=time.time() - t0,
+            artifacts=[str(artifact.relative_to(rd))],
+            payload={},
+            rc=0,
+            error=result.skipped_reason or "stage_model skipped",
+            error_kind=result.error_kind or "stage_model_skipped",
+            extra={
+                "aborted": True,
+                "reason": result.skipped_reason or "stage_model skipped",
+            },
+        )
+
+    # Hard failure (download error / post-download sanity). Retry-worthy.
+    return StageResult(
+        ok=False, duration_s=time.time() - t0,
+        artifacts=[str(artifact.relative_to(rd))],
+        payload={},
+        rc=1,
+        error=result.error or "stage_model failed",
+        error_kind=result.error_kind or "stage_model_failed",
+    )
+
+
+def _is_runnable_model_repo(siblings: list[str]) -> tuple[bool, str]:
+    """PR#43: is this HF repo actually an inference-able model, or just
+    a collection of voice embeddings / weights without a runtime entry?
+
+    Returns ``(runnable, reason)``. Conservative — we'd rather attempt
+    a borderline repo and let DEPLOY fail clearly (PR#36 honesty gate
+    will catch it) than reject a real model by mistake.
+
+    A repo is "runnable" if ANY of:
+      * has a transformers ``config.json``
+      * has a diffusers ``model_index.json``
+      * has any ``*.gguf`` (GGUF inference)
+      * has any ``*.mlpackage`` directory (CoreML)
+      * has any ``*.onnx`` (ONNX runtime)
+      * has chatterbox-style fingerprint (3 specific weight files)
+      * has any of: ``tokenizer.json`` + at least one ``*.safetensors``
+        / ``*.bin`` / ``*.pth`` / ``*.pt`` weight file (bespoke layouts
+        like ``apple/starflow`` ship .pth + tokenizer; transformers-
+        runner can sometimes detect via PR#41 fingerprint, but the
+        right behavior is to LET IT TRY)
+
+    Rejected when there are weight files but NO config + NO tokenizer +
+    NO recognisable runtime entry point — that's typically a voice
+    embedding pack, a LoRA adapter without base, or a model card with
+    raw artifacts only (kyutai/tts-voices is the canonical example).
+    """
+    if not siblings:
+        # No file list available (likely API failure) — let it through.
+        return True, "no siblings list available"
+
+    names = {Path(s).name.lower() for s in siblings}
+    paths_lower = [s.lower() for s in siblings]
+
+    # Strong positive signals
+    if "config.json" in names:
+        return True, "has config.json"
+    if "model_index.json" in names:
+        return True, "has model_index.json (diffusers)"
+    if any(n.endswith(".gguf") for n in names):
+        return True, "has .gguf"
+    if any(".mlpackage/" in p or p.endswith(".mlpackage") for p in paths_lower):
+        return True, "has .mlpackage (CoreML)"
+    if any(n.endswith(".onnx") for n in names):
+        return True, "has .onnx"
+    # Chatterbox fingerprint
+    if {"conds.pt", "s3gen.pt", "t3_cfg.pt"}.issubset(names):
+        return True, "chatterbox fingerprint"
+
+    has_tokenizer = any(
+        n.endswith("tokenizer.json") or n.endswith("tokenizer.model")
+        or n == "tokenizer_config.json"
+        for n in names
+    )
+    has_weight = any(
+        n.endswith(".safetensors") or n.endswith(".bin")
+        or n.endswith(".pth") or n.endswith(".pt")
+        or n.endswith(".ckpt") or n.endswith(".msgpack")
+        for n in names
+    )
+    if has_tokenizer and has_weight:
+        return True, "has tokenizer + weight (bespoke layout)"
+
+    # Weights without ANY runtime metadata — almost certainly not
+    # something an inference container can boot. kyutai/tts-voices is
+    # the canonical case: 200+ ``.pt`` voice embeddings, no config,
+    # no tokenizer, no manifest.
+    if has_weight:
+        return False, "weight files present but no config/tokenizer/manifest"
+
+    # No weights at all — definitely not a model.
+    return False, "no weight files in repo"
 
 
 def _pipeline_to_modalities(tag: str) -> list[str]:
@@ -390,34 +659,57 @@ def _license_from_tags(tags: list[str]) -> str | None:
 
 def _pick_engine(modality: str, pipeline_tag: str,
                  library_name: str | None = None) -> tuple[str, str, str, str | None]:
-    """Returns (engine, image, reason, fallback). image is what cc-agent docker-runs."""
-    # vllm-compatible modalities
-    if modality in ("text", "code") or pipeline_tag in (
+    """Returns (engine, image, reason, fallback). image is what cc-agent docker-runs.
+
+    Routing precedence (PR#46):
+      1. Single-purpose pipeline_tag (HF Hub authoritative) — TTS, ASR,
+         diffusion. These ALWAYS go to transformers-runner regardless
+         of what curator-derived ``modality`` says. The curator often
+         lists ``modalities=["text", "audio"]`` for TTS models because
+         the *input* is text, which previously misrouted speecht5 et al.
+         to vllm.
+      2. Multi-modal chat pipeline_tag (text-generation et al.) — vllm.
+      3. ``library_name`` hints (diffusers, sentence-transformers).
+      4. Modality fallback for repos without pipeline_tag (kyutai/tts-voices
+         and fingerprint-detected TTS).
+      5. Default vllm + transformers fallback.
+    """
+    pt = (pipeline_tag or "").strip().lower()
+
+    # 1. Single-purpose pipeline_tag — HF Hub trumps curator modalities.
+    if pt in ("automatic-speech-recognition", "audio-classification",
+              "text-to-speech", "text-to-audio"):
+        return ("transformers", "heyi-eval/transformers-runner:v10",
+                f"audio pipeline_tag={pt}", None)
+
+    if pt in ("text-to-image", "image-to-image", "inpainting",
+              "text-to-video", "image-to-video", "video-to-video"):
+        return ("transformers", "heyi-eval/transformers-runner:v10",
+                f"diffusion pipeline_tag={pt}", None)
+
+    # 2. Chat-capable pipeline_tag or curator-confirmed text/code.
+    if modality in ("text", "code") or pt in (
         "text-generation", "text2text-generation", "image-text-to-text",
         "any-to-any",
     ):
         return ("vllm", "vllm/vllm-openai:v0.11.0", "text-generation family", "transformers")
 
-    # Speech in/out — transformers is the safe path
-    if pipeline_tag in ("automatic-speech-recognition", "audio-classification",
-                        "text-to-speech"):
-        return ("transformers", "heyi-eval/transformers-runner:v9",
-                f"audio pipeline_tag={pipeline_tag}", None)
-
-    # Image/Video generation — diffusers via transformers runner
-    if pipeline_tag in ("text-to-image", "image-to-image", "inpainting",
-                        "text-to-video", "image-to-video"):
-        return ("transformers", "heyi-eval/transformers-runner:v9",
-                f"diffusion pipeline_tag={pipeline_tag}", None)
-
-    # library_name hints
+    # 3. library_name hints
     if (library_name or "").lower() in ("diffusers", "sentence-transformers"):
-        return ("transformers", "heyi-eval/transformers-runner:v9",
+        return ("transformers", "heyi-eval/transformers-runner:v10",
                 f"library={library_name}", None)
 
-    # default: vllm with transformers fallback (handbook decides the actual command)
+    # 4. PR#42: audio modality with no pipeline_tag (e.g. kyutai/tts-voices,
+    #    hf entries that forgot to set the tag, or fingerprint-detected
+    #    TTS repos) MUST go to transformers-runner.
+    if modality == "audio":
+        return ("transformers", "heyi-eval/transformers-runner:v10",
+                f"audio modality (pipeline_tag={pt or 'unknown'})",
+                None)
+
+    # 5. default: vllm with transformers fallback (handbook decides the actual command)
     return ("vllm", "vllm/vllm-openai:v0.11.0",
-            f"default (modality={modality}, pipeline_tag={pipeline_tag or 'unknown'})",
+            f"default (modality={modality}, pipeline_tag={pt or 'unknown'})",
             "transformers")
 
 
@@ -426,21 +718,53 @@ def _vllm_args_hint(metadata: dict[str, Any]) -> dict[str, Any]:
 
     Not authoritative — cc-agent can still adapt at runtime (e.g. lower
     gpu-memory-utilization to fit alongside glm-51, like it did in T11).
+
+    Param-size estimation tiers (PR#23 + PR#26):
+      1. ``metadata["param_count"]`` (curator output, preferred).
+      2. PR#26: fall back to ``metadata["hf_id"]`` — public model
+         names almost always embed the size (``Llama-3.1-405B``,
+         ``Qwen2.5-72B``, ``DeepSeek-V3``). Without this fallback,
+         a curator gap (param_count=None) silently bypasses INV-23
+         and the oversize gate misses the model, which is exactly
+         what happened on the nv8 PR#26 batch run for Llama 405B.
     """
+    import re
     ctx = metadata.get("context_length")
-    param_str = (metadata.get("param_count") or "").lower()
     hint: dict[str, Any] = {}
     if ctx and isinstance(ctx, int) and ctx > 0:
-        # cap to 32k unless explicitly long-context model
         hint["max_model_len"] = min(ctx, 32_768)
-    # crude size heuristic for tp
-    if param_str:
-        if any(s in param_str for s in ("70b", "72b", "100b", "180b", "405b")):
-            hint["tensor_parallel_size"] = 4
-        elif any(s in param_str for s in ("30b", "32b", "34b")):
-            hint["tensor_parallel_size"] = 2
-        else:
+
+    def _extract_b(s: str) -> float | None:
+        # Extract the leading "<num>b" amount in billions; tolerate
+        # decimals and stray surrounding text. e.g.:
+        #   "72.7B"           -> 72.7
+        #   "405B"            -> 405
+        #   "1.5b"            -> 1.5
+        #   "MoE-236.5B-A21B" -> 236.5 (first match wins)
+        m = re.search(r"(\d+(?:\.\d+)?)\s*b\b", s.lower())
+        return float(m.group(1)) if m else None
+
+    b = _extract_b(metadata.get("param_count") or "")
+    if b is None:
+        # PR#26 hf-id fallback. Strict word-boundary regex on the
+        # model id so we don't false-positive on e.g. version
+        # numbers ("v1.5") embedded in a smaller model's path.
+        b = _extract_b(metadata.get("hf_id") or "")
+
+    if b is None:
+        # Truly unknown — preserve historical default of tp=1 only
+        # when we have ANY size signal at all (was the old behaviour
+        # when param_str was non-empty but unparseable).
+        if metadata.get("param_count") or metadata.get("hf_id"):
             hint["tensor_parallel_size"] = 1
+        return hint
+
+    if b >= 65:
+        hint["tensor_parallel_size"] = 4
+    elif b >= 28:
+        hint["tensor_parallel_size"] = 2
+    else:
+        hint["tensor_parallel_size"] = 1
     return hint
 
 
@@ -448,7 +772,8 @@ def _vllm_args_hint(metadata: dict[str, Any]) -> dict[str, Any]:
 
 
 _STUB_STAGES = {StageName.DISCOVER}
-_PY_STAGES = {StageName.CURATE, StageName.METADATA, StageName.ENGINE_SELECT}
+_PY_STAGES = {StageName.CURATE, StageName.METADATA, StageName.ENGINE_SELECT,
+              StageName.STAGE_MODEL}
 # v10 native stages: orchestrator owns docker socket + eval HTTP path.
 # DEPLOY / READY_WAIT / CLEANUP land in stages_py;
 # CAPABILITY lands in capability.py;
@@ -456,7 +781,7 @@ _PY_STAGES = {StageName.CURATE, StageName.METADATA, StageName.ENGINE_SELECT}
 # spawn anywhere.
 _NATIVE_STAGES = {
     StageName.DEPLOY, StageName.READY_WAIT,
-    StageName.CAPABILITY, StageName.CLEANUP,
+    StageName.CAPABILITY, StageName.PERF_BENCH, StageName.CLEANUP,
     StageName.SHOWCASE,
 }
 
@@ -493,6 +818,8 @@ def execute_stage(
             return _execute_metadata_stage(run, cfg)
         if stage == StageName.ENGINE_SELECT:
             return _execute_engine_select_stage(run, cfg)
+        if stage == StageName.STAGE_MODEL:
+            return _execute_stage_model_stage(run, cfg)
     if stage in _NATIVE_STAGES:
         # Lazy imports — stages_py imports docker-py at module load and
         # we don't want to force that on processes that only run the
@@ -500,6 +827,7 @@ def execute_stage(
         from cc_agent import showcase_runner as sc_mod  # PR#5
 
         from . import capability as cap_mod
+        from . import perf_bench as pb_mod  # PR#14
         from . import stages_py
         if stage == StageName.DEPLOY:
             return _adapt_native(stages_py.execute_deploy(run, cfg))
@@ -507,6 +835,8 @@ def execute_stage(
             return _adapt_native(stages_py.execute_ready_wait(run, cfg))
         if stage == StageName.CAPABILITY:
             return _adapt_native(cap_mod.execute_capability(run, cfg))
+        if stage == StageName.PERF_BENCH:
+            return _adapt_native(pb_mod.execute_perf_bench(run, cfg))
         if stage == StageName.CLEANUP:
             return _adapt_native(stages_py.execute_cleanup(run, cfg))
         if stage == StageName.SHOWCASE:

@@ -1,18 +1,21 @@
 """
-9-stage state machine with mixed checkpoint policy.
+11-stage state machine with mixed checkpoint policy.
 
 Stage list (in order):
-    DISCOVER  CURATE  METADATA  ENGINE_SELECT          <- run-level checkpoint
-    DEPLOY  READY_WAIT  CAPABILITY  SHOWCASE  CLEANUP  <- stage-level checkpoint
+    DISCOVER  CURATE  METADATA  ENGINE_SELECT  STAGE_MODEL              <- run-level checkpoint
+    DEPLOY  READY_WAIT  CAPABILITY  PERF_BENCH  SHOWCASE  CLEANUP       <- stage-level checkpoint
 
 Checkpoint semantics:
 - run-level stages: if any fails, restart the whole run from DISCOVER on retry
+  (STAGE_MODEL is idempotent on an already-staged dir, so full restart is cheap)
 - stage-level stages: if any fails, retry from the last OK stage (DEPLOY result is preserved)
   This avoids wasting 60-120s of vllm boot if CAPABILITY/SHOWCASE fail.
 - CLEANUP is idempotent and always runs (best-effort) on terminal transitions.
 
 State is persisted to runs/<run_id>/state.json after every transition.
 Process can crash and recover by scanning state.json files.
+
+See docs/ARCHITECTURE.md §3 for per-stage inputs/outputs and failure semantics.
 """
 from __future__ import annotations
 
@@ -29,9 +32,17 @@ class StageName(str, Enum):
     CURATE = "CURATE"
     METADATA = "METADATA"
     ENGINE_SELECT = "ENGINE_SELECT"
+    # PR#31: Idempotent model-weights staging into the orchestrator's
+    # local cache (`cfg.model_cache_root / cfg.hf_local_dir(hf_id)`).
+    # Sits AFTER ENGINE_SELECT (so we already know whether the run is
+    # oversize and can skip the download) and BEFORE DEPLOY (so by the
+    # time DEPLOY runs, the weights are guaranteed on disk and the
+    # docker bind-mount cannot miss).
+    STAGE_MODEL = "STAGE_MODEL"
     DEPLOY = "DEPLOY"
     READY_WAIT = "READY_WAIT"
     CAPABILITY = "CAPABILITY"
+    PERF_BENCH = "PERF_BENCH"
     SHOWCASE = "SHOWCASE"
     CLEANUP = "CLEANUP"
 
@@ -41,9 +52,11 @@ STAGES_IN_ORDER: list[StageName] = [
     StageName.CURATE,
     StageName.METADATA,
     StageName.ENGINE_SELECT,
+    StageName.STAGE_MODEL,
     StageName.DEPLOY,
     StageName.READY_WAIT,
     StageName.CAPABILITY,
+    StageName.PERF_BENCH,
     StageName.SHOWCASE,
     StageName.CLEANUP,
 ]
@@ -53,12 +66,17 @@ RUN_LEVEL_STAGES: set[StageName] = {
     StageName.CURATE,
     StageName.METADATA,
     StageName.ENGINE_SELECT,
+    # STAGE_MODEL is run-level (no docker, no GPU; pure local-filesystem
+    # + HF Hub I/O), and full-restartable: it's idempotent on a
+    # already-staged dir.
+    StageName.STAGE_MODEL,
 }
 
 STAGE_LEVEL_STAGES: set[StageName] = {
     StageName.DEPLOY,
     StageName.READY_WAIT,
     StageName.CAPABILITY,
+    StageName.PERF_BENCH,
     StageName.SHOWCASE,
     StageName.CLEANUP,
 }

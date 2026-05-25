@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# heyi-eval-agent-prepare <run-id>
+#
+# ExecStartPre (root-prefix `+`) for the heyi-eval-agent@<run-id>.service
+# template unit. Idempotently materialises the per-run workdir and outbox
+# under the agent's HOME and hands ownership to the agent user.
+#
+# Trust:
+#   • Runs as root via systemd `ExecStartPre=+`.
+#   • Argument MUST be a sanitised run-id (matched against the same regex
+#     as the agent-run wrapper). The systemd unit-name parser already
+#     rejects most exotic chars, but we belt-and-suspenders re-validate
+#     because v9's incidents were partly enabled by trusting upstream
+#     sanitisation.
+#   • All directories created live ONLY inside the agent's HOME
+#     (/var/lib/heyi-eval-agent). We never `mkdir` or `chmod` anything in
+#     /home/ai/* — that ACL is set once by acl_install.sh.
+set -euo pipefail
+
+PROG="heyi-eval-agent-prepare"
+AGENT_USER="${AGENT_USER:-heyi-eval-agent}"
+AGENT_HOME="${AGENT_HOME:-/var/lib/heyi-eval-agent}"
+
+log() { printf '[%s] %s\n' "$PROG" "$*" >&2; }
+die() { printf '[%s] ERROR: %s\n' "$PROG" "$*" >&2; exit 2; }
+
+[[ $EUID -eq 0 ]] || die "must be invoked as root (use ExecStartPre=+)"
+[[ $# -eq 1   ]] || die "usage: $PROG <run-id>"
+
+RUN_ID="$1"
+if ! [[ "$RUN_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
+  # Same allowlist as heyi-eval-agent-run. Refusing here also stops a
+  # malicious unit-name like `..` or with slashes from materialising a
+  # workdir at a path the agent could escape from.
+  die "invalid run-id $(printf %q "$RUN_ID")"
+fi
+
+id -u "$AGENT_USER" >/dev/null 2>&1 || die "user $AGENT_USER missing (setup_agent_user.sh first)"
+[[ -d "$AGENT_HOME" ]] || die "agent home $AGENT_HOME missing (setup_agent_user.sh first)"
+
+RUN_DIR="$AGENT_HOME/runs/$RUN_ID"
+WORKDIR="$RUN_DIR/workdir"
+OUTBOX="$RUN_DIR/outbox"
+
+install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0750 "$AGENT_HOME/runs"
+install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0750 "$RUN_DIR" "$WORKDIR" "$OUTBOX"
+
+# Sanity: never let a prior run leak its workdir into a new instance with
+# the same id. If you re-use a run-id and there are stale files, drop
+# them and recreate empty dirs. The outbox is preserved so the
+# orchestrator can still rsync the previous attempt's last successful
+# write if it lost the report due to a crash.
+if [[ -n "$(ls -A "$WORKDIR" 2>/dev/null || true)" ]]; then
+  log "warning: stale workdir for run-id=$RUN_ID found, wiping"
+  rm -rf -- "$WORKDIR"/* "$WORKDIR"/.[!.]* "$WORKDIR"/..?* 2>/dev/null || true
+fi
+
+log "ok run_id=$RUN_ID workdir=$WORKDIR outbox=$OUTBOX"

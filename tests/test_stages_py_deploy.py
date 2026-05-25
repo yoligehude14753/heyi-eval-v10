@@ -267,6 +267,19 @@ class DeploySadTests(unittest.TestCase):
             self.assertEqual(r.error_kind, "image_pull")
 
     def test_s3_model_path_missing(self):
+        """PR#31: model staging is no longer DEPLOY's job — it lives in
+        the new STAGE_MODEL pipeline stage. If DEPLOY still sees a
+        missing model path here, that is a HARD bug (the pipeline order
+        was bypassed, or STAGE_MODEL was skipped), not a graceful
+        "wait for stager" condition.
+
+        Old contract (pre-PR#31, kept here as commentary): graceful
+        skip with error_kind="model_missing". The graceful skip used
+        to silently mask the PR#30 root cause (no auto-stager existed).
+
+        New contract: hard fail with error_kind="model_missing_after_stage"
+        so the run shows up red in the Panel and operator investigates.
+        """
         with TemporaryDirectory() as td:
             tmp = Path(td)
             cfg = _make_cfg(tmp)
@@ -277,7 +290,7 @@ class DeploySadTests(unittest.TestCase):
                 r = stages_py.execute_deploy(run, cfg, sleep=_NOP_SLEEP)
 
             self.assertFalse(r.ok)
-            self.assertEqual(r.error_kind, "model_missing")
+            self.assertEqual(r.error_kind, "model_missing_after_stage")
             self.assertEqual(client.containers.run.call_count, 0)
 
     def test_s4_engine_json_missing(self):

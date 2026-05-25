@@ -278,9 +278,12 @@ class _Harness:
         self.data_root = root / "data"
         self.model_cache_root = root / "models" / "_eval-cache"
         # The model dir must exist for stages_py._model_path_on_host check.
+        # PR#31: STAGE_MODEL also needs at least one weight file to
+        # treat the dir as 'already staged' and skip download.
         model_subdir = self.model_cache_root / HF_ID.split("/", 1)[-1]
         model_subdir.mkdir(parents=True, exist_ok=True)
         (model_subdir / "config.json").write_text("{}", encoding="utf-8")
+        (model_subdir / "model.safetensors").write_bytes(b"\x00" * 16)
 
         # Build the cfg used everywhere.
         self.cfg = OrchestratorConfig(
@@ -295,6 +298,15 @@ class _Harness:
             capability_timeout_s=5,
             showcase_timeout_s=5,
             cleanup_timeout_s=5,
+            # PR#36a: the DEPLOY-level inference probe lives in
+            # stages_py, not in capability.py. The E2E harness mocks
+            # the capability stage's chat helper for sad-path tests
+            # but doesn't (and shouldn't) mock the deploy probe's
+            # _http_post_json. Disable the probe here so e2e tests
+            # still exercise the original DEPLOY → CAPABILITY flow.
+            # The PR#36a tests in test_pr36_inference_probe.py turn
+            # the probe back on explicitly.
+            deploy_inference_probe_enabled=False,
         )
 
         # Patch every external boundary.

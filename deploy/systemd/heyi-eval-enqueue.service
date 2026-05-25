@@ -1,0 +1,38 @@
+[Unit]
+Description=heyi-eval-v10 auto-enqueue newest discovered models into orchestrator queue
+Documentation=https://github.com/yoligehude14753/heyi-eval-v10/blob/main/docs/ARCHITECTURE.md
+After=network-online.target heyi-eval-discover.service
+Wants=network-online.target
+# PR#30 supersedes the v9-era unit that pointed at ~/heyi-eval-v9/.venv —
+# v10 owns the same data root + curated.json, so all paths now live under
+# /home/ai/heyi-eval-v10.
+ConditionPathExists=/home/ai/heyi-eval-v10/.venv/bin/python
+
+[Service]
+Type=oneshot
+User=ai
+Group=ai
+WorkingDirectory=/home/ai/heyi-eval-v10
+EnvironmentFile=-/etc/heyi-eval-v10/env
+Environment=PYTHONUNBUFFERED=1
+Environment=HEYI_EVAL_DATA=/home/ai/heyi-eval-data
+Environment=HF_ENDPOINT=https://hf-mirror.com
+# PR#56: looser thresholds + bigger batch so the orchestrator queue is
+# rarely empty. Whitelist vendors (Qwen/MiniMax/Mistral/Google/...) now
+# bypass the signal threshold in _enqueue_policy_passes, so this
+# threshold only gates non-whitelist trending candidates. 200dl / 5likes
+# rejects bulk no-signal uploads but admits fresh research checkpoints.
+# Combined with the 15-min timer cadence (see .timer unit), the panel
+# now shows continuous queue activity instead of "0 pending" between
+# hourly bursts.
+ExecStart=/home/ai/heyi-eval-v10/.venv/bin/python -m discover.main enqueue \
+    --limit 5 \
+    --min-downloads 200 \
+    --min-likes 5
+Nice=10
+MemoryHigh=1G
+MemoryMax=2G
+TasksMax=128
+
+[Install]
+WantedBy=multi-user.target

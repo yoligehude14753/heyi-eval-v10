@@ -6,7 +6,12 @@ against a fake.
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable
+import re
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections.abc import Iterable, Iterator
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -63,6 +68,11 @@ class TrackerConfig:
     ])
     per_org_limit: int = 50
     trending_sweep_limit: int = 200
+    # PR#53: only admit a "trending" candidate if it has actually been
+    # touched in the last N days. Without this gate every daily scan
+    # surfaces the same stale mega-popular checkpoints (bert-base,
+    # llama-2-7b, …) and crowds out fresh releases. ``0`` disables.
+    min_trending_recency_days: int = 0
 
     @classmethod
     def from_yaml(cls, path: Path) -> TrackerConfig:
@@ -89,24 +99,46 @@ class TrackerConfig:
             ]),
             per_org_limit=int(data.get("per_org_limit", 50)),
             trending_sweep_limit=int(data.get("trending_sweep_limit", 200)),
+            min_trending_recency_days=int(
+                data.get("min_trending_recency_days", 0)
+            ),
         )
 
 
 @dataclass
 class Cursor:
     """Persistent state of one tracker. `seen` is the set of hf_ids we have
-    already emitted as a candidate (so repeat scans don't dup them)."""
+    already emitted as a candidate (so repeat scans don't dup them).
+
+    PR#49: extends with backfill tracking. ``backfill_complete`` flips to
+    True once the daemon has paginated every 2026 model whose
+    ``last_modified >= config.from_date`` into the candidates file. After
+    that, daily incremental scans (``scan_incremental``) only fetch the
+    delta since ``last_run_ts``.
+    """
     seen: set[str] = field(default_factory=set)
     last_run_ts: str = ""
+    backfill_complete: bool = False
+    # The oldest last_modified we've already paged through during backfill.
+    # Used to resume an interrupted backfill — next page starts strictly
+    # before this timestamp.
+    backfill_high_water: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        return {"seen": sorted(self.seen), "last_run_ts": self.last_run_ts}
+        return {
+            "seen": sorted(self.seen),
+            "last_run_ts": self.last_run_ts,
+            "backfill_complete": self.backfill_complete,
+            "backfill_high_water": self.backfill_high_water,
+        }
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Cursor:
         return cls(
             seen=set(d.get("seen") or []),
             last_run_ts=str(d.get("last_run_ts", "")),
+            backfill_complete=bool(d.get("backfill_complete", False)),
+            backfill_high_water=str(d.get("backfill_high_water", "")),
         )
 
 
@@ -208,31 +240,49 @@ def _passes_modality(pipeline_tag: str | None, allowed: list[str]) -> bool:
 
 
 def _model_to_candidate(m: Any, reason: str) -> Candidate:
-    """Convert HfApi ModelInfo (or dict from fake) to our Candidate."""
-    hf_id = getattr(m, "id", None) or m.get("id")
-    pipeline_tag = getattr(m, "pipeline_tag", None)
-    if pipeline_tag is None and isinstance(m, dict):
-        pipeline_tag = m.get("pipeline_tag")
-    last_modified = (
-        getattr(m, "last_modified", None)
-        or getattr(m, "lastModified", None)
-        or (m.get("last_modified") if isinstance(m, dict) else None)
+    """Convert HfApi ModelInfo (or dict from fake / raw mirror JSON) to
+    our Candidate.
+
+    PR#52: the mirror's /api/models JSON uses camelCase (``lastModified``,
+    ``modelId``) while huggingface_hub's ModelInfo exposes snake_case
+    attributes (``last_modified``). Read both so the same converter
+    works for either input shape.
+    """
+    def _read(key_snake: str, key_camel: str | None = None) -> Any:
+        v = getattr(m, key_snake, None)
+        if v is not None:
+            return v
+        if isinstance(m, dict):
+            return m.get(key_snake) or (m.get(key_camel) if key_camel else None)
+        if key_camel:
+            return getattr(m, key_camel, None)
+        return None
+
+    hf_id = (
+        getattr(m, "id", None)
+        or (m.get("id") if isinstance(m, dict) else None)
+        or (m.get("modelId") if isinstance(m, dict) else None)
+        or ""
     )
-    library_name = getattr(m, "library_name", None)
-    if library_name is None and isinstance(m, dict):
-        library_name = m.get("library_name")
+    pipeline_tag = _read("pipeline_tag", "pipelineTag")
+    last_modified = _read("last_modified", "lastModified")
+    library_name = _read("library_name", "libraryName")
+    downloads = _read("downloads")
+    likes = _read("likes")
+    private = _read("private")
+    gated = _read("gated")
     return Candidate(
         hf_id=hf_id,
         discovered_at=datetime.now(tz=UTC).isoformat(timespec="seconds"),
         reason=reason,
         source_org=hf_id.split("/", 1)[0] if "/" in hf_id else None,
         last_modified=_norm_ts(last_modified),
-        downloads=int(getattr(m, "downloads", 0) or 0) or None,
-        likes=int(getattr(m, "likes", 0) or 0) or None,
+        downloads=int(downloads or 0) or None,
+        likes=int(likes or 0) or None,
         pipeline_tag=pipeline_tag,
         library_name=library_name,
-        private=bool(getattr(m, "private", False) or False),
-        gated=bool(getattr(m, "gated", False) or False),
+        private=bool(private or False),
+        gated=bool(gated or False),
     )
 
 
@@ -249,6 +299,184 @@ _EXPAND_FIELDS = [
     "private",
     "gated",
 ]
+
+
+# ── PR#52: cursor-aware mirror paginator ──────────────────────────────────
+
+
+def _parse_next_link(link_header: str) -> str | None:
+    """Extract ``<URL>; rel="next"`` from a Link header."""
+    if not link_header:
+        return None
+    m = re.search(r'<([^>]+)>;\s*rel=["\']?next["\']?', link_header)
+    return m.group(1) if m else None
+
+
+def _rewrite_to_mirror(url: str, mirror_endpoint: str) -> str:
+    """HF mirror serves page 1 but its Link header points at huggingface.co
+    for ``next``. NV8 / many CN networks can't reach huggingface.co, so
+    we have to swap the host back to the mirror to keep paginating.
+
+    Idempotent: if ``url`` already targets the mirror, returns unchanged.
+    """
+    mirror = mirror_endpoint.rstrip("/")
+    # Replace huggingface.co (any scheme) with the mirror's scheme+host.
+    return re.sub(r"https?://huggingface\.co", mirror, url)
+
+
+def mirror_paginate_models(
+    *,
+    endpoint: str,
+    token: str | None = None,
+    sort: str = "lastModified",
+    direction: int = -1,
+    limit_per_page: int = 1000,
+    expand: list[str] | None = None,
+    stop_when_older_than: str | None = None,
+    max_pages: int = 2000,
+    page_sleep_s: float = 0.0,
+    max_429_retries: int = 8,
+    retry_after_default_s: float = 60.0,
+    log: Any = print,
+    opener: Any = None,
+) -> Iterator[dict]:
+    """Generator that yields raw model JSON dicts from the HF mirror's
+    ``/api/models`` endpoint, transparently following cursor-based
+    pagination via the Link header (rewriting next-URLs back to the
+    mirror so we don't get redirected to the unreachable huggingface.co).
+
+    Parameters
+    ----------
+    endpoint : str
+        e.g. ``https://hf-mirror.com``.
+    token : str | None
+        Sent as ``Authorization: Bearer …`` if provided.
+    sort, direction, limit_per_page, expand
+        Forwarded as query params to ``/api/models``.
+    stop_when_older_than : ISO-8601 string | None
+        Short-circuit: as soon as we yield a model whose
+        ``lastModified < stop_when_older_than``, raise StopIteration
+        on the next loop iteration. Skips wasted pages for backfill.
+    max_pages : int
+        Safety cap so a runaway cursor doesn't page forever (default 2000
+        pages × 1000 items = 2M models, well past the 2026 cohort).
+    page_sleep_s : float
+        Politeness delay between pages.
+    opener : callable | None
+        Pluggable opener for unit tests. Defaults to
+        ``urllib.request.urlopen``. Must accept (Request, *, timeout) and
+        return an object with ``.read()`` + ``.headers.get("Link", "")``.
+    """
+    if expand is None:
+        expand = _EXPAND_FIELDS
+    params: list[tuple[str, str]] = [
+        ("sort", sort),
+        ("direction", str(direction)),
+        ("limit", str(limit_per_page)),
+    ]
+    for f in expand:
+        params.append(("expand", f))
+    url = f"{endpoint.rstrip('/')}/api/models?{urllib.parse.urlencode(params)}"
+    headers = {"User-Agent": "heyi-eval-v10/discover (mirror_paginate)"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    # Normalise the cutoff once so we don't pay the parse cost per row.
+    # The mirror returns "...000Z" with millis but config.from_date is
+    # "...Z" with none; raw string compare ranks `.` (46) < `Z` (90)
+    # and a model exactly at the boundary is wrongly judged "older".
+    cutoff_norm = _norm_ts(stop_when_older_than) if stop_when_older_than else None
+
+    _opener = opener or urllib.request.urlopen
+
+    def _fetch_with_429_retry(req_url: str) -> tuple[bytes, str] | None:
+        """Returns (body, link_hdr) or None on hard failure. The HF
+        mirror throttles at ~150 consecutive page fetches with HTTP
+        429; honour Retry-After and try again so we can drain the
+        whole 2026 cohort in one round."""
+        attempt = 0
+        while True:
+            try:
+                req = urllib.request.Request(req_url, headers=headers)
+                with _opener(req, timeout=60) as r:
+                    body = r.read()
+                    if hasattr(r, "headers"):
+                        link = r.headers.get("Link", "") or ""
+                    else:
+                        link = r.getheader("Link", "") or ""
+                return body, link
+            except urllib.error.HTTPError as e:
+                if e.code == 429 and attempt < max_429_retries:
+                    retry_after = e.headers.get("Retry-After") if hasattr(e, "headers") else None
+                    try:
+                        wait_s = float(retry_after) if retry_after else retry_after_default_s
+                    except (TypeError, ValueError):
+                        wait_s = retry_after_default_s
+                    attempt += 1
+                    log(f"[mirror_paginate] HTTP 429 throttle "
+                        f"(attempt {attempt}/{max_429_retries}); "
+                        f"sleeping {wait_s:.0f}s")
+                    time.sleep(wait_s)
+                    continue
+                log(f"[mirror_paginate] HTTPError {e.code} on "
+                    f"{req_url[:120]}: {e}")
+                return None
+            except Exception as e:
+                log(f"[mirror_paginate] request failed on "
+                    f"{req_url[:120]}: {type(e).__name__}: {e}")
+                return None
+
+    for page_idx in range(1, max_pages + 1):
+        result = _fetch_with_429_retry(url)
+        if result is None:
+            return
+        body, link_hdr = result
+        try:
+            models = json.loads(body)
+        except json.JSONDecodeError as e:
+            log(f"[mirror_paginate] page {page_idx} bad JSON: {e}; "
+                f"body[:200]={body[:200]!r}")
+            return
+        if not isinstance(models, list):
+            log(f"[mirror_paginate] page {page_idx}: expected list, got "
+                f"{type(models).__name__}; body[:200]={body[:200]!r}")
+            return
+        if not models:
+            log(f"[mirror_paginate] page {page_idx}: empty body, end of "
+                f"results (link={link_hdr[:80]!r})")
+            return
+
+        # Per-page heartbeat: oldest lastModified in the page is the
+        # interesting datum (tells us where we are in time).
+        oldest_in_page = min(
+            (m.get("lastModified") or m.get("last_modified") or "ZZZ")
+            for m in models
+        )
+        if page_idx == 1 or page_idx % 50 == 0:
+            log(f"[mirror_paginate] page {page_idx}: n={len(models)} "
+                f"oldest_in_page={oldest_in_page}")
+
+        for m in models:
+            yield m
+            if cutoff_norm:
+                lm = m.get("lastModified") or m.get("last_modified")
+                if lm:
+                    lm_norm = _norm_ts(lm)
+                    if lm_norm and lm_norm < cutoff_norm:
+                        log(f"[mirror_paginate] hit cutoff "
+                            f"{cutoff_norm} at page {page_idx}, stop")
+                        return
+
+        next_url = _parse_next_link(link_hdr)
+        if not next_url:
+            log(f"[mirror_paginate] page {page_idx}: no Link rel=next; "
+                f"reached end of available pages "
+                f"(oldest_in_page={oldest_in_page})")
+            return
+        url = _rewrite_to_mirror(next_url, endpoint)
+        if page_sleep_s:
+            time.sleep(page_sleep_s)
+    log(f"[mirror_paginate] max_pages={max_pages} reached, stopping")
 
 
 def scan_round(
@@ -306,6 +534,18 @@ def scan_round(
         stats.api_errors += 1
         models = []
 
+    # PR#53: precompute the recency cutoff once. Models touched before
+    # this datetime are dropped from the trending bucket so the daily
+    # scan surfaces actually-fresh hot models, not the same stale
+    # mega-checkpoints every round.
+    recency_cutoff: str | None = None
+    if config.min_trending_recency_days > 0:
+        from datetime import timedelta
+        cutoff_dt = datetime.now(tz=UTC) - timedelta(
+            days=config.min_trending_recency_days,
+        )
+        recency_cutoff = cutoff_dt.isoformat(timespec="seconds")
+
     for m in models:
         cand = _model_to_candidate(m, reason="trending")
         if cand.hf_id in cursor.seen:
@@ -316,6 +556,12 @@ def scan_round(
             stats.seen_skipped += 1
             continue
         if not _passes_window(cand.last_modified, config.from_date):
+            stats.excluded_old += 1
+            continue
+        if recency_cutoff and cand.last_modified and (
+            (_norm_ts(cand.last_modified) or cand.last_modified)
+            < recency_cutoff
+        ):
             stats.excluded_old += 1
             continue
         if not _passes_modality(cand.pipeline_tag, config.modality_pipeline_tags):
@@ -329,6 +575,150 @@ def scan_round(
         new.append(cand)
         cursor.seen.add(cand.hf_id)
         stats.new_candidates += 1
+
+    cursor.last_run_ts = datetime.now(tz=UTC).isoformat(timespec="seconds")
+    return new, stats
+
+
+# Backwards-compatible alias: PR#53 reframes "legacy whitelist+trending"
+# as "curated" — the user's stated discovery scope. Same code path.
+scan_curated = scan_round
+
+
+# ── backfill (PR#49) ───────────────────────────────────────────────────────
+
+
+def scan_backfill(
+    paginator: Iterable[Any],
+    config: TrackerConfig,
+    cursor: Cursor,
+    *,
+    log: Any = print,
+) -> tuple[list[Candidate], RoundStats, bool]:
+    """One round of historical backfill: drain ``paginator`` (yielding
+    models sorted by lastModified DESC) until we cross config.from_date.
+
+    Returns (new_candidates, stats, finished).
+
+    ``finished=True`` means we observed at least one model older than
+    from_date — i.e. we paged through every 2026 model and have proof
+    we hit the bottom. Caller should flip ``cursor.backfill_complete``.
+
+    PR#52 fix: the previous PR#49 implementation tried to resume across
+    rounds by tracking ``backfill_high_water`` and skipping the rolling
+    "top 5000 newest" window. That didn't work because HF Hub returns
+    the same window every call and the high_water marched forward as
+    new models were uploaded. The new design pages cursor-style via the
+    HF Link header (see ``mirror_paginate_models``), so a single round
+    drains everything from "now" back to from_date in one shot.
+
+    The trending threshold (downloads/likes) is NOT applied in backfill
+    mode — we want EVERY 2026 model, not just popular ones, exactly as
+    the user requested: "把26年历史的抓完后，就持续抓最新的就好，日频抓取".
+    Modality and privacy filters still apply.
+    """
+    stats = RoundStats()
+    new: list[Candidate] = []
+    finished = False
+    oldest_seen: str | None = None
+    saw_any = False
+    # PR#52: normalise the boundary once so we don't mis-compare due to
+    # "Z" vs "+00:00" suffix mismatches (see mirror_paginate_models for
+    # the gory details).
+    from_date_norm = _norm_ts(config.from_date) or config.from_date
+
+    try:
+        for m in paginator:
+            saw_any = True
+            cand = _model_to_candidate(m, reason="backfill")
+            if cand.last_modified and (
+                oldest_seen is None or cand.last_modified < oldest_seen
+            ):
+                oldest_seen = cand.last_modified
+            # Stop iterating once we cross the from_date boundary.
+            if (cand.last_modified and
+                    cand.last_modified < from_date_norm):
+                finished = True
+                stats.excluded_old += 1
+                break
+            if cand.hf_id in cursor.seen:
+                stats.seen_skipped += 1
+                continue
+            if not _passes_window(cand.last_modified, config.from_date):
+                stats.excluded_old += 1
+                continue
+            if not _passes_modality(cand.pipeline_tag,
+                                    config.modality_pipeline_tags):
+                stats.excluded_modality += 1
+                continue
+            if cand.private or cand.gated:
+                # gated repos can be promoted by other paths (manual
+                # enqueue) but backfill skips them to avoid the 403
+                # GatedRepoError storm during model_stager downloads.
+                stats.excluded_modality += 1
+                continue
+            new.append(cand)
+            cursor.seen.add(cand.hf_id)
+            stats.new_candidates += 1
+    except Exception as e:
+        log(f"[backfill] paginator failed mid-stream: "
+            f"{type(e).__name__}: {e}")
+        stats.api_errors += 1
+
+    if not saw_any:
+        log("[backfill] paginator yielded zero models — treating as "
+            "finished so the daemon stops looping on an empty source")
+        finished = True
+
+    if oldest_seen:
+        cursor.backfill_high_water = oldest_seen
+    cursor.last_run_ts = datetime.now(tz=UTC).isoformat(timespec="seconds")
+    if finished:
+        cursor.backfill_complete = True
+    return new, stats, finished
+
+
+def scan_incremental(
+    paginator: Iterable[Any],
+    config: TrackerConfig,
+    cursor: Cursor,
+    *,
+    log: Any = print,
+) -> tuple[list[Candidate], RoundStats]:
+    """Daily-incremental pass after backfill is complete.
+
+    Drains ``paginator`` (newest-first) and stops as soon as it yields
+    a model older than ``cursor.last_run_ts``. Same filters as
+    backfill — no trending-downloads gate, so a new-but-unknown model
+    is still captured.
+    """
+    stats = RoundStats()
+    new: list[Candidate] = []
+    cutoff_raw = cursor.last_run_ts or config.from_date
+    cutoff = _norm_ts(cutoff_raw) or cutoff_raw
+
+    try:
+        for m in paginator:
+            cand = _model_to_candidate(m, reason="incremental")
+            if cand.last_modified and cand.last_modified < cutoff:
+                break
+            if cand.hf_id in cursor.seen:
+                stats.seen_skipped += 1
+                continue
+            if not _passes_modality(cand.pipeline_tag,
+                                    config.modality_pipeline_tags):
+                stats.excluded_modality += 1
+                continue
+            if cand.private or cand.gated:
+                stats.excluded_modality += 1
+                continue
+            new.append(cand)
+            cursor.seen.add(cand.hf_id)
+            stats.new_candidates += 1
+    except Exception as e:
+        log(f"[incremental] paginator failed mid-stream: "
+            f"{type(e).__name__}: {e}")
+        stats.api_errors += 1
 
     cursor.last_run_ts = datetime.now(tz=UTC).isoformat(timespec="seconds")
     return new, stats
