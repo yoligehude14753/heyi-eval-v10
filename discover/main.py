@@ -19,6 +19,7 @@ from .tracker import (
     append_candidates,
     load_candidates,
     load_cursor,
+    mirror_paginate_models,
     save_cursor,
     scan_backfill,
     scan_incremental,
@@ -85,13 +86,36 @@ def cmd_once(args: argparse.Namespace) -> int:
         kind = "legacy"
         finished = None
     elif mode == "backfill" or (mode == "auto" and not cursor.backfill_complete):
-        new, stats, finished = scan_backfill(
-            api, config, cursor,
-            max_per_round=getattr(args, "backfill_batch", 5000),
+        # PR#52: cursor-aware mirror paginator drains the entire 2026
+        # cohort in one round (~30min) by following Link-header `next`
+        # URLs rewritten to point back to the mirror (huggingface.co
+        # itself is unreachable from NV8 / most CN networks).
+        paginator = mirror_paginate_models(
+            endpoint=args.hf_endpoint,
+            token=_resolve_hf_token(),
+            sort="lastModified",
+            direction=-1,
+            limit_per_page=getattr(args, "backfill_page_size", 1000),
+            stop_when_older_than=config.from_date,
+            max_pages=getattr(args, "backfill_max_pages", 2000),
+            page_sleep_s=getattr(args, "backfill_page_sleep_s", 0.2),
         )
+        new, stats, finished = scan_backfill(paginator, config, cursor)
         kind = "backfill"
     else:
-        new, stats = scan_incremental(api, config, cursor)
+        # Incremental: 1-3 pages of newest models is plenty for a daily
+        # delta; cap pages low and stop at cursor.last_run_ts.
+        paginator = mirror_paginate_models(
+            endpoint=args.hf_endpoint,
+            token=_resolve_hf_token(),
+            sort="lastModified",
+            direction=-1,
+            limit_per_page=1000,
+            stop_when_older_than=cursor.last_run_ts or config.from_date,
+            max_pages=10,
+            page_sleep_s=0.2,
+        )
+        new, stats = scan_incremental(paginator, config, cursor)
         kind = "incremental"
         finished = None
 
@@ -304,8 +328,16 @@ def main(argv: list[str] | None = None) -> int:
               "= the pre-PR#49 whitelist+trending sweep"),
     )
     p_once.add_argument(
-        "--backfill-batch", type=int, default=5000,
-        help="max models per backfill page",
+        "--backfill-page-size", type=int, default=1000,
+        help="models per cursor page (HF mirror caps at ~1000)",
+    )
+    p_once.add_argument(
+        "--backfill-max-pages", type=int, default=2000,
+        help="safety cap to prevent runaway cursor pagination",
+    )
+    p_once.add_argument(
+        "--backfill-page-sleep-s", type=float, default=0.2,
+        help="politeness delay between mirror pages",
     )
     p_once.set_defaults(func=cmd_once)
 
@@ -325,8 +357,16 @@ def main(argv: list[str] | None = None) -> int:
         help="see `once --mode`",
     )
     p_loop.add_argument(
-        "--backfill-batch", type=int, default=5000,
-        help="max models per backfill page",
+        "--backfill-page-size", type=int, default=1000,
+        help="models per cursor page (HF mirror caps at ~1000)",
+    )
+    p_loop.add_argument(
+        "--backfill-max-pages", type=int, default=2000,
+        help="safety cap to prevent runaway cursor pagination",
+    )
+    p_loop.add_argument(
+        "--backfill-page-sleep-s", type=float, default=0.2,
+        help="politeness delay between mirror pages",
     )
     p_loop.set_defaults(func=cmd_loop)
 
