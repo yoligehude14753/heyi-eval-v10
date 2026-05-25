@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import json
 import sys
+from unittest import mock as _unittest_mock
+unittest_mock_patch_object = _unittest_mock.patch.object
 
 import pytest
 
@@ -1452,6 +1454,81 @@ def test_pr63_run_detail_renders_inferred_params_with_tooltip(
     assert "0.5B" in out
     assert "Qwen" in out
     assert "从模型名推断" in out  # tooltip text
+
+
+def test_pr64_results_page_has_table_toolkit_directives(tmp_path, monkeypatch):
+    """The /results page must mark its table as data-table with sortable
+    headers and filter dropdowns so users can search/sort/filter."""
+    import importlib
+    srv = importlib.import_module("panel.server")
+    monkeypatch.setattr(srv, "DATA_ROOT", tmp_path)
+    out = srv.render_results_page()
+    # Toolkit directives on the table
+    assert "<table data-table" in out
+    assert "data-sort='time'" in out
+    assert "data-default-sort='desc'" in out
+    assert "data-filter='search'" in out
+    assert "data-filter='enum'" in out
+    # Toolkit JS is embedded
+    assert "initDataTables" in out
+    assert "dt-toolbar" in out
+    # Filter labels (Chinese)
+    assert "data-filter-label='状态'" in out
+    assert "data-filter-label='模态'" in out
+    assert "data-filter-label='引擎'" in out
+
+
+def test_pr64_candidates_page_has_table_toolkit_directives(tmp_path, monkeypatch):
+    """The /candidates page must support sort+filter on hf_id /status /
+    pipeline_tag / source columns."""
+    import importlib
+    srv = importlib.import_module("panel.server")
+    monkeypatch.setattr(srv, "DATA_ROOT", tmp_path)
+    out = srv.render_candidates_page()
+    assert "<table data-table" in out
+    assert "data-filter='search'" in out
+    assert "data-filter='enum'" in out
+    assert "data-default-sort='desc'" in out
+    assert "initDataTables" in out
+    assert "data-filter-label='状态'" in out
+    assert "data-filter-label='来源'" in out
+
+
+def test_pr64_results_row_cells_carry_data_value(tmp_path, monkeypatch):
+    """Each cell that needs numeric/temporal sort must carry data-value
+    so the toolkit can sort by real values (not '5 分钟前' strings)."""
+    import importlib
+    srv = importlib.import_module("panel.server")
+    rows = [{
+        "run_id": "r1", "hf_id": "Qwen/Qwen2.5-7B",
+        "status": "ok", "publisher": "Qwen", "modality": "text",
+        "params": "7B", "license": "apache-2.0", "engine": "vllm",
+        "capability": "9/10", "pass_rate": 0.9,
+        "categories": ["text_reasoning"],
+        "ttft_ms_p50": 240.0, "tps_p50": 62.0, "perf_applicable": True,
+        "showcase_items": 5, "first_impression": "靠谱",
+        "summary": "整体表现良好", "duration_s": 120,
+        "created_at": 1748100000, "ended_at": 1748100120,
+        "failure_reason": None, "failure_reason_zh": None,
+    }]
+    with unittest_mock_patch_object(srv, "results_leaderboard",
+                                    return_value={
+                                        "total": 1, "completed_ok": 1,
+                                        "failed": 0, "in_progress": 0,
+                                        "avg_pass_rate": 0.9,
+                                        "rows": rows,
+                                    }):
+        out = srv.render_results_page()
+    # time column carries unix timestamp
+    assert "data-value='1748100000'" in out
+    # pass_rate column carries 0.9
+    assert "data-value='0.9'" in out
+    # ttft + tps + duration
+    assert "data-value='240.0'" in out
+    assert "data-value='62.0'" in out
+    assert "data-value='120'" in out
+    # hf_id and status carry string sort values
+    assert "data-value='Qwen/Qwen2.5-7B'" in out
 
 
 def test_pr63_results_leaderboard_uses_inferred_params(tmp_path, monkeypatch):

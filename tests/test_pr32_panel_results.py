@@ -136,8 +136,13 @@ class TestFailureReasonTruncated(unittest.TestCase):
                                    "rows": rows,
                                }):
             html = server.render_results_page()
-        # Short message must NOT be truncated.
-        self.assertNotIn("…", html)
+        # Short message must NOT be truncated. Check only the row body
+        # (the toolkit's placeholder text "搜索 ... …" lives in JS and
+        # is not part of the data).
+        tbody_start = html.find("<tbody>")
+        tbody_end = html.find("</tbody>")
+        body = html[tbody_start:tbody_end] if tbody_start >= 0 else html
+        self.assertNotIn("…", body)
         # Must still be rendered.
         self.assertIn(short_err, html)
 

@@ -398,7 +398,254 @@ main{padding:20px 28px 80px;max-width:1500px;margin:0 auto}
 .show-rationale>div,.show-comment>div{color:var(--text-2);font-size:13px;line-height:1.55}
 .show-comment{background:#2a230f;border:1px solid #5a4322;border-radius:6px;padding:8px 12px;color:#e9b870}
 .show-comment label{color:#e9b870}
+
+/* PR#64 — data-table toolkit: sortable headers + filter toolbar */
+.dt-toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;
+  padding:10px 14px;background:var(--bg-card-2);border:1px solid var(--border);
+  border-radius:8px;margin-bottom:12px}
+.dt-toolbar input,.dt-toolbar select{background:var(--bg);border:1px solid var(--border-2);
+  color:var(--text);padding:7px 10px;border-radius:6px;font-size:13px;font-family:var(--sans);
+  min-width:140px;outline:none}
+.dt-toolbar input:focus,.dt-toolbar select:focus{border-color:var(--accent)}
+.dt-toolbar input[type=search]{min-width:240px}
+.dt-toolbar label{font-size:11px;color:var(--text-3);
+  text-transform:uppercase;letter-spacing:0.05em;margin-right:4px;font-weight:600}
+.dt-toolbar .dt-spacer{flex:1}
+.dt-count{font-size:12px;color:var(--text-2);font-variant-numeric:tabular-nums}
+.dt-clear{background:transparent;border:1px solid var(--border-2);color:var(--text-2);
+  padding:6px 12px;border-radius:6px;font-size:12px;cursor:pointer;font-family:var(--sans)}
+.dt-clear:hover{border-color:var(--accent);color:var(--accent)}
+table[data-table] th[data-sort]{cursor:pointer;user-select:none;position:relative;
+  padding-right:18px;transition:color 0.15s}
+table[data-table] th[data-sort]:hover{color:var(--accent)}
+table[data-table] th[data-sort]::after{content:'⇅';position:absolute;right:6px;top:50%;
+  transform:translateY(-50%);font-size:11px;opacity:0.4}
+table[data-table] th[data-sort].sort-asc::after{content:'▲';opacity:1;color:var(--accent)}
+table[data-table] th[data-sort].sort-desc::after{content:'▼';opacity:1;color:var(--accent)}
+table[data-table] tr.dt-hidden{display:none}
 </style>"""
+
+
+# PR#64: vanilla data-table toolkit. Adds sortable column headers,
+# search + filter dropdowns above the table, and a row count. Reads
+# config from data-* attributes so HTML stays declarative:
+#   <table data-table data-table-name="results">
+#     <thead><tr>
+#       <th data-sort="time" data-default-sort="desc">时间</th>
+#       <th data-sort="text" data-filter="search" data-filter-label="搜索">hf_id</th>
+#       <th data-sort="text" data-filter="enum" data-filter-label="状态">状态</th>
+#       <th data-sort="num">通过率</th>
+#       ...
+#     </tr></thead>
+#     <tbody><tr><td data-value="42">42%</td>...</tr></tbody>
+#   </table>
+# data-sort values: "text" / "num" / "time"
+# data-filter values: "search" (text input) / "enum" (auto-build dropdown
+#   from distinct column values)
+# Each <td> may set data-value="..." to override the sort/filter key
+# (useful for "刚刚" / "5 分钟前" cells where you want to sort by
+# the underlying timestamp).
+_TABLE_TOOLKIT_JS = """<script>
+(function(){
+  function parseNum(s) {
+    if (s == null) return NaN;
+    s = String(s).trim();
+    if (!s || s === '-' || s === 'N/A') return NaN;
+    // strip common units & separators
+    var m = s.replace(/,/g, '').match(/^(-?\\d+(?:\\.\\d+)?)/);
+    if (!m) return NaN;
+    var n = parseFloat(m[1]);
+    if (/[kK千]/.test(s)) n *= 1e3;
+    else if (/[mM万]/.test(s) && !/ms\\b/.test(s)) {
+      // 'm' on its own means million ONLY if not "ms"; tested by ms guard above
+      // but most of our numbers labeled 'M' are actually params (100M = 1e6)
+      n *= 1e6;
+    } else if (/[bB亿]/.test(s)) n *= 1e9;
+    return n;
+  }
+  function cellValue(tr, idx) {
+    var td = tr.children[idx];
+    if (!td) return '';
+    var dv = td.getAttribute('data-value');
+    if (dv != null) return dv;
+    return (td.textContent || '').trim();
+  }
+  function cmp(a, b, type) {
+    if (type === 'num' || type === 'time') {
+      var an = parseFloat(a), bn = parseFloat(b);
+      var aok = !isNaN(an), bok = !isNaN(bn);
+      if (!aok && !bok) return 0;
+      if (!aok) return 1;   // NaN sorts to bottom
+      if (!bok) return -1;
+      return an - bn;
+    }
+    return String(a).localeCompare(String(b), 'zh-CN');
+  }
+  function initOne(table) {
+    var thead = table.tHead;
+    if (!thead) return;
+    var ths = Array.from(thead.rows[0].cells);
+    var tbody = table.tBodies[0];
+    if (!tbody) return;
+    var allRows = Array.from(tbody.rows);
+
+    // Build toolbar
+    var toolbar = document.createElement('div');
+    toolbar.className = 'dt-toolbar';
+    var filters = []; // {idx, type, el, getValue}
+    ths.forEach(function(th, idx){
+      var f = th.getAttribute('data-filter');
+      if (!f) return;
+      var label = th.getAttribute('data-filter-label') || th.textContent.trim();
+      var wrap = document.createElement('span');
+      wrap.style.display = 'inline-flex';
+      wrap.style.alignItems = 'center';
+      wrap.style.gap = '6px';
+      var lab = document.createElement('label');
+      lab.textContent = label;
+      wrap.appendChild(lab);
+      if (f === 'search') {
+        var inp = document.createElement('input');
+        inp.type = 'search';
+        inp.placeholder = '搜索 ' + label + '…';
+        wrap.appendChild(inp);
+        filters.push({idx: idx, type: 'search', el: inp,
+          getValue: function(){ return inp.value.trim().toLowerCase(); }});
+        inp.addEventListener('input', apply);
+      } else if (f === 'enum') {
+        var sel = document.createElement('select');
+        var optAll = document.createElement('option');
+        optAll.value = '';
+        optAll.textContent = '全部';
+        sel.appendChild(optAll);
+        var distinct = {};
+        allRows.forEach(function(tr){
+          var v = cellValue(tr, idx);
+          if (v && !distinct[v]) distinct[v] = true;
+        });
+        Object.keys(distinct).sort().forEach(function(v){
+          var o = document.createElement('option');
+          o.value = v; o.textContent = v;
+          sel.appendChild(o);
+        });
+        wrap.appendChild(sel);
+        filters.push({idx: idx, type: 'enum', el: sel,
+          getValue: function(){ return sel.value; }});
+        sel.addEventListener('change', apply);
+      }
+      toolbar.appendChild(wrap);
+    });
+    // Spacer + count + clear
+    var spacer = document.createElement('span');
+    spacer.className = 'dt-spacer';
+    toolbar.appendChild(spacer);
+    var countEl = document.createElement('span');
+    countEl.className = 'dt-count';
+    toolbar.appendChild(countEl);
+    if (filters.length) {
+      var clear = document.createElement('button');
+      clear.className = 'dt-clear';
+      clear.textContent = '清空筛选';
+      clear.addEventListener('click', function(){
+        filters.forEach(function(f){
+          if (f.type === 'search') f.el.value = '';
+          else f.el.value = '';
+        });
+        apply();
+      });
+      toolbar.appendChild(clear);
+    }
+    // Mount toolbar
+    table.parentNode.insertBefore(toolbar, table);
+
+    // Sortable headers
+    var currentSort = null;
+    ths.forEach(function(th, idx){
+      var stype = th.getAttribute('data-sort');
+      if (!stype) return;
+      th.addEventListener('click', function(){
+        var dir = (currentSort && currentSort.idx === idx && currentSort.dir === 'asc') ? 'desc' : 'asc';
+        if (currentSort && currentSort.idx === idx) dir = currentSort.dir === 'asc' ? 'desc' : 'asc';
+        else dir = (stype === 'time' || stype === 'num') ? 'desc' : 'asc';
+        currentSort = {idx: idx, type: stype, dir: dir};
+        sortAndRender();
+      });
+    });
+
+    // Default sort: first th with data-default-sort
+    ths.forEach(function(th, idx){
+      var def = th.getAttribute('data-default-sort');
+      if (def && !currentSort) {
+        currentSort = {idx: idx, type: th.getAttribute('data-sort'), dir: def};
+      }
+    });
+
+    function sortAndRender() {
+      // Update header indicators
+      ths.forEach(function(th){
+        th.classList.remove('sort-asc', 'sort-desc');
+      });
+      if (currentSort) {
+        ths[currentSort.idx].classList.add(
+          currentSort.dir === 'asc' ? 'sort-asc' : 'sort-desc',
+        );
+        var rows = allRows.slice();
+        rows.sort(function(a, b){
+          var av = cellValue(a, currentSort.idx);
+          var bv = cellValue(b, currentSort.idx);
+          var r = cmp(av, bv, currentSort.type);
+          return currentSort.dir === 'asc' ? r : -r;
+        });
+        // Re-append in sorted order (preserves event handlers)
+        rows.forEach(function(r){ tbody.appendChild(r); });
+      }
+      apply();
+    }
+
+    function apply() {
+      var visible = 0;
+      allRows.forEach(function(tr){
+        var ok = filters.every(function(f){
+          var v = cellValue(tr, f.idx).toLowerCase();
+          var q = f.getValue().toLowerCase();
+          if (!q) return true;
+          if (f.type === 'enum') return v === q;
+          return v.indexOf(q) !== -1;
+        });
+        tr.classList.toggle('dt-hidden', !ok);
+        if (ok) visible++;
+      });
+      countEl.textContent = '显示 ' + visible + ' / ' + allRows.length + ' 行';
+    }
+
+    sortAndRender();
+  }
+  function initAll(root) {
+    (root || document).querySelectorAll('table[data-table]').forEach(function(t){
+      if (t.__dtInited) return;
+      t.__dtInited = true;
+      initOne(t);
+    });
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', function(){ initAll(); });
+  } else {
+    initAll();
+  }
+  // Expose so JS-populated tables (main dashboard) can re-init after fetch.
+  window.initDataTables = initAll;
+  window.reinitDataTable = function(table) {
+    table.__dtInited = false;
+    // remove old toolbar above it
+    var prev = table.previousSibling;
+    if (prev && prev.classList && prev.classList.contains('dt-toolbar')) {
+      prev.remove();
+    }
+    initOne(table);
+    table.__dtInited = true;
+  };
+})();
+</script>"""
 
 
 # ---------- PR#63: metadata fallback inference ----------
@@ -1434,30 +1681,39 @@ INDEX_HTML = """<!doctype html>
   <section>
     <h2>队列（待评测）</h2>
     <div id="queue-summary" class="muted">loading…</div>
-    <table id="queue-table"><thead><tr>
-      <th>run_id</th><th>hf_id</th>
+    <table id="queue-table" data-table data-table-name="queue"><thead><tr>
+      <th data-sort="text">run_id</th>
+      <th data-sort="text" data-filter="search" data-filter-label="模型">hf_id</th>
     </tr></thead><tbody></tbody></table>
   </section>
 
   <section>
     <h2>评测结果总览 <a href="/results" style="font-size:11px;font-weight:normal;margin-left:8px">查看完整结果表 →</a></h2>
     <div class="grid" id="results-grid"></div>
-    <table id="results-table"><thead><tr>
-      <th>hf_id</th><th>状态</th><th>modality</th><th>engine</th>
-      <th>能力得分</th><th>pass rate</th>
-      <th>TTFT</th><th>TPS</th>
-      <th>首印象</th><th>评价摘要</th><th>耗时</th>
+    <table id="results-table" data-table data-table-name="results"><thead><tr>
+      <th data-sort="text" data-filter="search" data-filter-label="模型">hf_id</th>
+      <th data-sort="text" data-filter="enum" data-filter-label="状态">状态</th>
+      <th data-sort="text" data-filter="enum" data-filter-label="模态">modality</th>
+      <th data-sort="text" data-filter="enum" data-filter-label="引擎">engine</th>
+      <th>能力得分</th>
+      <th data-sort="num">pass rate</th>
+      <th data-sort="num">TTFT</th>
+      <th data-sort="num">TPS</th>
+      <th>首印象</th><th>评价摘要</th>
+      <th data-sort="num">耗时</th>
     </tr></thead><tbody></tbody></table>
   </section>
 
   <section>
     <h2>9 阶段状态明细</h2>
-    <table id="runs-table"><thead><tr>
-      <th>run_id</th><th>hf_id</th><th>状态</th>
+    <table id="runs-table" data-table data-table-name="runs"><thead><tr>
+      <th>run_id</th>
+      <th data-sort="text" data-filter="search" data-filter-label="模型">hf_id</th>
+      <th data-sort="text" data-filter="enum" data-filter-label="状态">状态</th>
       <th>DISCOVER</th><th>CURATE</th><th>METADATA</th><th>ENGINE_SELECT</th>
       <th>STAGE_MODEL</th>
       <th>DEPLOY</th><th>READY_WAIT</th><th>CAPABILITY</th><th>SHOWCASE</th><th>CLEANUP</th>
-      <th>总时长</th>
+      <th data-sort="num">总时长</th>
     </tr></thead><tbody></tbody></table>
   </section>
 
@@ -1653,10 +1909,11 @@ async function refreshQueue() {
     `待评测 <strong>${q.pending_count}</strong> 个${etaLabel}`;
   const qbody = document.querySelector('#queue-table tbody');
   qbody.innerHTML = (q.pending||[]).map(p =>
-    `<tr><td><a href="/run/${encodeURIComponent(p.run_id||'')}"><code>${escHTML((p.run_id||'').substring(0,32))}…</code></a></td>`
-    + `<td>${hfLinkJS(p.hf_id, p.run_id, false)}</td></tr>`
+    `<tr><td data-value="${escHTML(p.run_id||'')}"><a href="/run/${encodeURIComponent(p.run_id||'')}"><code>${escHTML((p.run_id||'').substring(0,32))}…</code></a></td>`
+    + `<td data-value="${escHTML(p.hf_id||'')}">${hfLinkJS(p.hf_id, p.run_id, false)}</td></tr>`
   ).join('') ||
     '<tr><td colspan="2" class="muted">空 — 等待下次自动入队 / 或在 <a href="/candidates">候选模型</a> 页手动入队</td></tr>';
+  if (window.reinitDataTable) window.reinitDataTable(document.getElementById('queue-table'));
 }
 
 async function refreshResults() {
@@ -1683,21 +1940,29 @@ async function refreshResults() {
     const sm  = r.summary ? `<span class="muted" style="font-size:11px">${r.summary}…</span>` : (r.failure_reason ? `<span class="err" style="font-size:11px">✗ ${r.failure_reason}</span>` : '<span class="muted">-</span>');
     const ttft = (typeof r.ttft_ms_p50 === 'number') ? `${r.ttft_ms_p50.toFixed(0)}ms` : (r.perf_applicable === false ? '<span class="muted">N/A</span>' : '<span class="muted">-</span>');
     const tps  = (typeof r.tps_p50 === 'number') ? `${r.tps_p50.toFixed(1)} tok/s` : (r.perf_applicable === false ? '<span class="muted">N/A</span>' : '<span class="muted">-</span>');
+    // PR#64: data-value on each cell so the toolkit's sort/filter
+    // uses real numeric/enum values, not the formatted display string.
+    const pr_dv = (typeof r.pass_rate === 'number') ? r.pass_rate : -1;
+    const ttft_dv = (typeof r.ttft_ms_p50 === 'number') ? r.ttft_ms_p50 : -1;
+    const tps_dv = (typeof r.tps_p50 === 'number') ? r.tps_p50 : -1;
+    const dur_dv = (typeof r.duration_s === 'number') ? r.duration_s : -1;
+    const statusZh = {ok:'成功',failed:'失败',aborted:'已中止',in_progress:'进行中',queued:'排队中'}[r.status]||r.status||'-';
     return `<tr>
-      <td><strong>${hfLinkJS(r.hf_id, r.run_id, true)}</strong>
+      <td data-value="${escHTML(r.hf_id||'')}"><strong>${hfLinkJS(r.hf_id, r.run_id, true)}</strong>
         <div class="muted" style="font-size:11px">${publisherLinkJS(r.publisher)}</div></td>
-      <td>${pillStatus(r.status)}</td>
-      <td>${escHTML(r.modality)||'<span class="muted">-</span>'}</td>
-      <td>${escHTML(r.engine)||'<span class="muted">-</span>'}</td>
+      <td data-value="${escHTML(statusZh)}">${pillStatus(r.status)}</td>
+      <td data-value="${escHTML(r.modality||'-')}">${escHTML(r.modality)||'<span class="muted">-</span>'}</td>
+      <td data-value="${escHTML(r.engine||'-')}">${escHTML(r.engine)||'<span class="muted">-</span>'}</td>
       <td>${cap}</td>
-      <td>${pr}</td>
-      <td>${ttft}</td>
-      <td>${tps}</td>
+      <td data-value="${pr_dv}">${pr}</td>
+      <td data-value="${ttft_dv}">${ttft}</td>
+      <td data-value="${tps_dv}">${tps}</td>
       <td>${fi}</td>
       <td style="max-width:380px">${sm}</td>
-      <td>${formatDuration(r.duration_s)}</td>
+      <td data-value="${dur_dv}">${formatDuration(r.duration_s)}</td>
     </tr>`;
   }).join('') || '<tr><td colspan="11" class="muted">无评测结果</td></tr>';
+  if (window.reinitDataTable) window.reinitDataTable(document.getElementById('results-table'));
 }
 
 async function refreshRuns() {
@@ -1711,14 +1976,17 @@ async function refreshRuns() {
   const rbody = document.querySelector('#runs-table tbody');
   rbody.innerHTML = (runs||[]).slice(0, 30).map(r => {
     const stages = STAGES.map(s => pillStatus((r.stages||{})[s])).join('</td><td>');
+    const dur_dv = (typeof r.duration_s === 'number') ? r.duration_s : -1;
+    const statusZh = {ok:'成功',failed:'失败',aborted:'已中止',in_progress:'进行中',queued:'排队中'}[r.status]||r.status||'-';
     return `<tr class="stage-row">
       <td><a href="/run/${encodeURIComponent(r.run_id)}"><code>${escHTML(r.run_id.substring(0,28))}…</code></a></td>
-      <td>${hfLinkJS(r.hf_id, r.run_id, true)}</td>
-      <td>${pillStatus(r.status)}</td>
+      <td data-value="${escHTML(r.hf_id||'')}">${hfLinkJS(r.hf_id, r.run_id, true)}</td>
+      <td data-value="${escHTML(statusZh)}">${pillStatus(r.status)}</td>
       <td>${stages}</td>
-      <td>${formatDuration(r.duration_s)}</td>
+      <td data-value="${dur_dv}">${formatDuration(r.duration_s)}</td>
     </tr>`;
   }).join('') || '<tr><td colspan="14" class="muted">无 runs</td></tr>';
+  if (window.reinitDataTable) window.reinitDataTable(document.getElementById('runs-table'));
 }
 
 async function refreshDiscover() {
@@ -1855,17 +2123,27 @@ def render_candidates_page() -> str:
         hf_cell = hf_link(hf_raw if hf_raw != "-" else None,
                           run_id=run_id,
                           show_run_icon=False)  # run_id link is its own column already
+        # PR#64: data-value attrs for filter/sort. status_label is what
+        # the enum dropdown reads (Chinese), but we keep raw status in
+        # tooltip for grep debugging.
+        pr_dv = pr if isinstance(pr, (int, float)) else -1
+        dl_dv = dl if isinstance(dl, int) else -1
+        likes_dv = likes if isinstance(likes, int) else -1
+        # Sortable last_modified — full ISO if present, else empty
+        lm_raw = r.get("last_modified") or ""
         rows_html.append(
             f"<tr>"
-            f"<td><strong>{hf_cell}</strong>{fail_html}</td>"
-            f"<td><span class='pill {st_cls}' title='{html.escape(st)}'>{st_label}</span></td>"
+            f"<td data-value='{html.escape(hf_raw, quote=True)}'>"
+            f"<strong>{hf_cell}</strong>{fail_html}</td>"
+            f"<td data-value='{html.escape(st_label, quote=True)}'>"
+            f"<span class='pill pill-{st_cls}' title='{html.escape(st)}'>{st_label}</span></td>"
             f"<td>{params_html}</td>"
-            f"<td>{pipe}</td>"
-            f"<td>{reason}</td>"
-            f"<td>{lm}</td>"
-            f"<td style='text-align:right'>{dl_s}</td>"
-            f"<td style='text-align:right'>{likes_s}</td>"
-            f"<td class='{pr_cls}' style='text-align:right'>"
+            f"<td data-value='{html.escape(pipe, quote=True)}'>{pipe}</td>"
+            f"<td data-value='{html.escape(reason, quote=True)}'>{reason}</td>"
+            f"<td data-value='{html.escape(lm_raw, quote=True)}'>{lm}</td>"
+            f"<td style='text-align:right' data-value='{dl_dv}'>{dl_s}</td>"
+            f"<td style='text-align:right' data-value='{likes_dv}'>{likes_s}</td>"
+            f"<td class='{pr_cls}' style='text-align:right' data-value='{pr_dv}'>"
             f"<strong>{pr_pct}</strong></td>"
             f"<td>{run_link}</td>"
             f"<td>{action_html}</td>"
@@ -1890,63 +2168,54 @@ def render_candidates_page() -> str:
     )}
 
     return f"""<!doctype html>
-<html lang="zh"><head><meta charset="utf-8"><title>heyi-eval-v10 · 候选模型生命周期</title>
+<html lang="zh"><head><meta charset="utf-8"><title>heyi-eval · 候选模型生命周期</title>
+{_PANEL_STYLES}
 <style>
-body{{font-family:system-ui,-apple-system,sans-serif;background:#0c0c10;color:#e7e7ea;margin:0;padding:0}}
-header{{padding:16px 24px;background:#14141a;border-bottom:1px solid #26262e}}
-header h1{{margin:0;font-size:18px}} header .sub{{color:#8a8a96;font-size:12px;margin-top:4px}}
-main{{padding:18px 24px 60px;max-width:1700px;margin:0 auto}}
-.grid{{display:grid;grid-template-columns:repeat(7,1fr);gap:12px;margin-bottom:20px}}
-.stat{{padding:12px 16px;background:#14141a;border:1px solid #26262e;border-radius:6px}}
-.stat .label{{color:#8a8a96;font-size:11px;text-transform:uppercase;letter-spacing:0.05em}}
-.stat .value{{font-size:22px;margin-top:6px;font-weight:500}}
-section{{background:#14141a;border:1px solid #26262e;border-radius:8px;padding:14px 18px;margin-bottom:18px}}
-section h2{{margin:0 0 10px;font-size:14px}}
-table{{width:100%;border-collapse:collapse;font-size:13px}}
-th,td{{text-align:left;padding:8px 10px;border-bottom:1px solid #20202a;vertical-align:top}}
-th{{color:#8a8a96;font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:0.05em}}
-tr:hover td{{background:#1a1a22}}
-.ok{{color:#5ad48d}} .err{{color:#ef5f64}} .warn{{color:#e9b870}} .muted{{color:#6a6a76}} .run{{color:#6ec0ff}}
-.pill{{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;background:#20202a;color:#b8b8c4;white-space:nowrap}}
-.pill.ok{{background:#1a3a26;color:#5ad48d}}
-.pill.err{{background:#3a1a1f;color:#ef5f64}}
-.pill.warn{{background:#3a2a18;color:#e9b870}}
-.pill.run{{background:#1a2a3a;color:#6ec0ff}}
-.pill.muted{{background:#1a1a22;color:#6a6a76}}
-a{{color:#6ec0ff;text-decoration:none}} a:hover{{text-decoration:underline}}
+/* candidates-specific button overrides */
+.enqueue-btn{{padding:4px 10px;border-radius:4px;border:1px solid #2a4a6a;
+  background:#1a2a3a;color:#6ec0ff;font-size:11px;cursor:pointer;font-family:var(--sans)}}
+.enqueue-btn:hover{{background:#22344a}}
+.enqueue-btn.primary{{background:#1a3a26;color:#5ad48d;border-color:#2a5a3e;
+  font-size:13px;padding:8px 18px}}
+.enqueue-btn.primary:hover{{background:#225033}}
+.enqueue-btn[disabled]{{opacity:0.5;cursor:not-allowed}}
 </style></head><body>
-<header><a href="/">← 返回主面板</a> ·
-<h1 style="display:inline">🔭 候选模型生命周期</h1>
-<div class="sub">discover/candidates.jsonl × store/queue.jsonl × runs/* — 完整抓取→测试→结果链路</div></header>
+<header class='page-header'>
+  <div class='header-left'><a href='/' class='back-link'>← 返回主面板</a></div>
+  <h1 class='page-title'>候选模型生命周期</h1>
+  <div class='header-sub muted'>
+    discover/candidates.jsonl × store/queue.jsonl × runs/* — 完整抓取→测试→结果链路
+  </div>
+</header>
 <main>
-<section>
-  <h2>🛰️ Backfill 进度 {bf_badge}</h2>
-  <div class="grid" style="grid-template-columns:repeat(4,1fr)">
-    <div class="stat"><div class="label">backfill 完成</div>
-      <div class="value {'ok' if bf_complete else 'warn'}">{'是' if bf_complete else '否'}</div></div>
-    <div class="stat"><div class="label">cursor.seen 数</div>
-      <div class="value">{bf_seen:,}</div></div>
-    <div class="stat"><div class="label">high_water (已回填到)</div>
-      <div class="value" style="font-size:14px">{bf_water}</div></div>
-    <div class="stat"><div class="label">last_run_ts</div>
-      <div class="value" style="font-size:14px">{bf_last}</div></div>
+<section class='card-section'>
+  <h2>Backfill 进度 {bf_badge}</h2>
+  <div class='meta-pills'>
+    <span class='meta-pill'><label>backfill 完成</label>
+      <span class='val' style='color:var({"--accent-2" if bf_complete else "--warn"})'>{'是' if bf_complete else '否'}</span></span>
+    <span class='meta-pill'><label>cursor.seen 数</label><span class='val'>{bf_seen:,}</span></span>
+    <span class='meta-pill'><label>已回填到</label><span class='val'>{bf_water}</span></span>
+    <span class='meta-pill'><label>last_run_ts</label><span class='val'>{bf_last}</span></span>
   </div>
 </section>
-<div class="grid">
-  <div class="stat"><div class="label">候选总数</div><div class="value">{data['total']:,}</div></div>
-  <div class="stat"><div class="label">已发现</div><div class="value muted">{sc['discovered']:,}</div></div>
-  <div class="stat"><div class="label">排队中</div><div class="value run">{sc['queued']:,}</div></div>
-  <div class="stat"><div class="label">进行中</div><div class="value run">{sc['in_progress']:,}</div></div>
-  <div class="stat"><div class="label">成功</div><div class="value ok">{sc['ok']:,}</div></div>
-  <div class="stat"><div class="label">失败</div><div class="value err">{sc['failed']:,}</div></div>
-  <div class="stat"><div class="label">已中止</div><div class="value warn">{sc['aborted']:,}</div></div>
-</div>
-<section>
-  <h2>✋ 手动入队（按 hf_id 指定模型）</h2>
+<section class='card-section'>
+  <h2>候选总数 · 状态分布</h2>
+  <div class='meta-pills' style='grid-template-columns:repeat(auto-fit,minmax(120px,1fr))'>
+    <span class='meta-pill'><label>候选总数</label><span class='val'>{data['total']:,}</span></span>
+    <span class='meta-pill'><label>已发现</label><span class='val muted'>{sc['discovered']:,}</span></span>
+    <span class='meta-pill'><label>排队中</label><span class='val' style='color:var(--info)'>{sc['queued']:,}</span></span>
+    <span class='meta-pill'><label>进行中</label><span class='val' style='color:var(--info)'>{sc['in_progress']:,}</span></span>
+    <span class='meta-pill'><label>成功</label><span class='val' style='color:var(--accent-2)'>{sc['ok']:,}</span></span>
+    <span class='meta-pill'><label>失败</label><span class='val' style='color:var(--err)'>{sc['failed']:,}</span></span>
+    <span class='meta-pill'><label>已中止</label><span class='val' style='color:var(--warn)'>{sc['aborted']:,}</span></span>
+  </div>
+</section>
+<section class='card-section'>
+  <h2>手动入队（按 hf_id 指定模型）</h2>
   <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
     <input id="manual-hf" type="text" placeholder="org/model 例: deepseek-ai/DeepSeek-V3.2"
-           style="flex:1;min-width:320px;padding:8px 12px;background:#0c0c10;
-           border:1px solid #26262e;border-radius:4px;color:#e7e7ea;font-family:monospace"/>
+           style="flex:1;min-width:320px;padding:8px 12px;background:var(--bg);
+           border:1px solid var(--border-2);border-radius:6px;color:var(--text);font-family:var(--mono)"/>
     <button class="enqueue-btn primary" onclick="enqueueManual()">入队评测</button>
     <span id="manual-status" class="muted" style="font-size:12px"></span>
   </div>
@@ -1955,31 +2224,27 @@ a{{color:#6ec0ff;text-decoration:none}} a:hover{{text-decoration:underline}}
     orchestrator 自动去重，已在队列 / in_progress 的请求会被拒绝。
   </p>
 </section>
-<section><table>
+<section class='card-section'>
+<table data-table data-table-name='candidates'>
 <thead><tr>
-  <th>hf_id / 失败原因（中文）</th><th>状态</th><th>参数量</th><th>模态/类型</th><th>来源</th>
-  <th>HF 最后更新</th><th style="text-align:right">下载</th>
-  <th style="text-align:right">点赞</th><th style="text-align:right">通过率</th>
-  <th>run_id</th><th>操作</th>
+  <th data-sort='text' data-filter='search' data-filter-label='模型'>hf_id / 失败原因</th>
+  <th data-sort='text' data-filter='enum' data-filter-label='状态'>状态</th>
+  <th data-sort='text'>参数量</th>
+  <th data-sort='text' data-filter='enum' data-filter-label='模态/类型'>模态/类型</th>
+  <th data-sort='text' data-filter='enum' data-filter-label='来源'>来源</th>
+  <th data-sort='time' data-default-sort='desc'>HF 最后更新</th>
+  <th data-sort='num' style="text-align:right">下载</th>
+  <th data-sort='num' style="text-align:right">点赞</th>
+  <th data-sort='num' style="text-align:right">通过率</th>
+  <th>run_id</th>
+  <th>操作</th>
 </tr></thead><tbody>{table_body}</tbody>
 </table>
-<p class="muted" style="font-size:11px;margin:10px 0 0">显示最近 500 条；按 last_modified 倒序（最新模型在前）；来源 = discover 来源
-(whitelist / trending / curated / manual)；状态 = 已发现 → 排队中 → 进行中 → 成功 / 失败 / 中止。
+<p class="muted" style="font-size:11px;margin:10px 0 0">显示最近 500 条；默认按 HF 最后更新倒序（最新模型在前）；点列头切换排序方向。
+来源 = discover 来源 (whitelist / trending / curated / manual)；状态 = 已发现 → 排队中 → 进行中 → 成功 / 失败 / 中止。
 点击「立即评测 / 重测」立即入队；同一模型并发入队会被 orchestrator 去重。失败原因悬停可看英文原文。</p>
 </section>
-<style>
-.enqueue-btn{{
-  padding:4px 10px;border-radius:4px;border:1px solid #2a4a6a;
-  background:#1a2a3a;color:#6ec0ff;font-size:11px;cursor:pointer;
-}}
-.enqueue-btn:hover{{background:#22344a}}
-.enqueue-btn.primary{{
-  background:#1a3a26;color:#5ad48d;border-color:#2a5a3e;font-size:13px;
-  padding:8px 18px;
-}}
-.enqueue-btn.primary:hover{{background:#225033}}
-.enqueue-btn[disabled]{{opacity:0.5;cursor:not-allowed}}
-</style>
+{_TABLE_TOOLKIT_JS}
 <script>
 async function _postEnqueue(hfId) {{
   const r = await fetch('/api/enqueue', {{
@@ -2054,8 +2319,7 @@ async function enqueueManual() {{
     status.className = 'err';
   }}
 }}
-</script>
-</main></body></html>"""
+</script></main></body></html>"""
 
 
 def render_results_page() -> str:
@@ -2189,66 +2453,77 @@ def render_results_page() -> str:
             if r.get("publisher") else "<span class='muted'>-</span>"
         )
         hf_cell = hf_link(r.get("hf_id"), run_id=r.get("run_id"))
+        # PR#64: data-value attributes on cells so the sort/filter
+        # toolkit can use real numeric/timestamp values regardless of
+        # the human-readable text in the cell.
+        hf_dv = html.escape(r.get("hf_id") or "", quote=True)
+        pr_dv = pr if isinstance(pr, (int, float)) else -1
+        ttft_dv = ttft_p50 if isinstance(ttft_p50, (int, float)) else -1
+        tps_dv = tps_p50 if isinstance(tps_p50, (int, float)) else -1
+        dur_dv = dur if isinstance(dur, (int, float)) else -1
+        # Status sort key for ordering: ok > in_progress > failed
         rows_html.append(
-            f"<tr><td>{when_cell}</td>"
-            f"<td><strong>{hf_cell}</strong>"
+            f"<tr>"
+            f"<td data-value='{int(created or 0)}'>{when_cell}</td>"
+            f"<td data-value='{hf_dv}'><strong>{hf_cell}</strong>"
             f"<div class='muted' style='font-size:11px'>{pub_link}</div></td>"
-            f"<td><span class='pill {status_cls}' title='{html.escape(status)}'>{status_zh_label}</span></td>"
-            f"<td>{modality}</td><td>{params}</td><td>{license_}</td>"
-            f"<td>{engine}</td>"
+            f"<td data-value='{html.escape(status_zh_label, quote=True)}'>"
+            f"<span class='pill pill-{status_cls}' title='{html.escape(status)}'>{status_zh_label}</span></td>"
+            f"<td data-value='{html.escape(modality or '-', quote=True)}'>{modality or '<span class=muted>-</span>'}</td>"
+            f"<td>{params or '<span class=muted>-</span>'}</td>"
+            f"<td>{license_ or '<span class=muted>-</span>'}</td>"
+            f"<td data-value='{html.escape(engine or '-', quote=True)}'>{engine or '<span class=muted>-</span>'}</td>"
             f"<td><span class='pill'>{cap}</span><div style='margin-top:3px'>{cats_html}</div></td>"
-            f"<td class='{pr_cls}'><strong>{pr_pct}</strong></td>"
-            f"<td>{ttft_cell}</td><td>{tps_cell}</td>"
+            f"<td class='{pr_cls}' data-value='{pr_dv}'><strong>{pr_pct}</strong></td>"
+            f"<td data-value='{ttft_dv}'>{ttft_cell}</td>"
+            f"<td data-value='{tps_dv}'>{tps_cell}</td>"
             f"<td>{showcase_n} 条</td>"
             f"<td><span class='pill'>{fi}</span></td>"
-            f"<td style='max-width:380px;font-size:12px;color:#b8b8c4;overflow:hidden;text-overflow:ellipsis;max-height:120px'>{summary}{fail_html}</td>"
-            f"<td>{dur_s}</td></tr>"
+            f"<td style='max-width:380px;font-size:12px;color:var(--text-2);overflow:hidden;text-overflow:ellipsis;max-height:120px'>{summary}{fail_html}</td>"
+            f"<td data-value='{dur_dv}'>{dur_s}</td></tr>"
         )
 
     table_body = "".join(rows_html) or '<tr><td colspan="15" class="muted">无评测结果</td></tr>'
 
     return f"""<!doctype html>
-<html lang="zh"><head><meta charset="utf-8"><title>heyi-eval-v9 · 评测结果</title>
-<style>
-body{{font-family:system-ui,-apple-system,sans-serif;background:#0c0c10;color:#e7e7ea;margin:0;padding:0}}
-header{{padding:16px 24px;background:#14141a;border-bottom:1px solid #26262e}}
-header h1{{margin:0;font-size:18px}} header .sub{{color:#8a8a96;font-size:12px;margin-top:4px}}
-main{{padding:18px 24px 60px;max-width:1700px;margin:0 auto}}
-.grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}}
-.stat{{padding:12px 16px;background:#14141a;border:1px solid #26262e;border-radius:6px}}
-.stat .label{{color:#8a8a96;font-size:11px;text-transform:uppercase;letter-spacing:0.05em}}
-.stat .value{{font-size:26px;margin-top:6px;font-weight:500}}
-section{{background:#14141a;border:1px solid #26262e;border-radius:8px;padding:14px 18px}}
-table{{width:100%;border-collapse:collapse;font-size:13px}}
-th,td{{text-align:left;padding:8px 10px;border-bottom:1px solid #20202a;vertical-align:top}}
-th{{color:#8a8a96;font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:0.05em}}
-tr:hover td{{background:#1a1a22}}
-.ok{{color:#5ad48d}} .err{{color:#ef5f64}} .warn{{color:#e9b870}} .muted{{color:#6a6a76}}
-.pill{{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;background:#20202a;color:#b8b8c4;white-space:nowrap}}
-.pill.ok{{background:#1a3a26;color:#5ad48d}}
-.pill.err{{background:#3a1a1f;color:#ef5f64}}
-.pill.run{{background:#1a2a3a;color:#6ec0ff}}
-a{{color:#6ec0ff;text-decoration:none}} a:hover{{text-decoration:underline}}
-</style></head><body>
-<header><a href="/">← 返回主面板</a> ·
-<h1 style="display:inline">📊 评测结果总览</h1>
-<div class="sub">所有跑过的 runs（含失败 / 进行中）；点 hf_id 看完整 capability + showcase 详情</div></header>
+<html lang="zh"><head><meta charset="utf-8"><title>heyi-eval · 评测结果</title>
+{_PANEL_STYLES}
+</head><body>
+<header class='page-header'>
+  <div class='header-left'><a href='/' class='back-link'>← 返回主面板</a></div>
+  <h1 class='page-title'>评测结果总览</h1>
+  <div class='header-sub muted'>所有跑过的 runs（含失败 / 进行中）；点击模型名跳 HF Hub，点 📄 看本地详情</div>
+</header>
 <main>
-<div class="grid">
-  <div class="stat"><div class="label">总评测 runs</div><div class="value">{data['total']}</div></div>
-  <div class="stat"><div class="label">完成 OK</div><div class="value ok">{data['completed_ok']}</div></div>
-  <div class="stat"><div class="label">失败</div><div class="value err">{data['failed']}</div></div>
-  <div class="stat"><div class="label">进行中</div><div class="value warn">{data['in_progress']}</div></div>
+<div class="meta-pills" style='margin-bottom:18px'>
+  <span class='meta-pill'><label>总评测 runs</label><span class='val'>{data['total']}</span></span>
+  <span class='meta-pill'><label>完成 OK</label><span class='val' style='color:var(--accent-2)'>{data['completed_ok']}</span></span>
+  <span class='meta-pill'><label>失败</label><span class='val' style='color:var(--err)'>{data['failed']}</span></span>
+  <span class='meta-pill'><label>进行中</label><span class='val' style='color:var(--warn)'>{data['in_progress']}</span></span>
 </div>
-<section><table>
+<section class='card-section'>
+<table data-table data-table-name='results'>
 <thead><tr>
-  <th>时间</th><th>hf_id / publisher</th><th>状态</th><th>模态</th><th>参数量</th><th>许可证</th>
-  <th>引擎</th><th>能力得分 / 类目</th><th>通过率</th>
-  <th>TTFT (p50)</th><th>TPS (p50)</th><th>展示题数</th>
-  <th>首印象</th><th>评价摘要 / 失败原因</th><th>耗时</th>
+  <th data-sort='time' data-default-sort='desc'>时间</th>
+  <th data-sort='text' data-filter='search' data-filter-label='模型'>hf_id / 厂商</th>
+  <th data-sort='text' data-filter='enum' data-filter-label='状态'>状态</th>
+  <th data-sort='text' data-filter='enum' data-filter-label='模态'>模态</th>
+  <th data-sort='text'>参数量</th>
+  <th data-sort='text'>许可证</th>
+  <th data-sort='text' data-filter='enum' data-filter-label='引擎'>引擎</th>
+  <th>能力得分 / 类目</th>
+  <th data-sort='num'>通过率</th>
+  <th data-sort='num'>TTFT (p50)</th>
+  <th data-sort='num'>TPS (p50)</th>
+  <th>展示题数</th>
+  <th>首印象</th>
+  <th>评价摘要 / 失败原因</th>
+  <th data-sort='num'>耗时</th>
 </tr></thead><tbody>{table_body}</tbody>
 </table></section>
-</main></body></html>"""
+</main>
+{_TABLE_TOOLKIT_JS}
+</body></html>"""
 
 
 # ── PR#18: CAPABILITY (multimodal) + PERF_BENCH renderers ─────────────────
@@ -2745,7 +3020,9 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
         try:
             if path == "/" or path == "":
-                self._html(INDEX_HTML)
+                # PR#64: append data-table toolkit JS so the dashboard
+                # results / runs / queue tables get sort + filter UI too.
+                self._html(INDEX_HTML.replace("</body>", _TABLE_TOOLKIT_JS + "</body>"))
             elif path == "/api/health":
                 self._json(health_summary())
             elif path == "/api/runs":
