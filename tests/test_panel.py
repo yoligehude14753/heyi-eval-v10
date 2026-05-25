@@ -908,3 +908,270 @@ def _post_enqueue(srv, payload: dict) -> tuple[dict, int]:
     handler._handle_enqueue = lambda: srv.Handler._handle_enqueue(handler)  # type: ignore[attr-defined]
     srv.Handler.do_POST(handler)
     return captured.get("body", {}), captured.get("status", -1)
+
+
+# ── PR#57 / PR#58 / PR#59: i18n + sort + params + first_impression ─────
+
+
+def test_pr57_failure_zh_translates_disk_headroom():
+    import importlib
+    srv = importlib.import_module("panel.server")
+    out = srv.failure_zh(
+        "disk headroom too low: free=14059986944 bytes, need≥19200000000 bytes"
+    )
+    assert "磁盘" in out
+    assert "GB" in out
+    assert "14.0GB" in out or "13.1GB" in out
+    assert "17.9GB" in out or "19" in out
+
+
+def test_pr57_failure_zh_translates_container_exit():
+    import importlib
+    srv = importlib.import_module("panel.server")
+    out = srv.failure_zh("container exited 1: model load failed")
+    assert "容器退出码 1" in out
+    assert "model load failed" in out
+
+
+def test_pr57_failure_zh_translates_ready_timeout():
+    import importlib
+    srv = importlib.import_module("panel.server")
+    out = srv.failure_zh("READY_WAIT timeout after 600s — /v1/models 5xx")
+    assert "就绪等待超时" in out
+    assert "600" in out
+
+
+def test_pr57_failure_zh_unknown_passes_through_with_marker():
+    import importlib
+    srv = importlib.import_module("panel.server")
+    out = srv.failure_zh("some never-seen failure mode 123")
+    assert "原文" in out
+    assert "never-seen" in out
+
+
+def test_pr57_failure_zh_empty_returns_empty():
+    import importlib
+    srv = importlib.import_module("panel.server")
+    assert srv.failure_zh(None) == ""
+    assert srv.failure_zh("") == ""
+    assert srv.failure_zh("   ") == ""
+
+
+def test_pr57_stage_and_status_zh_known_values():
+    import importlib
+    srv = importlib.import_module("panel.server")
+    assert srv.stage_zh("DEPLOY") == "部署"
+    assert srv.stage_zh("READY_WAIT") == "就绪等待"
+    assert srv.stage_zh("CAPABILITY") == "能力评测"
+    assert srv.status_zh("ok") == "成功"
+    assert srv.status_zh("aborted") == "已中止"
+    assert srv.status_zh("queued") == "排队中"
+
+
+def test_pr57_stage_zh_passthrough_unknown():
+    import importlib
+    srv = importlib.import_module("panel.server")
+    assert srv.stage_zh("WEIRD_STAGE") == "WEIRD_STAGE"
+    assert srv.status_zh("weird") == "weird"
+
+
+def test_pr58_results_leaderboard_sorts_by_created_at_desc(tmp_path, monkeypatch):
+    """Newest run must come first regardless of status (PR#58)."""
+    import importlib
+    srv = importlib.import_module("panel.server")
+    monkeypatch.setattr(srv, "DATA_ROOT", tmp_path)
+    runs = tmp_path / "runs"
+    runs.mkdir()
+
+    def make_run(name: str, hf: str, status: str, created: float) -> None:
+        d = runs / name
+        d.mkdir()
+        (d / "_meta").mkdir()
+        (d / "state.json").write_text(json.dumps({
+            "run_id": name, "hf_id": hf, "status": status,
+            "created_at": created, "ended_at": created + 60,
+            "stages": {},
+        }))
+
+    # ok run from yesterday, failed run from 10 seconds ago, ok run
+    # from one hour ago. Time-DESC order should be: 10s-ago, 1h-ago,
+    # yesterday — regardless of status.
+    import time as _t
+    now = _t.time()
+    make_run("r-old-ok", "org/a", "ok", now - 86400)
+    make_run("r-mid-ok", "org/b", "ok", now - 3600)
+    make_run("r-new-fail", "org/c", "failed", now - 10)
+
+    out = srv.results_leaderboard()
+    order = [r["hf_id"] for r in out["rows"]]
+    assert order == ["org/c", "org/b", "org/a"], order
+    # Each row carries created_at + status_zh + failure_reason_zh.
+    for r in out["rows"]:
+        assert r.get("created_at") is not None
+        assert r.get("status_zh")
+
+
+def test_pr58_render_results_page_shows_time_column_and_zh_status(
+    tmp_path, monkeypatch,
+):
+    import importlib
+    srv = importlib.import_module("panel.server")
+    monkeypatch.setattr(srv, "DATA_ROOT", tmp_path)
+    (tmp_path / "runs").mkdir()
+    (tmp_path / "runs" / "r-x").mkdir()
+    (tmp_path / "runs" / "r-x" / "_meta").mkdir()
+    (tmp_path / "runs" / "r-x" / "state.json").write_text(json.dumps({
+        "run_id": "r-x", "hf_id": "org/x", "status": "ok",
+        "created_at": 1779000000, "ended_at": 1779000060,
+        "stages": {},
+    }))
+    html_str = srv.render_results_page()
+    assert "时间" in html_str
+    assert "参数量" in html_str
+    assert "成功" in html_str  # status_zh
+
+
+def test_pr58_candidates_lifecycle_carries_params_and_zh(
+    tmp_path, monkeypatch,
+):
+    """Candidates row from a completed run must carry params + status_zh
+    + failure_reason_zh for the panel to render the new columns."""
+    import importlib
+    srv = importlib.import_module("panel.server")
+    monkeypatch.setattr(srv, "DATA_ROOT", tmp_path)
+
+    runs = tmp_path / "runs"
+    (runs / "r-a").mkdir(parents=True)
+    (runs / "r-a" / "_meta").mkdir()
+    (runs / "r-a" / "state.json").write_text(json.dumps({
+        "run_id": "r-a", "hf_id": "org/a", "status": "failed",
+        "created_at": 1779000000, "ended_at": 1779000060,
+        "failure_reason": "container exited 1: bad model",
+        "stages": {},
+    }))
+    (runs / "r-a" / "_meta" / "metadata.json").write_text(json.dumps({
+        "param_count": "7B", "modality": "text-generation",
+    }))
+
+    cand = tmp_path / "discover"
+    cand.mkdir()
+    (cand / "candidates.jsonl").write_text(
+        json.dumps({
+            "hf_id": "org/a", "reason": "whitelist",
+            "pipeline_tag": "text-generation",
+            "discovered_at": "2026-05-20T00:00:00Z",
+            "last_modified": "2026-05-20T00:00:00Z",
+            "downloads": 100, "likes": 5,
+        }) + "\n",
+    )
+    (tmp_path / "store").mkdir()
+
+    out = srv.candidates_lifecycle(limit=10)
+    org_a = next(r for r in out["rows"] if r["hf_id"] == "org/a")
+    assert org_a["params"] == "7B"
+    assert org_a["status_zh"] == "失败"
+    assert "容器退出码 1" in org_a["failure_reason_zh"]
+    assert org_a["modality"] == "text-generation"
+
+
+def test_pr56_enqueue_policy_whitelist_bypasses_low_signal_gate():
+    """PR#56: whitelist/both/manual candidates must NOT be rejected for
+    being below the dl/likes threshold — we already trust the vendor."""
+    import importlib
+    import argparse
+    m = importlib.import_module("discover.main")
+    # A whitelist candidate with rock-bottom signal: should still pass.
+    class _Cand:
+        hf_id = "Qwen/Qwen-NewExperimental"
+        private = False
+        gated = False
+        pipeline_tag = "text-generation"
+        library_name = None
+        reason = "whitelist"
+        downloads = 5      # well below default 200
+        likes = 0          # well below default 5
+        last_modified = "2026-05-20T00:00:00Z"
+        discovered_at = "2026-05-20T00:01:00Z"
+    args = argparse.Namespace(min_downloads=200, min_likes=5)
+    allow, reason = m._enqueue_policy_passes(_Cand(), args)
+    assert allow, reason
+    assert "白名单" in reason or "ok" in reason
+
+    # Plain trending candidate with the same low signal: rejected.
+    class _CandTrend(_Cand):
+        reason = "trending"
+    allow, reason = m._enqueue_policy_passes(_CandTrend(), args)
+    assert not allow
+    assert "信号过低" in reason
+
+
+def test_pr56_enqueue_policy_still_rejects_private_gated():
+    import importlib
+    import argparse
+    m = importlib.import_module("discover.main")
+    class _C:
+        hf_id = "x/y"
+        private = True
+        gated = False
+        pipeline_tag = "text-generation"
+        library_name = None
+        reason = "whitelist"
+        downloads = 9999
+        likes = 999
+        last_modified = None
+        discovered_at = None
+    args = argparse.Namespace(min_downloads=200, min_likes=5)
+    allow, reason = m._enqueue_policy_passes(_C(), args)
+    assert not allow
+    assert "私有" in reason or "受限" in reason
+
+
+def test_pr59_showcase_grade_strips_think_blocks_and_uses_zh_prompt(monkeypatch):
+    """PR#59: the grade summary must (a) use the Chinese prompt template
+    and (b) strip <think>...</think> CoT from the LLM reply BEFORE
+    returning the summary."""
+    import importlib
+    sr = importlib.import_module("cc_agent.showcase_runner")
+
+    assert "中文" in sr._GRADE_PROMPT_TEMPLATE
+    assert "首印象" in sr._FIRST_IMPRESSION_PROMPT_TEMPLATE
+
+    class _Reply:
+        def __init__(self, text):
+            self.text = text
+
+    class _FakeClient:
+        def call(self, messages, max_tokens):
+            return _Reply(
+                "<think>We need to summarize. The model did fine on code.</think>\n"
+                "模型在代码题上表现稳定，中文流畅度一般，多模态未覆盖。"
+            )
+
+    items = [{"id": "x", "rationale": "r", "prompt": "p",
+              "actual": "a", "comment": ""}]
+    out = sr._grade_summary(_FakeClient(), items, timeout_s=10.0)
+    assert "<think>" not in out
+    assert "We need to summarize" not in out
+    assert "中文流畅度" in out
+
+
+def test_pr59_first_impression_chinese_short_and_no_think(monkeypatch):
+    import importlib
+    sr = importlib.import_module("cc_agent.showcase_runner")
+
+    class _Reply:
+        def __init__(self, text):
+            self.text = text
+
+    class _FakeClient:
+        def call(self, messages, max_tokens):
+            return _Reply("<think>plan...</think>\n代码题尚可，中文偶有走样")
+
+    items = [{"id": "x", "rationale": "r", "prompt": "p",
+              "actual": "a", "comment": ""}]
+    out = sr._first_impression(_FakeClient(), items, timeout_s=10.0)
+    assert out is not None
+    assert "<think>" not in out
+    assert "plan" not in out
+    assert "代码" in out
+    assert len(out) <= 40

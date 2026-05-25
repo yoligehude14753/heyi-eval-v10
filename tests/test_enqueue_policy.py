@@ -53,9 +53,10 @@ class PolicyTests(unittest.TestCase):
         self.assertTrue(allow, reason)
 
     def test_private_rejected(self):
+        # PR#57: reason text is localized to Chinese.
         allow, reason = _enqueue_policy_passes(_cand("X/Y", private=True), _args())
         self.assertFalse(allow)
-        self.assertIn("private", reason)
+        self.assertTrue("私有" in reason or "受限" in reason, reason)
 
     def test_gated_rejected(self):
         allow, _reason = _enqueue_policy_passes(_cand("X/Y", gated=True), _args())
@@ -65,7 +66,9 @@ class PolicyTests(unittest.TestCase):
         c = _cand("X/Y", pipeline_tag="text-to-image")
         allow, reason = _enqueue_policy_passes(c, _args())
         self.assertFalse(allow)
+        # PR#57: Chinese rendering keeps the raw pipeline tag inline.
         self.assertIn("text-to-image", reason)
+        self.assertTrue("不支持" in reason or "pipeline_tag" in reason, reason)
 
     def test_asr_supported(self):
         c = _cand("X/Y", pipeline_tag="automatic-speech-recognition")
@@ -78,14 +81,24 @@ class PolicyTests(unittest.TestCase):
         self.assertTrue(allow)
 
     def test_low_signal_rejected(self):
-        c = _cand("X/Y", downloads=10, likes=2)
+        # PR#56: whitelist candidates bypass the dl/likes gate (we trust
+        # the vendor). Use ``reason="trending"`` so the threshold applies.
+        c = _cand("X/Y", downloads=10, likes=2, reason="trending")
         allow, reason = _enqueue_policy_passes(c, _args())
         self.assertFalse(allow)
-        self.assertIn("low signal", reason)
+        # PR#57: reason text is localized to Chinese.
+        self.assertIn("信号过低", reason)
+
+    def test_pr56_whitelist_bypasses_low_signal(self):
+        """A whitelisted vendor's fresh release with zero downloads must
+        STILL be admitted — PR#56 trust-the-vendor policy."""
+        c = _cand("Qwen/Brand-New", downloads=0, likes=0, reason="whitelist")
+        allow, reason = _enqueue_policy_passes(c, _args())
+        self.assertTrue(allow, reason)
 
     def test_high_likes_alone_passes(self):
         """Downloads low but likes high — OR logic should admit."""
-        c = _cand("X/Y", downloads=10, likes=200)
+        c = _cand("X/Y", downloads=10, likes=200, reason="trending")
         allow, _ = _enqueue_policy_passes(c, _args())
         self.assertTrue(allow)
 
@@ -237,15 +250,21 @@ class DedupTests(unittest.TestCase):
 class CmdEnqueueIntegrationTests(unittest.TestCase):
 
     def test_full_flow_filters_and_enqueues(self):
-        """Three candidates: one good, one private, one low-signal.
-        Should enqueue only the first."""
+        """Three candidates: one good (whitelist+high signal), one
+        private (always rejected), one low-signal trending (rejected by
+        PR#56 threshold). Should enqueue only the first.
+
+        PR#56: the original ``bad/lowsig`` fixture had reason="whitelist"
+        which now bypasses the dl/likes gate (trust-the-vendor). Force
+        reason="trending" so the threshold still applies."""
         with tempfile.TemporaryDirectory() as td:
             data_root = Path(td)
             cands_path = data_root / "discover" / "candidates.jsonl"
             append_candidates(cands_path, [
                 _cand("good/model", downloads=200_000, likes=100),
                 _cand("bad/private", private=True, downloads=200_000),
-                _cand("bad/lowsig", downloads=10, likes=2),
+                _cand("bad/lowsig", downloads=10, likes=2,
+                      reason="trending"),
             ])
             args = _args(limit=10)
             with mock.patch("discover.main._default_data_root",

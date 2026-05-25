@@ -279,17 +279,30 @@ _REJECTED_LIBRARIES = {
 }
 
 
+_TRUSTED_REASONS = {"whitelist", "both", "manual"}
+
+
 def _enqueue_policy_passes(c, args) -> tuple[bool, str]:
-    """Return (allow, reason) for a candidate. reason is human-readable."""
+    """Return (allow, reason_zh) for a candidate. reason_zh is the
+    human-readable Chinese reason shown in the enqueue audit log.
+
+    PR#56: whitelist/both/manual candidates bypass the low-signal
+    threshold. The old behavior was rejecting fresh vendor checkpoints
+    (e.g. Qwen's research SAE-Res-* repos right after release, when
+    downloads are still in the dozens) — exactly the models we WANT
+    to evaluate first. We already curated the vendor list explicitly,
+    so trust their releases regardless of HF velocity counters.
+    """
     if c.private or c.gated:
-        return False, "private/gated"
+        return False, "私有/受限仓库"
     if c.pipeline_tag and c.pipeline_tag not in _SUPPORTED_PIPELINE_TAGS:
-        return False, f"pipeline_tag={c.pipeline_tag}"
+        return False, f"暂不支持的 pipeline_tag={c.pipeline_tag}"
     if c.library_name and c.library_name in _REJECTED_LIBRARIES:
-        return False, f"library_name={c.library_name}"
-    # need at least *some* recency signal
+        return False, f"不可运行的 library_name={c.library_name}"
+    if c.reason in _TRUSTED_REASONS:
+        return True, "ok（白名单/手动，跳过 dl/likes 阈值）"
     if (c.downloads or 0) < args.min_downloads and (c.likes or 0) < args.min_likes:
-        return False, f"low signal (dl={c.downloads} likes={c.likes})"
+        return False, f"信号过低（dl={c.downloads} likes={c.likes}）"
     return True, "ok"
 
 
@@ -315,7 +328,15 @@ def cmd_enqueue(args: argparse.Namespace) -> int:
         print("[discover.enqueue] no candidates yet — run `once` first")
         return 1
 
-    cands = sorted(cands, key=lambda c: c.discovered_at, reverse=True)
+    # PR#56: sort newest-first by last_modified (model freshness) with
+    # discovered_at as the tiebreaker. The previous purely-discovered_at
+    # ordering meant the daily curated batch all sorted by ~same second,
+    # so the model age signal was lost.
+    cands = sorted(
+        cands,
+        key=lambda c: (c.last_modified or "", c.discovered_at or ""),
+        reverse=True,
+    )
     store = Store(data_root)
 
     enqueued = 0
@@ -324,6 +345,12 @@ def cmd_enqueue(args: argparse.Namespace) -> int:
     chosen_examined = 0
     rejection_reasons: dict[str, int] = {}
 
+    # PR#56: bucket the bulk "信号过低" rejections into a single key so
+    # the systemd journal isn't 50KB per round; preserve per-pipeline_tag
+    # and per-library rejection breakdowns since those are diagnostic.
+    def _bucket_reason(r: str) -> str:
+        return "信号过低" if r.startswith("信号过低") else r
+
     for c in cands:
         if enqueued >= args.limit:
             break
@@ -331,23 +358,29 @@ def cmd_enqueue(args: argparse.Namespace) -> int:
         allow, reason = _enqueue_policy_passes(c, args)
         if not allow:
             rejected += 1
-            rejection_reasons[reason] = rejection_reasons.get(reason, 0) + 1
+            key = _bucket_reason(reason)
+            rejection_reasons[key] = rejection_reasons.get(key, 0) + 1
             continue
         try:
             run_id = enqueue_one(store, c.hf_id, skip_if_recent=True)
             if run_id is None:
                 skipped_recent += 1
-                print(f"  skip {c.hf_id} (already evaluated recently)")
+                print(f"  跳过 {c.hf_id}（最近已评测过）")
                 continue
-            print(f"  enqueued {c.hf_id} → {run_id}  ({c.pipeline_tag}, dl={c.downloads})")
+            print(f"  已入队 {c.hf_id} → {run_id} "
+                  f"(reason={c.reason} pipe={c.pipeline_tag} "
+                  f"dl={c.downloads} mod={c.last_modified})")
             enqueued += 1
         except Exception as e:
-            print(f"  FAILED {c.hf_id}: {type(e).__name__}: {e}", file=sys.stderr)
+            print(f"  失败 {c.hf_id}: {type(e).__name__}: {e}", file=sys.stderr)
 
-    print(f"[discover.enqueue] examined={chosen_examined} enqueued={enqueued} "
-          f"skipped_recent={skipped_recent} rejected={rejected}")
+    print(f"[discover.enqueue] 检查={chosen_examined} 入队={enqueued} "
+          f"近期已评测跳过={skipped_recent} 拒绝={rejected}")
     if rejection_reasons:
-        print(f"[discover.enqueue] rejections by reason: {rejection_reasons}")
+        top = sorted(rejection_reasons.items(), key=lambda kv: -kv[1])[:8]
+        print("[discover.enqueue] 拒绝原因 Top:")
+        for k, v in top:
+            print(f"    {v:>5}  {k}")
     return 0
 
 
@@ -429,9 +462,14 @@ def main(argv: list[str] | None = None) -> int:
                           help="auto-enqueue newest N candidates into orchestrator queue")
     p_enq.add_argument("--limit", type=int, default=5,
                        help="max number of new runs to enqueue this call")
-    p_enq.add_argument("--min-downloads", type=int, default=1000,
+    # PR#56: relaxed thresholds — whitelist candidates bypass these
+    # anyway; the threshold only kicks in for trending candidates that
+    # aren't in any vendor whitelist, where 200 downloads OR 5 likes
+    # filters out the bulk of low-effort uploads without rejecting
+    # legitimate new releases.
+    p_enq.add_argument("--min-downloads", type=int, default=200,
                        help="OR condition vs min-likes — at least one must pass")
-    p_enq.add_argument("--min-likes", type=int, default=20)
+    p_enq.add_argument("--min-likes", type=int, default=5)
     p_enq.set_defaults(func=cmd_enqueue)
 
     args = p.parse_args(argv)

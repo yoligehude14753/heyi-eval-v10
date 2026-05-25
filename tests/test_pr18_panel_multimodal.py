@@ -265,8 +265,10 @@ def test_r4_run_detail_no_perf_bench_renders_dash(tmp_path, monkeypatch):
     import panel.server as srv
     importlib.reload(srv)
     out = srv.render_run_detail("r-noperf")
-    # The perf section is present, but its body is the "无" placeholder
-    assert "perf_bench" in out
+    # PR#57: the perf section heading is now localized to Chinese
+    # ("性能基准"), but its body is still the "无" placeholder when
+    # perf_bench.json is missing.
+    assert "性能基准" in out
     assert "无" in out
 
 

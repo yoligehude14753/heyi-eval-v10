@@ -52,6 +52,131 @@ def _is_valid_hf_id(s: str) -> bool:
     return bool(_HF_ID_RE.match(s))
 
 
+# ---------- PR#57: Chinese localization helpers ----------
+#
+# The orchestrator emits English error strings (e.g. "container exited 1"
+# or "disk headroom too low: free=..."). The user explicitly asked for
+# the panel to render those reasons in Chinese, so we keep the source
+# of truth in English (greppable, machine-friendly, lossless in the
+# raw JSON artifacts) and translate at render-time. Patterns are
+# matched in order; anything unrecognized falls through to the raw
+# English text with a small "原文" prefix so debuggability is preserved.
+
+_STAGE_ZH = {
+    "DISCOVER":     "发现",
+    "CURATE":       "整理",
+    "METADATA":     "元数据",
+    "ENGINE_SELECT": "引擎选择",
+    "STAGE_MODEL":  "模型暂存",
+    "DEPLOY":       "部署",
+    "READY_WAIT":   "就绪等待",
+    "CAPABILITY":   "能力评测",
+    "PERF_BENCH":   "性能基准",
+    "SHOWCASE":     "展示评测",
+    "CLEANUP":      "清理",
+}
+
+_STATUS_ZH = {
+    "ok":          "成功",
+    "failed":      "失败",
+    "aborted":     "已中止",
+    "in_progress": "进行中",
+    "queued":      "排队中",
+    "skipped":     "跳过",
+    "no-state":    "无状态",
+}
+
+
+def stage_zh(name: str) -> str:
+    return _STAGE_ZH.get(name, name)
+
+
+def status_zh(s: str) -> str:
+    return _STATUS_ZH.get(s, s or "-")
+
+
+# Failure reason patterns: (regex, lambda match -> Chinese rendering).
+# Order matters — most-specific first. Lambdas receive the re.Match.
+def _fmt_bytes(s: str) -> str:
+    try:
+        n = int(s)
+    except (TypeError, ValueError):
+        return s
+    if n >= 1 << 30:
+        return f"{n / (1 << 30):.1f}GB"
+    if n >= 1 << 20:
+        return f"{n / (1 << 20):.1f}MB"
+    return f"{n}B"
+
+
+_FAILURE_RULES: list[tuple[re.Pattern[str], "callable"]] = [  # type: ignore[name-defined]
+    # "aborted at <STAGE>: <reason>" — the orchestrator wraps every
+    # downstream skip/error this way. Recurse into the wrapped reason
+    # so each layer prints in Chinese ("DEPLOY 阶段中止：磁盘空间不足…").
+    (re.compile(r"^aborted at (\w+):\s*(.+)$", re.S),
+     lambda m: f"{_STAGE_ZH.get(m.group(1), m.group(1))} 阶段中止：{failure_zh(m.group(2).strip())}"),
+    (re.compile(r"^not_a_model:\s*(.*)$"),
+     lambda m: f"不是可评测的语言模型仓库（{m.group(1).strip()[:120]}）"),
+    (re.compile(r"^disk headroom too low.*free=(\d+).*need.?≥(\d+).*"),
+     lambda m: f"磁盘空间不足：可用 {_fmt_bytes(m.group(1))}，需要至少 {_fmt_bytes(m.group(2))}"),
+    (re.compile(r"^container exited (\d+)(?::|$)\s*(.*)", re.I),
+     lambda m: f"容器退出码 {m.group(1)}" + (f"：{m.group(2).strip()}" if m.group(2).strip() else "")),
+    (re.compile(r"^READY_WAIT timeout after (\d+)s.*", re.I),
+     lambda m: f"就绪等待超时（{m.group(1)} 秒内 /v1/models 未通过）"),
+    (re.compile(r"^connection refused.*", re.I),
+     lambda m: "连接被拒绝（服务未监听或防火墙拦截）"),
+    (re.compile(r"^image not found.*", re.I),
+     lambda m: "Docker 镜像不存在或拉取失败"),
+    (re.compile(r"^OOM|out of memory.*", re.I),
+     lambda m: "显存/内存不足（OOM）"),
+    (re.compile(r"^download failed.*"),
+     lambda m: "权重下载失败（HF 网络/镜像问题）"),
+    (re.compile(r".*safetensors.*not.found.*", re.I),
+     lambda m: "未找到 safetensors 权重文件"),
+    (re.compile(r"^bad_args.*"),
+     lambda m: "参数错误（编排器内部）"),
+    (re.compile(r"^missing_artifact.*"),
+     lambda m: "缺少上游 stage 产物"),
+    (re.compile(r"^engine \w+ not supported.*", re.I),
+     lambda m: "所选推理引擎不支持该模型架构"),
+    (re.compile(r"^staged size .* exceeds.*", re.I),
+     lambda m: "模型权重过大，超出本机磁盘配额"),
+    (re.compile(r"^license blocked.*", re.I),
+     lambda m: "许可证受限，已拒绝评测"),
+    (re.compile(r"^HF repo lacks any.*", re.I),
+     lambda m: "HF 仓库缺少有效权重文件（既无 safetensors 也无 GGUF）"),
+    (re.compile(r"^skipped:\s*(.*)$"),
+     lambda m: f"跳过：{failure_zh(m.group(1).strip()) or m.group(1).strip()}"),
+    (re.compile(r".*snapshot_download failed.*No space left on device.*", re.I | re.S),
+     lambda m: "权重下载失败：磁盘空间不足（OS Errno 28）"),
+    (re.compile(r".*snapshot_download failed.*", re.I | re.S),
+     lambda m: "权重下载失败（HF snapshot_download 抛错）"),
+    (re.compile(r"^Read timed out.*|.*ReadTimeoutError.*", re.I),
+     lambda m: "HF 镜像读取超时（网络/限流问题）"),
+    (re.compile(r".*connection reset.*", re.I),
+     lambda m: "网络连接被重置（中途断流）"),
+]
+
+
+def failure_zh(text: str | None) -> str:
+    """Render an orchestrator failure_reason in Chinese.
+
+    Unrecognized strings are passed through with a "原文" prefix so we
+    don't silently swallow novel failure modes — they'll show up in the
+    UI as e.g. "原文: foo bar baz" until a rule is added above.
+    """
+    if not text:
+        return ""
+    s = text.strip()
+    if not s:
+        return ""
+    for rx, fmt in _FAILURE_RULES:
+        m = rx.match(s)
+        if m:
+            return fmt(m)
+    return f"原文：{s}"
+
+
 # ---------- data readers (read-only over HEYI_EVAL_DATA) ----------
 
 def _read_json(path: Path) -> dict | None:
@@ -128,6 +253,14 @@ def list_runs() -> list[dict]:
         curated = _read_json(run_dir / "_meta" / "curated.json") or {}
 
         summary_text = show.get("summary") or ""
+        # PR#57: showcase summary often contains the raw <think>...</think>
+        # block from MiniMax-M2.7 / Qwen3-thinking reasoning models. Strip
+        # it so the preview shows the actual answer instead of CoT.
+        try:
+            from orchestrator.llm_text_utils import strip_think_blocks
+            summary_text = strip_think_blocks(summary_text)
+        except Exception:
+            pass
         publisher = curated.get("publisher") or meta.get("publisher") or {}
         if isinstance(publisher, dict):
             publisher_name = publisher.get("name")
@@ -163,13 +296,17 @@ def list_runs() -> list[dict]:
             if isinstance(tps_obj, dict):
                 tps_p50 = tps_obj.get("p50")
 
+        raw_fr = state.get("failure_reason")
         summaries.append({
             "run_id": state.get("run_id") or run_dir.name,
             "hf_id": state.get("hf_id"),
             "status": state.get("status", "?"),
+            "status_zh": status_zh(state.get("status", "?")),
             "stages": stage_status,
             "stage_durations": stage_dur,
-            "failure_reason": state.get("failure_reason"),
+            "failure_reason": raw_fr,
+            "failure_reason_zh": failure_zh(raw_fr),
+            "created_at": started,
             "started_at": started,
             "ended_at": ended,
             "duration_s": (ended - started) if (started and ended) else None,
@@ -205,6 +342,7 @@ def results_leaderboard() -> dict:
             "run_id": r["run_id"],
             "hf_id": r["hf_id"],
             "status": r["status"],
+            "status_zh": r.get("status_zh") or status_zh(r["status"]),
             "publisher": r.get("publisher"),
             "modality": r.get("modality"),
             "params": r.get("params_b"),
@@ -220,9 +358,22 @@ def results_leaderboard() -> dict:
             "first_impression": r.get("first_impression"),
             "summary": r.get("summary_preview"),
             "duration_s": r.get("duration_s"),
+            "created_at": r.get("created_at"),
             "ended_at": r.get("ended_at"),
             "failure_reason": r.get("failure_reason"),
+            "failure_reason_zh": r.get("failure_reason_zh") or failure_zh(r.get("failure_reason")),
         })
+    # PR#58: time-DESC ordering — newest run on top. The user explicitly
+    # asked for chronological ordering with the freshest evaluations
+    # surfaced first; previously the leaderboard relied on an implicit
+    # status-priority sort that buried fresh results below historical
+    # successes. Tiebreak on ended_at for runs that share created_at.
+    rows.sort(
+        key=lambda r: (
+            -(r.get("created_at") or 0),
+            -(r.get("ended_at") or 0),
+        ),
+    )
     completed = sum(1 for r in rows if r["status"] == "ok")
     failed = sum(1 for r in rows if r["status"] == "failed")
     in_progress = sum(1 for r in rows if r["status"] == "in_progress")
@@ -259,10 +410,57 @@ def run_detail(run_id: str) -> dict | None:
 
 def queue_status() -> dict:
     pending = _read_jsonl(DATA_ROOT / "store" / "queue.jsonl")
+    # PR#56: surface the auto-enqueue cadence so the panel can show
+    # "下次入队 in 7m" beside "pending: 0" — the user reported the
+    # panel showing 0 and assuming the system had stopped monitoring,
+    # when in fact the orchestrator had just drained the batch and
+    # was waiting for the next 15-min tick.
+    next_enqueue = _next_enqueue_eta()
     return {
         "pending_count": len(pending),
         "pending": pending[:50],
+        "next_enqueue_eta_s": next_enqueue.get("eta_s"),
+        "next_enqueue_iso": next_enqueue.get("iso"),
+        "enqueue_interval_s": next_enqueue.get("interval_s"),
     }
+
+
+def _next_enqueue_eta() -> dict:
+    """Best-effort: ask systemd when the enqueue timer fires next.
+
+    Returns an empty dict if systemctl isn't accessible (e.g. dev box)
+    so the renderer can fall back to a static label. Cheap — single
+    subprocess call, ~30ms; cached implicitly by being called per
+    /api/queue request.
+    """
+    try:
+        out = subprocess.check_output(
+            ["systemctl", "list-timers",
+             "heyi-eval-enqueue.timer",
+             "--no-pager", "--output=json"],
+            timeout=2,
+            stderr=subprocess.DEVNULL,
+        ).decode("utf-8")
+        rows = json.loads(out)
+        if not rows:
+            return {}
+        row = rows[0]
+        # systemctl --output=json reports usec since epoch
+        next_us = row.get("next") or 0
+        last_us = row.get("last") or 0
+        if not next_us:
+            return {}
+        import time as _t
+        eta_s = max(0, int(next_us / 1_000_000 - _t.time()))
+        interval_s = (
+            int((next_us - last_us) / 1_000_000) if last_us else None
+        )
+        iso = datetime.fromtimestamp(
+            next_us / 1_000_000, tz=UTC,
+        ).isoformat(timespec="seconds")
+        return {"eta_s": eta_s, "iso": iso, "interval_s": interval_s}
+    except Exception:
+        return {}
 
 
 def discover_summary(top_n: int = 20) -> dict:
@@ -378,6 +576,20 @@ def candidates_lifecycle(limit: int = 500) -> dict:
             if (cur is None or (state.get("created_at") or 0) >
                     (cur.get("_created_raw") or 0)):
                 cap = _read_json(run_dir / "capability.json") or {}
+                # PR#58: surface param_count + modality from the metadata
+                # artifact so the /candidates page can show the size of
+                # each model the user explicitly asked for ("必要的参数还
+                # 是得有，比如模型参数量大小啥的").
+                meta_art = _read_json(run_dir / "_meta" / "metadata.json") or {}
+                cur_art = _read_json(run_dir / "_meta" / "curated.json") or {}
+                params_b = (
+                    meta_art.get("param_count")
+                    or cur_art.get("param_count")
+                )
+                modality = (
+                    meta_art.get("modality")
+                    or (meta_art.get("modalities") or [None])[0]
+                )
                 by_hf[hf_id] = {
                     "run_id": state.get("run_id") or run_dir.name,
                     "status": state.get("status") or "?",
@@ -387,6 +599,8 @@ def candidates_lifecycle(limit: int = 500) -> dict:
                     "failure_reason": state.get("failure_reason"),
                     "pass_rate": cap.get("pass_rate"),
                     "score": cap.get("score"),
+                    "params": params_b,
+                    "modality": modality,
                 }
 
     # 2) Queue: small (max 1000s), keep in full.
@@ -457,9 +671,11 @@ def candidates_lifecycle(limit: int = 500) -> dict:
                     status = "queued"
                 else:
                     status = "discovered"
+                raw_fr = (run or {}).get("failure_reason")
                 row = {
                     "hf_id": hf_id,
                     "status": status,
+                    "status_zh": status_zh(status),
                     "discovered_at": c.get("discovered_at"),
                     "reason": c.get("reason"),
                     "pipeline_tag": c.get("pipeline_tag"),
@@ -469,8 +685,12 @@ def candidates_lifecycle(limit: int = 500) -> dict:
                     "run_id": (run or {}).get("run_id"),
                     "pass_rate": (run or {}).get("pass_rate"),
                     "score": (run or {}).get("score"),
-                    "failure_reason": (run or {}).get("failure_reason"),
+                    "failure_reason": raw_fr,
+                    "failure_reason_zh": failure_zh(raw_fr),
                     "ended_at": (run or {}).get("ended_at"),
+                    "params": (run or {}).get("params"),
+                    "modality": (run or {}).get("modality")
+                                or c.get("pipeline_tag"),
                 }
                 if status == "discovered":
                     _push_discovered(row)
@@ -486,6 +706,7 @@ def candidates_lifecycle(limit: int = 500) -> dict:
         non_discovered_rows.append({
             "hf_id": hf_id,
             "status": run["status"],
+            "status_zh": status_zh(run["status"]),
             "discovered_at": None,
             "reason": "manual",
             "pipeline_tag": None,
@@ -496,7 +717,10 @@ def candidates_lifecycle(limit: int = 500) -> dict:
             "pass_rate": run.get("pass_rate"),
             "score": run.get("score"),
             "failure_reason": run.get("failure_reason"),
+            "failure_reason_zh": failure_zh(run.get("failure_reason")),
             "ended_at": run.get("ended_at"),
+            "params": run.get("params"),
+            "modality": run.get("modality"),
         })
         seen_cand[hf_id] = ""
     for hf_id, q in queued_by_id.items():
@@ -505,6 +729,7 @@ def candidates_lifecycle(limit: int = 500) -> dict:
         non_discovered_rows.append({
             "hf_id": hf_id,
             "status": "queued",
+            "status_zh": status_zh("queued"),
             "discovered_at": None,
             "reason": "manual",
             "pipeline_tag": None,
@@ -515,7 +740,10 @@ def candidates_lifecycle(limit: int = 500) -> dict:
             "pass_rate": None,
             "score": None,
             "failure_reason": None,
+            "failure_reason_zh": "",
             "ended_at": None,
+            "params": None,
+            "modality": None,
         })
         seen_cand[hf_id] = ""
 
@@ -943,10 +1171,23 @@ async function refreshQueue() {
     document.getElementById('queue-summary').innerHTML = '<span class="err">加载失败</span>';
     return;
   }
-  document.getElementById('queue-summary').innerHTML = `pending: <strong>${q.pending_count}</strong>`;
+  // PR#56: show pending count *and* "下次自动入队" ETA. The user
+  // assumed pending:0 meant "monitoring stopped" — it actually means
+  // the orchestrator drained the last batch and we're waiting for the
+  // 15-min auto-enqueue tick. Surfacing the ETA makes the cadence
+  // visible so the panel matches user intuition.
+  let etaLabel = '';
+  if (typeof q.next_enqueue_eta_s === 'number') {
+    const m = Math.floor(q.next_enqueue_eta_s / 60);
+    const s = q.next_enqueue_eta_s % 60;
+    const cadence = q.enqueue_interval_s ? ` · 周期 ${Math.round(q.enqueue_interval_s/60)} min` : '';
+    etaLabel = ` · 下次自动入队 ${m}m ${s}s${cadence}`;
+  }
+  document.getElementById('queue-summary').innerHTML =
+    `待评测 <strong>${q.pending_count}</strong> 个${etaLabel}`;
   const qbody = document.querySelector('#queue-table tbody');
   qbody.innerHTML = (q.pending||[]).map(p => `<tr><td><code>${p.run_id||'-'}</code></td><td>${p.hf_id||'-'}</td></tr>`).join('') ||
-    '<tr><td colspan="2" class="muted">空</td></tr>';
+    '<tr><td colspan="2" class="muted">空 — 等待下次自动入队 / 或在 <a href="/candidates">候选模型</a> 页手动入队</td></tr>';
 }
 
 async function refreshResults() {
@@ -1080,13 +1321,19 @@ def render_candidates_page() -> str:
         hf_attr = html.escape(hf_raw, quote=True)
         st = r.get("status") or "?"
         st_cls = _status_color(st)
-        pipe = html.escape(r.get("pipeline_tag") or "-")
+        st_label = html.escape(r.get("status_zh") or status_zh(st))
+        pipe = html.escape(r.get("pipeline_tag") or r.get("modality") or "-")
         reason = html.escape(r.get("reason") or "-")
         lm = html.escape((r.get("last_modified") or "-")[:10])
         dl = r.get("downloads")
         dl_s = f"{dl:,}" if isinstance(dl, int) else "-"
         likes = r.get("likes")
         likes_s = f"{likes:,}" if isinstance(likes, int) else "-"
+        params_v = r.get("params") or "-"
+        params_html = (
+            f"<span class='pill'>{html.escape(str(params_v))}</span>"
+            if params_v != "-" else "<span class='muted'>-</span>"
+        )
         pr = r.get("pass_rate")
         if isinstance(pr, (int, float)):
             pr_pct = f"{pr * 100:.0f}%"
@@ -1101,14 +1348,20 @@ def render_candidates_page() -> str:
             )
         else:
             run_link = "<span class='muted'>-</span>"
-        fail = r.get("failure_reason") or ""
-        if len(fail) > 120:
-            fail = fail[:120] + "…"
+        # PR#57: render failure reason in Chinese. Keep the English raw
+        # text in the tooltip for grepability.
+        fail_raw = r.get("failure_reason") or ""
+        fail_zh_text = r.get("failure_reason_zh") or failure_zh(fail_raw)
+        if len(fail_zh_text) > 120:
+            fail_zh_disp = fail_zh_text[:120] + "…"
+        else:
+            fail_zh_disp = fail_zh_text
         fail_html = (
-            f"<div class='muted' style='font-size:11px;max-width:280px;"
-            f"overflow:hidden;text-overflow:ellipsis'>"
-            f"{html.escape(fail)}</div>"
-            if fail else ""
+            f"<div class='err' style='font-size:11px;max-width:280px;"
+            f"overflow:hidden;text-overflow:ellipsis' "
+            f"title='{html.escape(fail_raw, quote=True)}'>"
+            f"{html.escape(fail_zh_disp)}</div>"
+            if fail_raw else ""
         )
 
         # PR#55: action column. Hide the "立即评测" button for rows that
@@ -1132,7 +1385,8 @@ def render_candidates_page() -> str:
         rows_html.append(
             f"<tr>"
             f"<td><strong>{hf}</strong>{fail_html}</td>"
-            f"<td><span class='pill {st_cls}'>{html.escape(st)}</span></td>"
+            f"<td><span class='pill {st_cls}' title='{html.escape(st)}'>{st_label}</span></td>"
+            f"<td>{params_html}</td>"
             f"<td>{pipe}</td>"
             f"<td>{reason}</td>"
             f"<td>{lm}</td>"
@@ -1146,7 +1400,7 @@ def render_candidates_page() -> str:
         )
 
     table_body = "".join(rows_html) or (
-        "<tr><td colspan='10' class='muted'>暂无候选 — 等 discover daemon 抓第一轮</td></tr>"
+        "<tr><td colspan='11' class='muted'>暂无候选 — 等 discover daemon 抓第一轮</td></tr>"
     )
 
     bf_complete = backfill.get("complete")
@@ -1207,12 +1461,12 @@ a{{color:#6ec0ff;text-decoration:none}} a:hover{{text-decoration:underline}}
 </section>
 <div class="grid">
   <div class="stat"><div class="label">候选总数</div><div class="value">{data['total']:,}</div></div>
-  <div class="stat"><div class="label">discovered</div><div class="value muted">{sc['discovered']:,}</div></div>
-  <div class="stat"><div class="label">queued</div><div class="value run">{sc['queued']:,}</div></div>
-  <div class="stat"><div class="label">in_progress</div><div class="value run">{sc['in_progress']:,}</div></div>
-  <div class="stat"><div class="label">ok</div><div class="value ok">{sc['ok']:,}</div></div>
-  <div class="stat"><div class="label">failed</div><div class="value err">{sc['failed']:,}</div></div>
-  <div class="stat"><div class="label">aborted</div><div class="value warn">{sc['aborted']:,}</div></div>
+  <div class="stat"><div class="label">已发现</div><div class="value muted">{sc['discovered']:,}</div></div>
+  <div class="stat"><div class="label">排队中</div><div class="value run">{sc['queued']:,}</div></div>
+  <div class="stat"><div class="label">进行中</div><div class="value run">{sc['in_progress']:,}</div></div>
+  <div class="stat"><div class="label">成功</div><div class="value ok">{sc['ok']:,}</div></div>
+  <div class="stat"><div class="label">失败</div><div class="value err">{sc['failed']:,}</div></div>
+  <div class="stat"><div class="label">已中止</div><div class="value warn">{sc['aborted']:,}</div></div>
 </div>
 <section>
   <h2>✋ 手动入队（按 hf_id 指定模型）</h2>
@@ -1230,15 +1484,15 @@ a{{color:#6ec0ff;text-decoration:none}} a:hover{{text-decoration:underline}}
 </section>
 <section><table>
 <thead><tr>
-  <th>hf_id / 失败原因</th><th>状态</th><th>pipeline_tag</th><th>reason</th>
-  <th>last_modified</th><th style="text-align:right">downloads</th>
-  <th style="text-align:right">likes</th><th style="text-align:right">pass</th>
+  <th>hf_id / 失败原因（中文）</th><th>状态</th><th>参数量</th><th>模态/类型</th><th>来源</th>
+  <th>HF 最后更新</th><th style="text-align:right">下载</th>
+  <th style="text-align:right">点赞</th><th style="text-align:right">通过率</th>
   <th>run_id</th><th>操作</th>
 </tr></thead><tbody>{table_body}</tbody>
 </table>
-<p class="muted" style="font-size:11px;margin:10px 0 0">显示最近 500 条；按 last_modified 倒序（最新模型在前）；reason = discover 来源
-(whitelist / trending / curated / manual)；status = discovered → queued → in_progress → ok/failed/aborted。
-点击「立即评测 / 重测」立即入队；同一模型并发入队会被 orchestrator 去重。</p>
+<p class="muted" style="font-size:11px;margin:10px 0 0">显示最近 500 条；按 last_modified 倒序（最新模型在前）；来源 = discover 来源
+(whitelist / trending / curated / manual)；状态 = 已发现 → 排队中 → 进行中 → 成功 / 失败 / 中止。
+点击「立即评测 / 重测」立即入队；同一模型并发入队会被 orchestrator 去重。失败原因悬停可看英文原文。</p>
 </section>
 <style>
 .enqueue-btn{{
@@ -1344,27 +1598,16 @@ def render_results_page() -> str:
     """
     data = results_leaderboard()
 
-    def _row_priority(r: dict) -> tuple:
-        """Lowest tuple sorts first.
-        (0, _) = ok with real capability data (preferred top)
-        (1, _) = ok without capability data
-        (2, _) = in_progress
-        (3, _) = failed
-        (4, _) = aborted (typically oversize gate / skipped)"""
-        st = r.get("status") or ""
-        has_cap = isinstance(r.get("pass_rate"), (int, float))
-        if st == "ok" and has_cap:
-            # within OK-with-cap, higher pass_rate first
-            return (0, -(r.get("pass_rate") or 0))
-        if st == "ok":
-            return (1, 0)
-        if st == "in_progress":
-            return (2, 0)
-        if st == "failed":
-            return (3, 0)
-        return (4, 0)
-
-    sorted_rows = sorted(data["rows"], key=_row_priority)
+    # PR#58: pure time-DESC ordering. The user explicitly asked
+    # "测试结果时间排序，最新的放前面" — newest run on top, regardless of
+    # status. results_leaderboard() already sorts this way, but keep
+    # the explicit sort here so future readers see the contract; also
+    # ensures the page is correct even if upstream ordering changes.
+    sorted_rows = sorted(
+        data["rows"],
+        key=lambda r: (-(r.get("created_at") or 0),
+                       -(r.get("ended_at") or 0)),
+    )
 
     rows_html = []
     for r in sorted_rows:
@@ -1393,14 +1636,16 @@ def render_results_page() -> str:
         else:
             dur_s = "-"
         fail_raw = r.get("failure_reason") or ""
-        # PR#32 follow-up: enormous vLLM tracebacks (4 KB+ with ANSI
-        # escape sequences) used to be dumped raw into the cell — one
-        # bad row hid every other row below the fold. Truncate display
-        # to 200 chars; full text available via title= tooltip.
-        if len(fail_raw) > 200:
-            fail_short = fail_raw[:200] + "…"
+        # PR#57: render the failure reason in Chinese (failure_zh()
+        # handles known patterns; unknown text passed through with
+        # "原文：" prefix). Keep the raw English in the tooltip for
+        # debuggability — grepping logs by exact English string is
+        # still the fastest way to find a regression.
+        fail_zh_text = r.get("failure_reason_zh") or failure_zh(fail_raw)
+        if len(fail_zh_text) > 200:
+            fail_short = fail_zh_text[:200] + "…"
         else:
-            fail_short = fail_raw
+            fail_short = fail_zh_text
         fail = html.escape(fail_short)
         if fail_raw:
             fail_html = (
@@ -1438,10 +1683,37 @@ def render_results_page() -> str:
             ) if cats else "<span class='muted'>-</span>"
         )
 
+        # PR#58: time column — show "刚刚" / "Nm 前" / "Nh 前" / ISO so
+        # the user can immediately tell which result is freshest.
+        created = r.get("created_at") or 0
+        if created:
+            try:
+                import time as _t
+                age_s = _t.time() - float(created)
+                if age_s < 60:
+                    when = "刚刚"
+                elif age_s < 3600:
+                    when = f"{int(age_s / 60)} 分钟前"
+                elif age_s < 86400:
+                    when = f"{int(age_s / 3600)} 小时前"
+                else:
+                    when = f"{int(age_s / 86400)} 天前"
+                when_iso = datetime.fromtimestamp(float(created), tz=UTC).strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                when, when_iso = "-", ""
+        else:
+            when, when_iso = "-", ""
+        when_cell = (
+            f"<div>{html.escape(when)}</div>"
+            f"<div class='muted' style='font-size:10px'>{html.escape(when_iso)}</div>"
+        )
+
+        status_zh_label = html.escape(r.get("status_zh") or status_zh(status))
         rows_html.append(
-            f"<tr><td><a href='/run/{html.escape(r.get('run_id', ''))}'><strong>{hf}</strong></a>"
+            f"<tr><td>{when_cell}</td>"
+            f"<td><a href='/run/{html.escape(r.get('run_id', ''))}'><strong>{hf}</strong></a>"
             f"<div class='muted' style='font-size:11px'>{pub}</div></td>"
-            f"<td><span class='pill {status_cls}'>{html.escape(status)}</span></td>"
+            f"<td><span class='pill {status_cls}' title='{html.escape(status)}'>{status_zh_label}</span></td>"
             f"<td>{modality}</td><td>{params}</td><td>{license_}</td>"
             f"<td>{engine}</td>"
             f"<td><span class='pill'>{cap}</span><div style='margin-top:3px'>{cats_html}</div></td>"
@@ -1453,7 +1725,7 @@ def render_results_page() -> str:
             f"<td>{dur_s}</td></tr>"
         )
 
-    table_body = "".join(rows_html) or '<tr><td colspan="14" class="muted">无评测结果</td></tr>'
+    table_body = "".join(rows_html) or '<tr><td colspan="15" class="muted">无评测结果</td></tr>'
 
     return f"""<!doctype html>
 <html lang="zh"><head><meta charset="utf-8"><title>heyi-eval-v9 · 评测结果</title>
@@ -1490,9 +1762,9 @@ a{{color:#6ec0ff;text-decoration:none}} a:hover{{text-decoration:underline}}
 </div>
 <section><table>
 <thead><tr>
-  <th>hf_id / publisher</th><th>状态</th><th>modality</th><th>params</th><th>license</th>
-  <th>engine</th><th>能力得分 / categories</th><th>pass rate</th>
-  <th>TTFT (p50)</th><th>TPS (p50)</th><th>showcase</th>
+  <th>时间</th><th>hf_id / publisher</th><th>状态</th><th>模态</th><th>参数量</th><th>许可证</th>
+  <th>引擎</th><th>能力得分 / 类目</th><th>通过率</th>
+  <th>TTFT (p50)</th><th>TPS (p50)</th><th>展示题数</th>
   <th>首印象</th><th>评价摘要 / 失败原因</th><th>耗时</th>
 </tr></thead><tbody>{table_body}</tbody>
 </table></section>
@@ -1655,6 +1927,9 @@ def render_run_detail(run_id: str) -> str:
     cap_html = _render_capability_html(cap)
     perf_html = _render_perf_bench_html(detail.get("perf_bench") or {})
 
+    # PR#57: render the showcase summary with the <think> block stripped
+    # (artifact may have been written before PR#59 landed) and with
+    # first_impression rendered as a Chinese pill above the long body.
     show_html = ""
     if show.get("items"):
         cards = []
@@ -1662,19 +1937,88 @@ def render_run_detail(run_id: str) -> str:
             cards.append(
                 "<div style='border:1px solid #26262e;padding:12px;border-radius:6px;margin-bottom:10px'>"
                 f"<div class='muted' style='font-size:11px'>{html.escape(it.get('id',''))} · {it.get('tokens_out')}t out · {it.get('latency_ms')}ms</div>"
-                f"<div style='margin:4px 0;color:#b8b8c4;font-size:12px'><strong>rationale</strong>: {html.escape(it.get('rationale',''))}</div>"
-                f"<details><summary>prompt</summary><pre>{html.escape(it.get('prompt',''))}</pre></details>"
-                f"<details open><summary>actual</summary><pre>{html.escape(it.get('actual',''))}</pre></details>"
-                f"<div style='margin-top:4px;color:#e9b870;font-size:12px'><strong>comment</strong>: {html.escape(it.get('comment',''))}</div>"
+                f"<div style='margin:4px 0;color:#b8b8c4;font-size:12px'><strong>题目意图</strong>：{html.escape(it.get('rationale',''))}</div>"
+                f"<details><summary>题目原文</summary><pre>{html.escape(it.get('prompt',''))}</pre></details>"
+                f"<details open><summary>模型作答</summary><pre>{html.escape(it.get('actual',''))}</pre></details>"
+                f"<div style='margin-top:4px;color:#e9b870;font-size:12px'><strong>系统注释</strong>：{html.escape(it.get('comment',''))}</div>"
                 "</div>"
             )
         first = html.escape(show.get("model_first_impression") or "")
-        summary = html.escape(show.get("summary") or "")
+        summary_raw = show.get("summary") or ""
+        try:
+            from orchestrator.llm_text_utils import strip_think_blocks
+            summary_raw = strip_think_blocks(summary_raw)
+        except Exception:
+            pass
+        summary = html.escape(summary_raw)
+        first_html = (
+            f"<p><strong>首印象</strong>：<span class='pill'>{first}</span></p>"
+            if first else
+            "<p><strong>首印象</strong>：<span class='muted'>未生成</span></p>"
+        )
         show_html = (
-            f"<p><strong>first_impression</strong>: <span class='pill'>{first}</span></p>"
-            f"<p style='line-height:1.6'>{summary}</p>"
+            first_html
+            + f"<p style='line-height:1.7;white-space:pre-wrap'>{summary}</p>"
             + "".join(cards)
         )
+
+    # PR#57: stages table at the top — gives the user a one-glance view
+    # of which stage failed/skipped, in Chinese, with the localized
+    # failure reason highlighted. Addresses "我看为什么都是空的" by
+    # making it obvious WHY the downstream sections (READY/CAPABILITY/
+    # SHOWCASE) have no data: the run aborted earlier.
+    stages_rows = []
+    for st_name, st_info in (state.get("stages") or {}).items():
+        st = (st_info or {}).get("status", "?")
+        cls = {"ok": "ok", "failed": "err", "aborted": "err",
+               "skipped": "muted", "in_progress": "warn"}.get(st, "muted")
+        dur = (st_info or {}).get("duration_s")
+        dur_s = f"{dur:.1f}s" if isinstance(dur, (int, float)) else "-"
+        err = (st_info or {}).get("error") or ""
+        err_zh = failure_zh(err) if err else ""
+        stages_rows.append(
+            f"<tr><td><strong>{stage_zh(st_name)}</strong>"
+            f"<div class='muted' style='font-size:10px'>{st_name}</div></td>"
+            f"<td><span class='pill {cls}'>{status_zh(st)}</span></td>"
+            f"<td>{dur_s}</td>"
+            f"<td style='font-size:12px;color:#b8b8c4'>{html.escape(err_zh)}</td></tr>"
+        )
+    stages_table = (
+        "<table><thead><tr><th>阶段</th><th>状态</th><th>耗时</th><th>失败原因（中文）</th></tr></thead>"
+        f"<tbody>{''.join(stages_rows) or '<tr><td colspan=4 class=muted>无</td></tr>'}</tbody></table>"
+    )
+
+    # Top-level failure summary if the run aborted/failed
+    overall_status = state.get("status") or "?"
+    overall_status_zh = status_zh(overall_status)
+    overall_fr_raw = state.get("failure_reason") or ""
+    overall_fr_zh = failure_zh(overall_fr_raw) if overall_fr_raw else ""
+    overall_banner_cls = {
+        "ok": "ok", "failed": "err", "aborted": "err",
+        "in_progress": "warn",
+    }.get(overall_status, "muted")
+    overall_banner = (
+        f"<p>整体状态：<span class='pill {overall_banner_cls}'>{overall_status_zh}</span>"
+        + (f"　·　失败原因：<span class='err'>{html.escape(overall_fr_zh)}</span>"
+           if overall_fr_zh else "")
+        + "</p>"
+    )
+
+    # Key metadata pills — params / modality / publisher
+    params_pill = meta.get("param_count") or cur.get("param_count") or "-"
+    modality_pill = meta.get("modality") or "-"
+    publisher_dict = cur.get("publisher") or meta.get("publisher") or {}
+    publisher_pill = (
+        publisher_dict.get("name") if isinstance(publisher_dict, dict)
+        else (publisher_dict or "-")
+    )
+    license_pill = meta.get("license") or cur.get("license") or "-"
+    metadata_pills = (
+        f"<span class='pill'>参数量：{html.escape(str(params_pill))}</span> "
+        f"<span class='pill'>模态：{html.escape(str(modality_pill))}</span> "
+        f"<span class='pill'>厂商：{html.escape(str(publisher_pill or '-'))}</span> "
+        f"<span class='pill'>许可证：{html.escape(str(license_pill))}</span>"
+    )
 
     return f"""<!doctype html>
 <html lang="zh"><head><meta charset="utf-8"><title>{html.escape(run_id)}</title>
@@ -1695,14 +2039,19 @@ a{{color:#6ec0ff;text-decoration:none}} a:hover{{text-decoration:underline}}
 <header><a href="/">← 返回</a> · <strong>{html.escape(run_id)}</strong>
 <div class='muted' style='font-size:12px'>hf_id: {html.escape(state.get('hf_id') or '?')}</div>
 </header><main>
-<section><h2>state</h2><pre>{esc(state)}</pre></section>
-<section><h2>engine</h2><pre>{esc(eng)}</pre></section>
-<section><h2>metadata（HF + curator 合并）</h2><pre>{esc(meta)}</pre></section>
-<section><h2>curated（LLM 解读）</h2><pre>{esc(cur)}</pre></section>
-<section><h2>ready</h2><pre>{esc(ready)}</pre></section>
-<section><h2>capability（多模态分轨）</h2>{cap_html or '<div class="muted">无</div>'}</section>
-<section><h2>perf_bench（TTFT / TPS / 并发 / VRAM）</h2>{perf_html or '<div class="muted">无</div>'}</section>
-<section><h2>showcase（claude 自主设计的 8 题）</h2>{show_html or '<div class="muted">无</div>'}</section>
+<section><h2>概览</h2>
+{overall_banner}
+<div style='margin:8px 0'>{metadata_pills}</div>
+</section>
+<section><h2>阶段执行（按发生顺序）</h2>{stages_table}</section>
+<section><h2>能力评测（多模态分轨）</h2>{cap_html or '<div class="muted">无（运行未走到此阶段）</div>'}</section>
+<section><h2>性能基准（TTFT / TPS / 并发 / VRAM）</h2>{perf_html or '<div class="muted">无（运行未走到此阶段）</div>'}</section>
+<section><h2>展示评测（LLM 自主设计的题目 + 中文摘要）</h2>{show_html or '<div class="muted">无（运行未走到此阶段）</div>'}</section>
+<section><h2>原始 state.json</h2><pre>{esc(state)}</pre></section>
+<section><h2>原始 engine.json</h2><pre>{esc(eng)}</pre></section>
+<section><h2>原始 metadata.json（HF + curator 合并）</h2><pre>{esc(meta)}</pre></section>
+<section><h2>原始 curated.json（LLM 解读）</h2><pre>{esc(cur)}</pre></section>
+<section><h2>原始 ready.json</h2><pre>{esc(ready)}</pre></section>
 </main></body></html>"""
 
 

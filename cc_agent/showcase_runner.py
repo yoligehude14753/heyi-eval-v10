@@ -94,14 +94,29 @@ Do not include any preamble. Begin your response with "[" immediately.
 
 
 _GRADE_PROMPT_TEMPLATE = """\
-You graded a language model on a custom showcase suite. Read the
-results below and produce a short summary (3-6 sentences) describing
-what the model did well and where it struggled. Do not invent results.
+你刚刚在自定义 showcase 题集上评估了一个语言模型。请阅读下方的题目和模型作答，
+用 3-6 句中文写一段简短评价，覆盖：
+  1) 模型表现得好的方面；
+  2) 模型表现得弱或出错的方面；
+  3) 一个可观察到的小结论（例如：擅长代码生成但中文流畅度一般）。
 
-Showcase items and the model's responses:
+不要编造模型没有输出的内容。不要返回 JSON，不要使用 markdown 标题或编号，
+直接输出一段连贯的中文文字即可。
+
+题目与模型作答：
 {rendered_items}
+"""
 
-Output the summary as plain text — no JSON, no markdown headers.
+# PR#59: short, single-line "first impression" (gut-feel) call. Returned
+# as Chinese to match the panel's locale. Bounded to a single sentence
+# so it can render as a pill in the UI.
+_FIRST_IMPRESSION_PROMPT_TEMPLATE = """\
+基于下面的模型作答，给出一句不超过 25 个汉字的中文「首印象」结论。
+要求：直接给出结论，不要解释，不要前缀，不要标点结尾外的多余符号。
+示例：「代码题尚可，中文偶有走样」「数学推理稳，多模态未覆盖」
+
+模型作答样本：
+{rendered_items}
 """
 
 
@@ -413,9 +428,15 @@ def _grade_summary(
     *,
     timeout_s: float,
 ) -> str:
-    """Ask heyi_engine for a free-text summary. Returns a fallback
-    string on engine error so the caller does not have to special-case
-    grading; per S6 this still produces a valid showcase.json."""
+    """Ask heyi_engine for a Chinese free-text summary. Returns a
+    fallback string on engine error so the caller does not have to
+    special-case grading; per S6 this still produces a valid showcase.json.
+
+    PR#59: strip <think>...</think> blocks from the LLM reply BEFORE
+    returning. The previous code returned r.text verbatim, which on
+    MiniMax-M2.7 / Qwen3-thinking models meant the panel summary cell
+    showed the raw reasoning chain instead of the actual summary.
+    """
     _ = timeout_s
     prompt = _GRADE_PROMPT_TEMPLATE.format(rendered_items=_render_items_for_grading(items))
     try:
@@ -426,17 +447,61 @@ def _grade_summary(
     except HeyiEngineError as e:
         log.warning("grading skipped: %s", e)
         return _fallback_summary(items, reason=f"grading failed: {e}")
-    text = (r.text or "").strip()
+    raw = (r.text or "").strip()
+    # Strip CoT blocks here as well as in the renderer; defense in depth
+    # so the on-disk artifact is also clean.
+    try:
+        from orchestrator.llm_text_utils import strip_think_blocks
+        text = strip_think_blocks(raw).strip()
+    except Exception:
+        text = _strip_think(raw)
     if not text:
         return _fallback_summary(items, reason="grading returned empty")
     return text
 
 
+def _first_impression(
+    grade_client: HeyiEngineClient,
+    items: list[dict[str, Any]],
+    *,
+    timeout_s: float,
+) -> str | None:
+    """PR#59: short Chinese "首印象" gut-feel summary, ~25 chars.
+
+    Best-effort: returns None on engine error so the run still completes.
+    The panel renders this as a pill above the long summary; it's the
+    "TL;DR" the user wanted instead of a blank cell.
+    """
+    _ = timeout_s
+    prompt = _FIRST_IMPRESSION_PROMPT_TEMPLATE.format(
+        rendered_items=_render_items_for_grading(items),
+    )
+    try:
+        r = grade_client.call(
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=64,
+        )
+    except HeyiEngineError as e:
+        log.warning("first_impression skipped: %s", e)
+        return None
+    raw = (r.text or "").strip()
+    try:
+        from orchestrator.llm_text_utils import strip_think_blocks
+        text = strip_think_blocks(raw).strip()
+    except Exception:
+        text = _strip_think(raw)
+    if not text:
+        return None
+    # First non-empty line, hard cap 40 chars to fit the pill.
+    line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+    return line[:40] if line else None
+
+
 def _fallback_summary(items: list[dict[str, Any]], *, reason: str) -> str:
     ok = sum(1 for it in items if not it.get("comment"))
     return (
-        f"Auto summary ({reason}). {ok}/{len(items)} items completed without "
-        f"runtime issues; substantive evaluation skipped."
+        f"自动评价（{reason}）：{ok}/{len(items)} 道题未抛出运行时错误，"
+        f"但 LLM 评分调用失败，详细评估已跳过。"
     )
 
 
@@ -556,6 +621,12 @@ def execute_showcase(
 
     # Grade — S6 returns a fallback summary on engine error.
     summary = _grade_summary(grade_client, finished, timeout_s=per_call_timeout_s)
+    # PR#59: short Chinese "首印象" gut-feel call (best-effort, never
+    # raises). Surfaces in the panel as a pill alongside the long
+    # summary so the user gets a one-glance verdict.
+    model_first_impression = _first_impression(
+        grade_client, finished, timeout_s=per_call_timeout_s,
+    )
 
     payload = {
         "stage": "SHOWCASE",
@@ -563,6 +634,7 @@ def execute_showcase(
         "hf_id": run.hf_id,
         "items": finished,
         "summary": summary,
+        "model_first_impression": model_first_impression,
         "base_url": base_url,
         "evaluated_at": datetime.now(tz=UTC).isoformat(timespec="seconds"),
         "total_duration_s": round(time.time() - t0, 3),

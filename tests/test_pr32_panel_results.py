@@ -26,32 +26,33 @@ from panel import server
 
 
 class TestRowPrioritySort(unittest.TestCase):
-    """The internal _row_priority used to sort the results table."""
+    """PR#58 superseded the original PR#32 status-priority sort. The
+    user's new contract is purely time-DESC ("测试结果时间排序，最新的
+    放前面") regardless of status. This test pins that behavior."""
 
     def _rows(self):
+        # Each row tagged with a distinct created_at; ordering by status
+        # would scramble these but time-DESC keeps them strictly oldest→
+        # newest reversed.
         return [
-            {"hf_id": "fail/foo", "status": "failed",
-             "failure_reason": "X" * 5000},
-            {"hf_id": "abort/foo", "status": "aborted",
-             "failure_reason": "oversize"},
-            {"hf_id": "ok-cap/foo", "status": "ok", "pass_rate": 0.71,
-             "capability": "25/35"},
-            {"hf_id": "ok-cap-low/foo", "status": "ok", "pass_rate": 0.48,
-             "capability": "12/25"},
-            {"hf_id": "ok-nodata/foo", "status": "ok"},
-            {"hf_id": "in_prog/foo", "status": "in_progress"},
-            {"hf_id": "ok-cap-high/foo", "status": "ok", "pass_rate": 1.0,
-             "capability": "5/5"},
+            {"hf_id": "t1-oldest/foo", "status": "failed",
+             "failure_reason": "X" * 5000, "created_at": 1000},
+            {"hf_id": "t2-old/foo", "status": "aborted",
+             "failure_reason": "oversize", "created_at": 2000},
+            {"hf_id": "t3-mid/foo", "status": "ok", "pass_rate": 0.48,
+             "capability": "12/25", "created_at": 3000},
+            {"hf_id": "t4-mid/foo", "status": "ok", "pass_rate": 0.71,
+             "capability": "25/35", "created_at": 4000},
+            {"hf_id": "t5-new/foo", "status": "ok", "created_at": 5000},
+            {"hf_id": "t6-newer/foo", "status": "in_progress",
+             "created_at": 6000},
+            {"hf_id": "t7-newest/foo", "status": "ok", "pass_rate": 1.0,
+             "capability": "5/5", "created_at": 7000},
         ]
 
-    def test_sort_priority_buckets(self) -> None:
+    def test_sort_time_desc(self) -> None:
+        """PR#58: newest created_at first, regardless of status."""
         rows = self._rows()
-        sorted_ids = sorted(rows, key=server.render_results_page.__globals__["_row_priority"]
-                            if "_row_priority" in server.render_results_page.__globals__
-                            else lambda x: 0)
-        # The function is defined inside render_results_page, so we
-        # exercise the full render path and verify the table-body
-        # ordering instead.
         with mock.patch.object(server, "results_leaderboard",
                                return_value={
                                    "total": len(rows),
@@ -61,29 +62,22 @@ class TestRowPrioritySort(unittest.TestCase):
                                    "avg_pass_rate": 0.6,
                                    "rows": rows,
                                }):
-            html = server.render_results_page()
+            html_str = server.render_results_page()
 
-        # ok-cap-high (1.0) must appear before ok-cap (0.71) must
-        # appear before ok-cap-low (0.48) must appear before
-        # ok-nodata, in_progress, failed, aborted.
         def pos(needle: str) -> int:
-            i = html.find(needle)
+            i = html_str.find(needle)
             self.assertGreaterEqual(i, 0, f"{needle!r} not in page")
             return i
 
         order = [
-            "ok-cap-high/foo",
-            "ok-cap/foo",
-            "ok-cap-low/foo",
-            "ok-nodata/foo",
-            "in_prog/foo",
-            "fail/foo",
-            "abort/foo",
+            "t7-newest/foo", "t6-newer/foo", "t5-new/foo",
+            "t4-mid/foo", "t3-mid/foo",
+            "t2-old/foo", "t1-oldest/foo",
         ]
         positions = [pos(name) for name in order]
         for prev, curr, name in zip(positions, positions[1:], order[1:]):
             self.assertLess(prev, curr,
-                            f"{name!r} should come AFTER previous group")
+                            f"{name!r} should come AFTER older row")
 
 
 class TestFailureReasonTruncated(unittest.TestCase):
