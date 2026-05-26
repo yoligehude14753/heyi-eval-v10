@@ -281,6 +281,9 @@ discover daemon ─ append ─► discover/candidates.jsonl
 | 产线 LLM URL | `http://127.0.0.1:10814` | `HEYI_ENGINE_URL` |
 | 产线 LLM API Key | 无 | `HEYI_ENGINE_API_KEY` |
 | 产线 LLM judge model | `MiniMax-M2.7` | `HEYI_EVAL_JUDGE_MODEL` |
+| Judge provider 切换 | `heyi_engine`（默认） | `HEYI_EVAL_JUDGE_PROVIDER=yunwu` 切到云雾 |
+| 云雾 base url | `https://yunwu.ai/v1` | `YUNWU_BASE_URL` |
+| 云雾 API key | 无 | `YUNWU_GENERAL_KEY`（兜底 `YUNWU_KEY_2` / `YUNWU_GPT_KEY`） |
 | 产线容器名 | `minimax` | `HEYI_EVAL_PROD_ENGINE_CONTAINER` |
 | 产线 GPU | `(0,1,2,3)` | `HEYI_EVAL_PROD_ENGINE_GPUS` |
 | 评测 GPU | `(5,6,7)` | `HEYI_EVAL_EVAL_GPUS` |

@@ -719,7 +719,7 @@ def _vllm_args_hint(metadata: dict[str, Any]) -> dict[str, Any]:
     Not authoritative — cc-agent can still adapt at runtime (e.g. lower
     gpu-memory-utilization to fit alongside glm-51, like it did in T11).
 
-    Param-size estimation tiers (PR#23 + PR#26):
+    Param-size estimation tiers (PR#23 + PR#26 + PR#68):
       1. ``metadata["param_count"]`` (curator output, preferred).
       2. PR#26: fall back to ``metadata["hf_id"]`` — public model
          names almost always embed the size (``Llama-3.1-405B``,
@@ -727,6 +727,16 @@ def _vllm_args_hint(metadata: dict[str, Any]) -> dict[str, Any]:
          a curator gap (param_count=None) silently bypasses INV-23
          and the oversize gate misses the model, which is exactly
          what happened on the nv8 PR#26 batch run for Llama 405B.
+      3. PR#68: recognise the ``T`` (trillion) unit and pick the
+         *largest* magnitude in the string, not the first one.
+         Two real failures on nv8 (2026-05-25):
+           - moonshotai/Kimi-K2-Instruct had ``param_count="1T"``;
+             the old regex only matched ``\\d+b\\b`` so 1T was
+             silently dropped → tp=1 → STAGE_MODEL ate 28 minutes
+             of bandwidth before crashing.
+           - allenai/EMO_1b14b_1T (1.14B active / 1T total MoE):
+             first-match returned 1 ("1b") and missed the total.
+             max-match picks 1T → 1000B → tp=4 → oversize.
     """
     import re
     ctx = metadata.get("context_length")
@@ -735,14 +745,23 @@ def _vllm_args_hint(metadata: dict[str, Any]) -> dict[str, Any]:
         hint["max_model_len"] = min(ctx, 32_768)
 
     def _extract_b(s: str) -> float | None:
-        # Extract the leading "<num>b" amount in billions; tolerate
-        # decimals and stray surrounding text. e.g.:
+        # Extract the LARGEST "<num>[bt]" magnitude in billions;
+        # tolerate decimals and stray surrounding text. The "T"
+        # unit is interpreted as 1000B. Max-match (not first-match)
+        # so MoE total-param markers like "EMO_1b14b_1T" are read
+        # as 1000 (total) not 1 (active). Examples:
         #   "72.7B"           -> 72.7
         #   "405B"            -> 405
-        #   "1.5b"            -> 1.5
-        #   "MoE-236.5B-A21B" -> 236.5 (first match wins)
-        m = re.search(r"(\d+(?:\.\d+)?)\s*b\b", s.lower())
-        return float(m.group(1)) if m else None
+        #   "1T"              -> 1000  (1 trillion = 1000B)
+        #   "1.5T"            -> 1500
+        #   "EMO_1b14b_1T"    -> 1000  (max of 1, 14, 1000)
+        #   "MoE-236.5B-A21B" -> 236.5 (max of 236.5, 21)
+        matches = re.findall(r"(\d+(?:\.\d+)?)\s*([bt])\b", s.lower())
+        if not matches:
+            return None
+        vals = [float(num) * (1000.0 if unit == "t" else 1.0)
+                for num, unit in matches]
+        return max(vals)
 
     b = _extract_b(metadata.get("param_count") or "")
     if b is None:
