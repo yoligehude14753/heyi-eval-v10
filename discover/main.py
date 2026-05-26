@@ -155,15 +155,17 @@ def cmd_once(args: argparse.Namespace) -> int:
         f"[discover.{kind}] new={n_written} seen_skipped={stats.seen_skipped} "
         f"excluded_old={stats.excluded_old} excluded_modality={stats.excluded_modality} "
         f"excluded_trending_threshold={stats.excluded_trending_threshold} "
+        f"excluded_oversize={stats.excluded_oversize} "
         f"api_errors={stats.api_errors}{extra}"
     )
     if new:
         sample = new[: min(5, len(new))]
         print(f"[discover.{kind}] sample new candidates:")
         for c in sample:
+            pb = "-" if c.param_billion is None else f"{c.param_billion:.1f}B"
             print(
                 f"  + {c.hf_id}  reason={c.reason}  pipe={c.pipeline_tag} "
-                f"dl={c.downloads} likes={c.likes} mod={c.last_modified}"
+                f"dl={c.downloads} likes={c.likes} size={pb} mod={c.last_modified}"
             )
     return 0
 
@@ -242,11 +244,18 @@ def cmd_list(args: argparse.Namespace) -> int:
     cands = load_candidates(_candidates_path(data_root))
     cands = sorted(cands, key=lambda c: c.discovered_at, reverse=True)
     limit = args.limit
-    print(f"{'hf_id':<50} {'reason':<10} {'pipe':<22} {'dl':<10} {'likes':<6} {'discovered_at'}")
+    # PR#68: surface ``param_billion`` so operators can sanity-check the
+    # size-gate output (no more "wait, why is Kimi-K2.6 in the queue?").
+    print(
+        f"{'hf_id':<50} {'reason':<10} {'pipe':<22} "
+        f"{'dl':<10} {'likes':<6} {'B':<6} {'discovered_at'}"
+    )
     for c in cands[:limit]:
+        pb = "-" if c.param_billion is None else f"{c.param_billion:.1f}"
         print(
             f"{c.hf_id:<50} {c.reason:<10} {(c.pipeline_tag or '-'):<22} "
-            f"{(c.downloads or 0):<10} {(c.likes or 0):<6} {c.discovered_at}"
+            f"{(c.downloads or 0):<10} {(c.likes or 0):<6} {pb:<6} "
+            f"{c.discovered_at}"
         )
     return 0
 

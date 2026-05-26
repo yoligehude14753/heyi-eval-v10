@@ -41,13 +41,22 @@ class Candidate:
     library_name: str | None = None
     private: bool = False
     gated: bool = False
+    # PR#68: best-effort parameter count in billions, used to gate giant
+    # models (Kimi-K2.6, DeepSeek-V3 671B, Llama-3.1-405B, ...) that the
+    # eval-side GPU pool can never host. None = unknown (fail-open, same
+    # policy as _passes_window / _passes_modality on missing data).
+    param_billion: float | None = None
 
     def to_jsonl(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
 
     @classmethod
     def from_jsonl(cls, line: str) -> Candidate:
-        return cls(**json.loads(line))
+        # PR#68: tolerate older candidates.jsonl rows that don't have the
+        # ``param_billion`` field — they were appended before this PR landed.
+        data = json.loads(line)
+        data.setdefault("param_billion", None)
+        return cls(**data)
 
 
 @dataclass
@@ -73,6 +82,14 @@ class TrackerConfig:
     # surfaces the same stale mega-popular checkpoints (bert-base,
     # llama-2-7b, …) and crowds out fresh releases. ``0`` disables.
     min_trending_recency_days: int = 0
+    # PR#68: hard ceiling on parameter count (in billions). Candidates
+    # whose ``param_billion`` exceeds this are dropped at discover time,
+    # so the panel/queue never lists models the eval-side pool can't
+    # actually host (e.g. Kimi-K2.6 ≥ 1T, DeepSeek-V3 671B, Llama-3.1-405B
+    # on a 3×H100 pool). ``None`` disables the gate (= legacy behaviour).
+    # Default 70.0 matches the nv8 eval pool (3 free H100s, TP≤4 fits 70B
+    # at fp16); operators with bigger pools should override via yaml.
+    max_param_billion: float | None = 70.0
 
     @classmethod
     def from_yaml(cls, path: Path) -> TrackerConfig:
@@ -101,6 +118,9 @@ class TrackerConfig:
             trending_sweep_limit=int(data.get("trending_sweep_limit", 200)),
             min_trending_recency_days=int(
                 data.get("min_trending_recency_days", 0)
+            ),
+            max_param_billion=_coerce_max_param_billion(
+                data.get("max_param_billion", 70.0)
             ),
         )
 
@@ -149,6 +169,9 @@ class RoundStats:
     excluded_old: int = 0
     excluded_modality: int = 0
     excluded_trending_threshold: int = 0
+    # PR#68: PARAM-COUNT-OVERSIZE drops (Kimi-K2.6 / 671B / 405B / ...)
+    # so operators can verify the gate is doing something on each round.
+    excluded_oversize: int = 0
     api_errors: int = 0
 
 
@@ -239,6 +262,133 @@ def _passes_modality(pipeline_tag: str | None, allowed: list[str]) -> bool:
     return pipeline_tag in allowed
 
 
+# ── PR#68: parameter-count parsing + size gate ─────────────────────────────
+
+
+def _coerce_max_param_billion(v: Any) -> float | None:
+    """Read a yaml value (None/int/float/str) into ``float | None``.
+
+    yaml ``null`` / explicit ``"none"`` / empty string ⇒ ``None`` (disables
+    the gate). Anything coercible to float passes through; junk falls back
+    to ``None`` (= safe: gate disabled rather than mass-skip on parse error).
+    """
+    if v is None:
+        return None
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if not s or s in ("none", "null", "off", "false", "disabled"):
+            return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if f > 0 else None
+
+
+# Regex set used to recover param count from the hf_id when HF doesn't
+# expose ``safetensors.total``. Order matters — we try the most specific
+# patterns first so "MoE-236.5B-A21B" doesn't match the "A21B" suffix and
+# misreport the active-experts count as the model size.
+_PARAM_REGEX_HFID = re.compile(
+    # Matches things like "Kimi-K2.6-1T", "DeepSeek-V3-671B", "Qwen3-72B",
+    # "Llama-3.1-405B-Instruct", "70.7B" (decimals), "236.5B" (MoE total).
+    # We deliberately ignore later "AxxB" tokens (active experts) — only
+    # the *first* size token wins.
+    r"(?P<num>\d+(?:\.\d+)?)\s*(?P<unit>[TtBb])(?![A-Za-z])",
+)
+
+
+def _parse_param_billion_from_id(hf_id: str) -> float | None:
+    """Pull a parameter count out of an HF repo id.
+
+    Returns parameter count *in billions*, so ``671B → 671.0`` and
+    ``1T → 1000.0``. Returns ``None`` when no size token is present —
+    legitimate cases: ``Qwen3-Embedding-0.6B`` works, ``stabilityai/sd3``
+    doesn't (and shouldn't be size-gated on this code path).
+    """
+    if not hf_id:
+        return None
+    # Strip the org prefix so "moonshotai/Kimi-K2.6-1T-Instruct" → "Kimi-K2.6-1T-Instruct".
+    tail = hf_id.rsplit("/", 1)[-1]
+    m = _PARAM_REGEX_HFID.search(tail)
+    if not m:
+        return None
+    try:
+        num = float(m.group("num"))
+    except ValueError:
+        return None
+    unit = m.group("unit").upper()
+    if unit == "T":
+        return num * 1000.0
+    return num  # B
+
+
+def _parse_param_billion(m: Any, hf_id: str) -> float | None:
+    """Best-effort parameter-count extraction with fail-open semantics.
+
+    Resolution order:
+        1) HF API ``expand=["safetensors"]`` returns
+           ``safetensors = {"total": <int>, "parameters": {...}}``
+           — authoritative when present (it's the actual on-disk tensor
+           count, not a guess).
+        2) Regex on ``hf_id`` (`Kimi-K2.6-1T`, `Qwen3-72B`, …).
+        3) ``None`` — caller must NOT drop the candidate; the gate
+           defaults to "let unknown through, ENGINE_SELECT will bail
+           downstream" so we don't false-positive the entire panel
+           on an HF API outage.
+
+    The function tolerates two shapes for ``m``: a dict (from the raw
+    mirror JSON / unit-test fakes) or an object with attributes (from
+    ``huggingface_hub.ModelInfo``). Same pattern as ``_model_to_candidate``.
+    """
+    # ── (1) safetensors.total ──
+    safetensors: Any = None
+    if isinstance(m, dict):
+        safetensors = m.get("safetensors")
+    else:
+        safetensors = getattr(m, "safetensors", None)
+    if safetensors is not None:
+        total: Any = None
+        if isinstance(safetensors, dict):
+            total = safetensors.get("total")
+        else:
+            total = getattr(safetensors, "total", None)
+        try:
+            if total is not None:
+                # safetensors.total counts parameters, not bytes. Convert
+                # to billions with one decimal (keeps 7.7B / 0.5B readable
+                # in candidates.jsonl).
+                return round(float(total) / 1e9, 2)
+        except (TypeError, ValueError):
+            pass
+
+    # ── (2) hf_id regex ──
+    by_id = _parse_param_billion_from_id(hf_id)
+    if by_id is not None:
+        return by_id
+
+    # ── (3) give up — caller fail-opens ──
+    return None
+
+
+def _passes_size(param_billion: float | None,
+                 max_param_billion: float | None) -> bool:
+    """Size gate. ``param_billion=None`` ⇒ pass (fail-open). ``max=None``
+    ⇒ gate disabled, everything passes.
+
+    Decision matrix:
+        max=None             → True  (gate off)
+        param=None           → True  (unknown, ENGINE_SELECT decides)
+        param > max          → False
+        param ≤ max          → True
+    """
+    if max_param_billion is None:
+        return True
+    if param_billion is None:
+        return True
+    return param_billion <= max_param_billion
+
+
 def _model_to_candidate(m: Any, reason: str) -> Candidate:
     """Convert HfApi ModelInfo (or dict from fake / raw mirror JSON) to
     our Candidate.
@@ -283,6 +433,7 @@ def _model_to_candidate(m: Any, reason: str) -> Candidate:
         library_name=library_name,
         private=bool(private or False),
         gated=bool(gated or False),
+        param_billion=_parse_param_billion(m, hf_id),
     )
 
 
@@ -298,6 +449,10 @@ _EXPAND_FIELDS = [
     "library_name",
     "private",
     "gated",
+    # PR#68: ``safetensors.total`` carries the authoritative parameter
+    # count (no card-card parsing needed). Adds one field to the JSON
+    # response per model — cheap relative to the listing roundtrip.
+    "safetensors",
 ]
 
 
@@ -518,6 +673,9 @@ def scan_round(
             if not _passes_modality(cand.pipeline_tag, config.modality_pipeline_tags):
                 stats.excluded_modality += 1
                 continue
+            if not _passes_size(cand.param_billion, config.max_param_billion):
+                stats.excluded_oversize += 1
+                continue
             new.append(cand)
             cursor.seen.add(cand.hf_id)
             stats.new_candidates += 1
@@ -571,6 +729,9 @@ def scan_round(
         likes = cand.likes or 0
         if downloads < config.min_downloads_30d and likes < config.min_likes:
             stats.excluded_trending_threshold += 1
+            continue
+        if not _passes_size(cand.param_billion, config.max_param_billion):
+            stats.excluded_oversize += 1
             continue
         new.append(cand)
         cursor.seen.add(cand.hf_id)
@@ -651,6 +812,9 @@ def scan_backfill(
                                     config.modality_pipeline_tags):
                 stats.excluded_modality += 1
                 continue
+            if not _passes_size(cand.param_billion, config.max_param_billion):
+                stats.excluded_oversize += 1
+                continue
             if cand.private or cand.gated:
                 # gated repos can be promoted by other paths (manual
                 # enqueue) but backfill skips them to avoid the 403
@@ -708,6 +872,9 @@ def scan_incremental(
             if not _passes_modality(cand.pipeline_tag,
                                     config.modality_pipeline_tags):
                 stats.excluded_modality += 1
+                continue
+            if not _passes_size(cand.param_billion, config.max_param_billion):
+                stats.excluded_oversize += 1
                 continue
             if cand.private or cand.gated:
                 stats.excluded_modality += 1
