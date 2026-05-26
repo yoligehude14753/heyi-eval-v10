@@ -719,6 +719,223 @@ def cmd_resume(args: argparse.Namespace) -> int:
     return 0
 
 
+# ── project_lane CLI handlers (M4) ───────────────────────────────────────
+#
+# These are intentionally thin: real logic lives in
+# ``orchestrator.project_lane``. The wrappers do three things:
+#
+#   1. Resolve a real docker client if we're actually going to dispatch
+#      ("run" subcommand). For "enqueue" and "status" we don't need docker.
+#   2. Construct a PoolManager + StreamExec from the wired-up M2d helpers.
+#   3. Translate the lane's status enum to a stdout summary.
+#
+# Why no daemon subcommand here: the systemd unit file is the right shape
+# for that; we deliberately don't bake one into Python to keep the model
+# of "one process, one round" cleaner for operators reading logs.
+
+
+def _project_store():
+    from .project_lane import ProjectStore
+    return ProjectStore(_default_data_root())
+
+
+def cmd_project_enqueue(args: argparse.Namespace) -> int:
+    """Manually enqueue one github project by ``owner/repo``.
+
+    Bypasses radar_ingest — useful for drills and for one-off operator
+    requests ("evaluate this specific repo now"). Uses a synthetic
+    ProjectCandidate with reason='manual' so the audit trail records
+    that the request didn't come from the daily ingest.
+    """
+    from datetime import datetime as _dt
+
+    from discover.radar_ingest import ProjectCandidate
+    store = _project_store()
+    cand = ProjectCandidate(
+        full_id=args.full_id,
+        source_url=f"https://github.com/{args.full_id}",
+        source_report="manual-cli",
+        source_date=_dt.now(UTC).strftime("%Y-%m-%d"),
+        discovered_at=_dt.now(UTC).isoformat(),
+        reason="manual",
+        short_desc="(manually enqueued via CLI)",
+    )
+    run_id = store.enqueue(cand, skip_if_recent_hours=0.0)
+    if run_id is None:
+        print(f"project enqueue {args.full_id}: dedup-skipped (recent run found)")
+        return 0
+    print(f"project enqueued {args.full_id} -> {run_id}")
+    return 0
+
+
+def cmd_project_run(args: argparse.Namespace) -> int:
+    """Execute up to ``--limit`` pending project_lane runs in series.
+
+    Requires docker daemon + the m2b container named ``--container``.
+    Fails cleanly with rc=2 if docker isn't reachable so systemd notices.
+    """
+    try:
+        import docker
+    except ImportError:
+        print("project run: 'docker' python package not installed", file=sys.stderr)
+        return 2
+    try:
+        client = docker.from_env()
+        client.ping()
+    except Exception as e:
+        print(f"project run: docker not reachable: {e}", file=sys.stderr)
+        return 2
+
+    from agent_driver.exec_runner import make_docker_stream_exec
+    from agent_driver.pool_manager import PoolManager
+
+    from .project_lane import run_pending as project_run_pending
+    store = _project_store()
+    workspace = Path(os.environ.get(
+        "HEYI_PROJECT_WORKSPACE", "/tmp/heyi-project-ws",
+    ))
+    workspace.mkdir(parents=True, exist_ok=True)
+    pool = PoolManager(
+        container_names=[args.container],
+        host_workspace_root=workspace,
+        docker_client=client,
+    )
+    n = project_run_pending(
+        store, pool=pool, host_workspace_root=workspace,
+        limit=args.limit,
+        stream_exec=make_docker_stream_exec(client),
+    )
+    print(f"project run: processed {n} pending runs")
+    return 0
+
+
+def cmd_project_status(args: argparse.Namespace) -> int:
+    """Tail of recent project_lane runs, panel-shaped (status / outcome /
+    full_id / age). Useful for `watch` during a drill."""
+    from .project_lane import list_recent as project_list_recent
+    store = _project_store()
+    rows = project_list_recent(store, limit=args.limit)
+    if not rows:
+        print("project status: no runs yet")
+        return 0
+    print(f"{'run_id':<28} {'status':<22} {'outcome':<8} {'full_id':<40} enqueued_at")
+    for r in rows:
+        print(
+            f"{r.run_id:<28} {r.status.value:<22} "
+            f"{(r.summary_outcome or '-'):<8} {r.full_id:<40} {r.enqueued_at}"
+        )
+    return 0
+
+
+# ── skill_lane CLI handlers (M4) ─────────────────────────────────────────
+
+
+def _skill_store():
+    from .skill_lane import SkillStore
+    return SkillStore(_default_data_root())
+
+
+def cmd_skill_enqueue(args: argparse.Namespace) -> int:
+    """Manually enqueue one skill by full_id. If ``--source-path`` is
+    not given, we resolve from the candidate list (which discover/
+    skill_local_scan emits to data/discover/skill_candidates.jsonl)."""
+    from discover.skill_local_scan import (
+        SkillCandidate,
+        default_skill_candidates_path,
+    )
+    src_path = args.source_path
+    if src_path is None:
+        cand_file = default_skill_candidates_path()
+        if not cand_file.exists():
+            print(
+                "skill enqueue: --source-path not given and no "
+                f"{cand_file} on disk; run skill scan first or "
+                "pass --source-path explicitly", file=sys.stderr,
+            )
+            return 2
+        for line in cand_file.read_text().splitlines():
+            try:
+                c = SkillCandidate.from_jsonl(line)
+            except Exception:
+                continue
+            if c.full_id == args.full_id:
+                src_path = c.source_path
+                break
+    if not src_path:
+        print(f"skill enqueue: {args.full_id} not in candidates", file=sys.stderr)
+        return 2
+
+    cand = SkillCandidate(
+        full_id=args.full_id,
+        source_path=src_path,
+        source_root=args.full_id.split("/", 1)[0],
+        discovered_at=datetime.now(UTC).isoformat(),
+        name=args.full_id.split("/", 1)[-1],
+        reason="manual",
+    )
+    store = _skill_store()
+    run_id = store.enqueue(cand, skip_if_recent_hours=0.0)
+    if run_id is None:
+        print(f"skill enqueue {args.full_id}: dedup-skipped")
+        return 0
+    print(f"skill enqueued {args.full_id} -> {run_id}")
+    return 0
+
+
+def cmd_skill_run(args: argparse.Namespace) -> int:
+    """Execute pending skill_lane runs. Same docker prereqs as
+    cmd_project_run."""
+    try:
+        import docker
+    except ImportError:
+        print("skill run: 'docker' python package not installed", file=sys.stderr)
+        return 2
+    try:
+        client = docker.from_env()
+        client.ping()
+    except Exception as e:
+        print(f"skill run: docker not reachable: {e}", file=sys.stderr)
+        return 2
+
+    from agent_driver.exec_runner import make_docker_stream_exec
+    from agent_driver.pool_manager import PoolManager
+
+    from .skill_lane import run_pending as skill_run_pending
+    store = _skill_store()
+    workspace = Path(os.environ.get(
+        "HEYI_SKILL_WORKSPACE", "/tmp/heyi-skill-ws",
+    ))
+    workspace.mkdir(parents=True, exist_ok=True)
+    pool = PoolManager(
+        container_names=[args.container],
+        host_workspace_root=workspace,
+        docker_client=client,
+    )
+    n = skill_run_pending(
+        store, pool=pool, host_workspace_root=workspace,
+        limit=args.limit,
+        stream_exec=make_docker_stream_exec(client),
+    )
+    print(f"skill run: processed {n} pending runs")
+    return 0
+
+
+def cmd_skill_status(args: argparse.Namespace) -> int:
+    from .skill_lane import list_recent as skill_list_recent
+    store = _skill_store()
+    rows = skill_list_recent(store, limit=args.limit)
+    if not rows:
+        print("skill status: no runs yet")
+        return 0
+    print(f"{'run_id':<30} {'status':<22} {'outcome':<8} {'full_id':<50} demos")
+    for r in rows:
+        print(
+            f"{r.run_id:<30} {r.status.value:<22} "
+            f"{(r.summary_outcome or '-'):<8} {r.full_id:<50} {r.summary_demos or 0}"
+        )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="heyi-eval-orchestrator")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -746,6 +963,68 @@ def main(argv: list[str] | None = None) -> int:
     s5.add_argument("--stub-only", action="store_true",
                     help="Use in-process stubs instead of CC agent docker invocations")
     s5.set_defaults(fn=cmd_resume)
+
+    # ── project_lane subcommands (M4) ───────────────────────────────────
+    # Namespaced under ``project`` so model_lane CLI surface is untouched
+    # (INV-L0) and lane intent is obvious in operator logs.
+    proj = sub.add_parser(
+        "project", help="project_lane operations (github project evals via M2.7)",
+    )
+    proj_sub = proj.add_subparsers(dest="project_cmd", required=True)
+
+    pp_enq = proj_sub.add_parser(
+        "enqueue", help="enqueue one github repo by owner/name",
+    )
+    pp_enq.add_argument("full_id", help="github full id, e.g. simonw/llm")
+    pp_enq.set_defaults(fn=cmd_project_enqueue)
+
+    pp_run = proj_sub.add_parser(
+        "run", help="execute one round of pending project runs",
+    )
+    pp_run.add_argument("--limit", type=int, default=5)
+    pp_run.add_argument(
+        "--container", default=os.environ.get("HEYI_AGENT_CONTAINER", "m2b-1"),
+        help="m2b container to dispatch through (default $HEYI_AGENT_CONTAINER or m2b-1)",
+    )
+    pp_run.set_defaults(fn=cmd_project_run)
+
+    pp_status = proj_sub.add_parser(
+        "status", help="recent project_lane runs (panel-shaped output)",
+    )
+    pp_status.add_argument("--limit", type=int, default=20)
+    pp_status.set_defaults(fn=cmd_project_status)
+
+    # ── skill_lane subcommands (M4) ─────────────────────────────────────
+    sk = sub.add_parser(
+        "skill", help="skill_lane operations (SKILL.md evals via M2.7)",
+    )
+    sk_sub = sk.add_subparsers(dest="skill_cmd", required=True)
+
+    sk_enq = sk_sub.add_parser(
+        "enqueue", help="enqueue one skill by full_id (sourceLabel/slug)",
+    )
+    sk_enq.add_argument("full_id", help="e.g. claude-user/agent-development")
+    sk_enq.add_argument(
+        "--source-path",
+        help="absolute path to SKILL.md (default: derived from full_id under "
+             "$HEYI_CLAUDE_SKILLS_ROOT or $HEYI_CURSOR_SKILLS_ROOT)",
+    )
+    sk_enq.set_defaults(fn=cmd_skill_enqueue)
+
+    sk_run = sk_sub.add_parser(
+        "run", help="execute one round of pending skill runs",
+    )
+    sk_run.add_argument("--limit", type=int, default=5)
+    sk_run.add_argument(
+        "--container", default=os.environ.get("HEYI_AGENT_CONTAINER", "m2b-1"),
+    )
+    sk_run.set_defaults(fn=cmd_skill_run)
+
+    sk_status = sk_sub.add_parser(
+        "status", help="recent skill_lane runs",
+    )
+    sk_status.add_argument("--limit", type=int, default=20)
+    sk_status.set_defaults(fn=cmd_skill_status)
 
     args = p.parse_args(argv)
     return args.fn(args)

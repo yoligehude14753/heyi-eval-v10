@@ -869,6 +869,136 @@ def _read_jsonl(path: Path, limit: int | None = None) -> list[dict]:
     return out
 
 
+def project_runs(limit: int = 100) -> list[dict]:
+    """Recent project_lane runs, panel-shaped.
+
+    Schema chosen to mirror ``list_runs`` enough that the dashboard
+    can render the three lanes with a single template loop, but with
+    project-specific fields exposed at the top level for easy filtering.
+
+    Failure mode: if the project_lane sqlite isn't initialised yet
+    (e.g. first start, never enqueued anything), return [] instead of
+    raising — the panel uses an empty array as the canonical "no rows"
+    signal.
+    """
+    try:
+        from orchestrator.project_lane import ProjectStore, list_recent
+    except ImportError:
+        return []
+    try:
+        store = ProjectStore(DATA_ROOT)
+        rows = list_recent(store, limit=limit)
+    except Exception:
+        return []
+    out = []
+    for r in rows:
+        out.append({
+            "run_id": r.run_id,
+            "lane": "project",
+            "full_id": r.full_id,
+            "source_url": r.source_url,
+            "status": r.status.value,
+            "outcome": r.summary_outcome,
+            "deploys": r.summary_deploys,
+            "quickstart_works": r.summary_quickstart,
+            "enqueued_at": r.enqueued_at,
+            "started_at": r.started_at,
+            "ended_at": r.ended_at,
+            "failure_reason_zh": r.failure_reason_zh or None,
+            "candidate": r.candidate,
+        })
+    return out
+
+
+def project_run_detail(run_id: str) -> dict | None:
+    """Detail view: state.json + agent.log tail + report.json (if any)."""
+    try:
+        from orchestrator.project_lane import ProjectStore
+    except ImportError:
+        return None
+    try:
+        store = ProjectStore(DATA_ROOT)
+        run = store.load(run_id)
+    except FileNotFoundError:
+        return None
+    run_dir = store._run_dir(run_id)
+    report = _read_json(run_dir / "report.json")
+    preflight = _read_json(run_dir / "preflight.json")
+    agent_log_text = None
+    log_path = run_dir / "agent.log"
+    if log_path.exists():
+        # cap to 12KB tail so HTML payload stays sane
+        agent_log_text = log_path.read_text(encoding="utf-8", errors="replace")[-12_000:]
+    return {
+        "run_id": run_id,
+        "state": run.to_jsonable(),
+        "report": report,
+        "preflight": preflight,
+        "agent_log_tail": agent_log_text,
+    }
+
+
+def skill_runs(limit: int = 100) -> list[dict]:
+    """Recent skill_lane runs, panel-shaped (mirror of project_runs)."""
+    try:
+        from orchestrator.skill_lane import SkillStore, list_recent
+    except ImportError:
+        return []
+    try:
+        store = SkillStore(DATA_ROOT)
+        rows = list_recent(store, limit=limit)
+    except Exception:
+        return []
+    out = []
+    for r in rows:
+        out.append({
+            "run_id": r.run_id,
+            "lane": "skill",
+            "full_id": r.full_id,
+            "skill_path": r.skill_path,
+            "status": r.status.value,
+            "outcome": r.summary_outcome,
+            "demos": r.summary_demos,
+            "enqueued_at": r.enqueued_at,
+            "started_at": r.started_at,
+            "ended_at": r.ended_at,
+            "failure_reason_zh": r.failure_reason_zh or None,
+            "candidate": r.candidate,
+            "clone_evidence": r.clone_evidence,
+        })
+    return out
+
+
+def skill_run_detail(run_id: str) -> dict | None:
+    """skill_lane run detail view."""
+    try:
+        from orchestrator.skill_lane import SkillStore
+    except ImportError:
+        return None
+    try:
+        store = SkillStore(DATA_ROOT)
+        run = store.load(run_id)
+    except FileNotFoundError:
+        return None
+    run_dir = store._run_dir(run_id)
+    report = _read_json(run_dir / "report.json")
+    log_path = run_dir / "agent.log"
+    agent_log_text = None
+    if log_path.exists():
+        agent_log_text = log_path.read_text(encoding="utf-8", errors="replace")[-12_000:]
+    clone_evidence = None
+    ev_path = run_dir / "clone_evidence.txt"
+    if ev_path.exists():
+        clone_evidence = ev_path.read_text(encoding="utf-8", errors="replace")
+    return {
+        "run_id": run_id,
+        "state": run.to_jsonable(),
+        "report": report,
+        "agent_log_tail": agent_log_text,
+        "clone_evidence": clone_evidence,
+    }
+
+
 def list_runs() -> list[dict]:
     """Each run summary: run_id, hf_id, status, started, ended, stages overview,
     plus result highlights (capability score, showcase first_impression, engine)
@@ -3079,6 +3209,26 @@ class Handler(BaseHTTPRequestHandler):
             elif path.startswith("/api/runs/"):
                 run_id = path[len("/api/runs/"):]
                 d = run_detail(run_id)
+                if d is None:
+                    self._json({"error": "not_found"}, status=404)
+                else:
+                    self._json(d)
+            # ── project_lane (M4b) ──────────────────────────────────
+            elif path == "/api/project/runs":
+                self._json(project_runs(limit=100))
+            elif path.startswith("/api/project/runs/"):
+                run_id = path[len("/api/project/runs/"):]
+                d = project_run_detail(run_id)
+                if d is None:
+                    self._json({"error": "not_found"}, status=404)
+                else:
+                    self._json(d)
+            # ── skill_lane (M4b) ────────────────────────────────────
+            elif path == "/api/skill/runs":
+                self._json(skill_runs(limit=100))
+            elif path.startswith("/api/skill/runs/"):
+                run_id = path[len("/api/skill/runs/"):]
+                d = skill_run_detail(run_id)
                 if d is None:
                     self._json({"error": "not_found"}, status=404)
                 else:
