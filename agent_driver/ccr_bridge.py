@@ -199,6 +199,8 @@ def inject_into_container(
     config: dict[str, Any],
     target_path_in_container: str = "/home/agent/.claude-code-router/config.json",
     settle_seconds: float = 2.0,
+    owner_uid: int = 1100,
+    owner_gid: int = 1100,
 ) -> None:
     """docker cp the config into a running m2b container + restart ccr.
 
@@ -212,10 +214,13 @@ def inject_into_container(
          stream (docker.put_archive accepts only tar)
       2. ``container.put_archive(parent_dir, tar_bytes)`` — atomically
          replaces the file inside the container
-      3. ``container.exec_run("pkill -HUP ccr")`` — ccr handles SIGHUP
-         by re-reading config. The kill is non-fatal (exit 1 if no ccr
-         process matched, exit 0 if matched) — we ignore exit and
-         settle-wait either way.
+      3. stop the running ccr process via SIGTERM + clear its stale
+         pidfile, then re-launch ``ccr start`` under nohup as the agent
+         user.  The earlier SIGHUP design (PR#22) assumed ccr would
+         re-read its config on SIGHUP, but the bundled node entry
+         point doesn't register a SIGHUP handler — node's default
+         action for SIGHUP is **terminate**, which left the container
+         with no router process.  Confirmed on 2026-05-26 heyi drill.
       4. settle-wait ``settle_seconds`` for ccr to re-bind 3456
 
     The "settle wait" is a hardcoded sleep (not a probe) because the
@@ -226,9 +231,8 @@ def inject_into_container(
     Failure modes:
       - put_archive fails (container missing, fs full) → propagate the
         docker-py exception; caller (pool_manager) treats as recycle.
-      - pkill exits non-zero → ignored (ccr might not be running yet
-        on a freshly-started container; SIGHUP only matters if it IS
-        running, in which case 0 is returned).
+      - SIGTERM exits non-zero → ignored (ccr might not be running yet
+        on a freshly-started container; we'll launch it anyway).
       - settle wait completes regardless. If ccr never came back, the
         next agent run will fail at the claude → ccr hop and produce
         a SANDBOX_DEAD report.
@@ -252,6 +256,17 @@ def inject_into_container(
         info.size = len(body)
         info.mode = 0o600
         info.mtime = int(_time.time())
+        # docker.put_archive runs as root by default, so without explicit
+        # uid/gid the extracted file is owned by root.  ccr inside the
+        # container runs as the unprivileged agent user (uid 1100 in
+        # m2b-claude-code), which would then fail to read its own config.
+        # Stamping the tar entry with agent's uid/gid avoids a post-inject
+        # chown step.  Defaults match m2b-claude-code's Dockerfile; pass
+        # explicit values if running against a non-default container.
+        info.uid = owner_uid
+        info.gid = owner_gid
+        info.uname = "agent"
+        info.gname = "agent"
         tf.addfile(info, io.BytesIO(body))
     buf.seek(0)
 
@@ -263,12 +278,33 @@ def inject_into_container(
             f"docker.put_archive returned False for {container_name}:{target_path}"
         )
 
-    # SIGHUP triggers ccr's config-reload handler. If ccr isn't yet up
-    # (fresh container), pkill returns 1; that's not an error for us.
+    # ccr's node entrypoint doesn't trap SIGHUP, so SIGHUP terminates
+    # the process without reloading.  We instead do a clean stop-then-
+    # start: SIGTERM existing ccr (if any), wipe the stale pidfile that
+    # would otherwise make the new ccr exit with "server is running",
+    # then nohup a fresh ccr.  Both steps are best-effort — failures
+    # surface in the post-settle probe path inside run_agent.
     container.exec_run(
-        cmd=["sh", "-c", "pkill -HUP -f 'ccr start' || true"],
+        cmd=[
+            "sh", "-c",
+            "pkill -TERM -f 'ccr start' 2>/dev/null; "
+            "sleep 1; "
+            "rm -f /home/agent/.claude-code-router/.claude-code-router.pid; "
+            "true",
+        ],
         user="agent",
         detach=False,
+        tty=False,
+    )
+    container.exec_run(
+        cmd=[
+            "sh", "-c",
+            "export HOME=/home/agent PATH=/home/agent/.npm-global/bin:$PATH; "
+            "nohup ccr start "
+            ">/home/agent/logs/ccr-injected.log 2>&1 </dev/null &",
+        ],
+        user="agent",
+        detach=True,
         tty=False,
     )
 

@@ -289,20 +289,53 @@ class InjectIntoContainerTests(_EnvIsolation):
             self.assertEqual(loaded["Router"]["default"], cfg["Router"]["default"])
             info = tar.getmember("config.json")
             self.assertEqual(info.mode, 0o600)
+            # uid/gid must match the agent user inside m2b (uid 1100);
+            # otherwise put_archive extracts as root and ccr (running as
+            # agent) hits "permission denied" on read.  Confirmed by the
+            # heyi real-machine drill on 2026-05-26.
+            self.assertEqual(info.uid, 1100)
+            self.assertEqual(info.gid, 1100)
+            self.assertEqual(info.uname, "agent")
+            self.assertEqual(info.gname, "agent")
 
-    def test_pkill_command_issued(self) -> None:
+    def test_owner_uid_gid_overridable(self) -> None:
+        """Operators with a non-default m2b image should be able to point
+        at a different uid via kwargs without forking the module."""
+        import io
+        import tarfile
+
+        from agent_driver.ccr_bridge import inject_into_container
+        docker, cap = self._fake_docker()
+        cfg = build_ccr_config(yunwu_url="https://yunwu.ai/v1", yunwu_key="sk")
+        inject_into_container(
+            "m2b-1", docker_client=docker, config=cfg, settle_seconds=0,
+            owner_uid=2000, owner_gid=2000,
+        )
+        with tarfile.open(fileobj=io.BytesIO(cap["tar_bytes"]), mode="r") as tar:
+            info = tar.getmember("config.json")
+            self.assertEqual(info.uid, 2000)
+            self.assertEqual(info.gid, 2000)
+
+    def test_stop_and_start_commands_issued(self) -> None:
+        # inject must (1) SIGTERM old ccr + drop stale pidfile, then
+        # (2) nohup a fresh ccr start.  SIGHUP can't be used: ccr's
+        # node entry-point doesn't trap it, so SIGHUP would terminate
+        # the process and leave the container without a router (see
+        # commit message — heyi 2026-05-26 drill confirmed this).
         from agent_driver.ccr_bridge import inject_into_container
         docker, cap = self._fake_docker()
         cfg = build_ccr_config(yunwu_url="https://yunwu.ai/v1", yunwu_key="sk")
         inject_into_container(
             "m2b-1", docker_client=docker, config=cfg, settle_seconds=0,
         )
-        self.assertEqual(len(cap["exec_cmds"]), 1)
-        cmd = cap["exec_cmds"][0]
-        # Should be a shell pkill SIGHUP targeting the ccr process
-        self.assertIn("pkill", " ".join(cmd))
-        self.assertIn("-HUP", " ".join(cmd))
-        self.assertIn("ccr start", " ".join(cmd))
+        self.assertEqual(len(cap["exec_cmds"]), 2)
+        stop_cmd = " ".join(cap["exec_cmds"][0])
+        start_cmd = " ".join(cap["exec_cmds"][1])
+        self.assertIn("pkill", stop_cmd)
+        self.assertIn("-TERM", stop_cmd)
+        self.assertIn("ccr start", stop_cmd)
+        self.assertIn(".claude-code-router.pid", stop_cmd)
+        self.assertIn("nohup ccr start", start_cmd)
 
     def test_put_archive_false_return_raises(self) -> None:
         """docker-py legacy paths return False on failure; we translate

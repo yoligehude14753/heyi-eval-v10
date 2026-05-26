@@ -185,9 +185,17 @@ class PoolManager:
         # container's identity. Recycling clears run_count + boot time.
         self._maybe_recycle(handle)
 
-        safe_run_workspace(self._host_workspace_root, run_id).mkdir(
-            mode=0o700, parents=False, exist_ok=False,
-        )
+        # mode=0o755 (not 0o700): m2b containers run as uid 1100 (agent)
+        # while the host workspace is typically owned by uid 1000.  With
+        # 0o700 the container's agent user would land in `other` and lose
+        # rwx, hitting "permission denied" on cd into the workspace.  0o755
+        # keeps host owner-exclusive write while granting the container
+        # agent read+execute, which is the minimum needed for `claude
+        # --print TASK.md` from inside the run dir.  The dir's parent
+        # (host_workspace_root) is itself the security boundary; the inner
+        # per-run subdir doesn't need to add another layer.
+        run_dir = safe_run_workspace(self._host_workspace_root, run_id)
+        run_dir.mkdir(mode=0o755, parents=False, exist_ok=False)
         handle.run_id = run_id
         handle.run_count += 1
         log.info(
