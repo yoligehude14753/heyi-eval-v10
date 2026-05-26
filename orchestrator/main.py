@@ -23,6 +23,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from . import notify
 from .config import OrchestratorConfig
@@ -768,6 +769,47 @@ def cmd_project_enqueue(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_m2b_host_workspace(
+    client: Any, container_name: str, env_override: str | None,
+) -> Path:
+    """Return the host-side directory that is mounted into ``container_name``
+    at ``/home/agent/workspace``.
+
+    When the operator sets ``$HEYI_PROJECT_WORKSPACE`` / ``$HEYI_SKILL_WORKSPACE``
+    explicitly, we trust that value (used by tests / sandbox drills).
+    Otherwise we inspect the running container's mounts and pick the
+    one whose Destination matches the agent workspace inside the
+    container — that's the path PoolManager has to ``mkdir`` so the
+    container's ``cd /home/agent/workspace/<run_id>`` resolves.
+
+    Falling back to a hard-coded ``/tmp/heyi-*-ws`` (the previous
+    default) silently broke ``orchestrator project run`` on heyi
+    because the m2b container's actual mount is
+    ``/home/ai/nanchang-demos/m2b-claude-code/workspace``; OCI then
+    rejected every exec with ``chdir to cwd … no such file or
+    directory`` and every run died in <1s.
+    """
+    if env_override:
+        return Path(env_override)
+    try:
+        info = client.api.inspect_container(container_name)
+    except Exception as e:
+        raise RuntimeError(
+            f"docker inspect {container_name!r} failed: {e}"
+        ) from e
+    mounts = info.get("Mounts") or []
+    for m in mounts:
+        if m.get("Destination") == "/home/agent/workspace":
+            src = m.get("Source")
+            if src:
+                return Path(src)
+    raise RuntimeError(
+        f"container {container_name!r} has no mount with destination "
+        "/home/agent/workspace; either fix the m2b compose file or set "
+        "HEYI_PROJECT_WORKSPACE / HEYI_SKILL_WORKSPACE explicitly"
+    )
+
+
 def cmd_project_run(args: argparse.Namespace) -> int:
     """Execute up to ``--limit`` pending project_lane runs in series.
 
@@ -791,9 +833,14 @@ def cmd_project_run(args: argparse.Namespace) -> int:
 
     from .project_lane import run_pending as project_run_pending
     store = _project_store()
-    workspace = Path(os.environ.get(
-        "HEYI_PROJECT_WORKSPACE", "/tmp/heyi-project-ws",
-    ))
+    try:
+        workspace = _resolve_m2b_host_workspace(
+            client, args.container,
+            os.environ.get("HEYI_PROJECT_WORKSPACE"),
+        )
+    except RuntimeError as e:
+        print(f"project run: {e}", file=sys.stderr)
+        return 2
     workspace.mkdir(parents=True, exist_ok=True)
     pool = PoolManager(
         container_names=[args.container],
@@ -902,9 +949,14 @@ def cmd_skill_run(args: argparse.Namespace) -> int:
 
     from .skill_lane import run_pending as skill_run_pending
     store = _skill_store()
-    workspace = Path(os.environ.get(
-        "HEYI_SKILL_WORKSPACE", "/tmp/heyi-skill-ws",
-    ))
+    try:
+        workspace = _resolve_m2b_host_workspace(
+            client, args.container,
+            os.environ.get("HEYI_SKILL_WORKSPACE"),
+        )
+    except RuntimeError as e:
+        print(f"skill run: {e}", file=sys.stderr)
+        return 2
     workspace.mkdir(parents=True, exist_ok=True)
     pool = PoolManager(
         container_names=[args.container],
