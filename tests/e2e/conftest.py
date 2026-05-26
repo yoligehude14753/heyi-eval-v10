@@ -32,6 +32,15 @@ def _e2e_allowed() -> bool:
     return os.environ.get("HEYI_EVAL_E2E_ALLOW") == "1"
 
 
+def _e2e_forced() -> bool:
+    """``HEYI_EVAL_E2E_FORCE=1`` lets operators run the suite on a
+    non-nv8 host that still has docker + nvidia-smi available (e.g.
+    the heyi dev box).  Documented in ``docs/USAGE.md §3.1``; the
+    original conftest forgot to honour it and skipped unconditionally.
+    """
+    return os.environ.get("HEYI_EVAL_E2E_FORCE") == "1"
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _require_nv8() -> None:
     if not _e2e_allowed():
@@ -40,7 +49,7 @@ def _require_nv8() -> None:
             "Set it explicitly on nv8 to opt in.",
             allow_module_level=True,
         )
-    if not _on_nv8():
+    if not _on_nv8() and not _e2e_forced():
         pytest.skip(
             "E2E tests should only run on a host whose hostname contains 'nv8' "
             "(or set HEYI_EVAL_E2E_FORCE=1 for a dry-run on another host).",
@@ -71,7 +80,12 @@ def heyi_eval_repo() -> Path:
 ProdSnap = list[tuple[str, str, str, str]]
 
 
-@pytest.fixture
+# Module scope (not function scope): ``fresh_qwen_run`` in
+# test_full_pipeline_qwen is module-scoped so the ~20 min pipeline run
+# only happens once for E-1..E-5.  pytest forbids a function-scoped
+# fixture being consumed by a module-scoped one, so this snapshot
+# pair must outlive the consumer.
+@pytest.fixture(scope="module")
 def prod_container_snapshot() -> tuple[Callable[[], ProdSnap],
                                        Callable[[ProdSnap], None]]:
     """Yields (snapshot_now, assert_unchanged_since).
