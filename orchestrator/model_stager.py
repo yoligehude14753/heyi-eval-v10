@@ -412,7 +412,7 @@ def _run_downloader_with_timeout(
     allow_patterns: list[str] | None,
     timeout_s: float | None,
     token: str | None = None,
-) -> None:
+) -> str | None:
     """Invoke ``dl`` with a wall-clock budget.
 
     PR#34c: when huggingface_hub.snapshot_download retries against a flaky
@@ -427,32 +427,35 @@ def _run_downloader_with_timeout(
     thread itself is left as a daemon — it will be reaped at process exit;
     we accept this trade-off because Python lacks a portable way to
     interrupt a blocking I/O call from another thread.
+
+    Returns the path the downloader actually populated.  For
+    huggingface_hub >= 0.23 this is the snapshot directory inside the
+    HF cache (e.g. ``~/.cache/huggingface/hub/models--…/snapshots/<sha>``)
+    even when ``local_dir`` was provided — newer hub versions short-
+    circuit the local_dir copy when the cache already holds the
+    snapshot and the target filesystem refuses symlinks (PR#71).
+    Returns ``None`` if the downloader didn't yield a path (very old
+    test fakes).
     """
-    # PR#40: only forward `token=` when explicitly set so legacy test
-    # fakes whose signatures predate token plumbing keep working.
-    # huggingface_hub.snapshot_download accepts token=None or absent
-    # identically, but custom downloader fakes used in tests typically
-    # do not.
-    def _invoke() -> None:
+    def _invoke() -> str | None:
         kw: dict[str, Any] = dict(
             repo_id=repo_id, local_dir=local_dir,
             max_workers=max_workers, allow_patterns=allow_patterns,
         )
         if token:
             kw["token"] = token
-        dl(**kw)
+        result = dl(**kw)
+        return result if isinstance(result, str) else None
 
     if timeout_s is None or timeout_s <= 0:
-        _invoke()
-        return
+        return _invoke()
 
     import threading
     holder: dict[str, Any] = {}
 
     def _worker() -> None:
         try:
-            _invoke()
-            holder["ok"] = True
+            holder["path"] = _invoke()
         except BaseException as e:
             holder["err"] = e
 
@@ -465,6 +468,7 @@ def _run_downloader_with_timeout(
         )
     if "err" in holder:
         raise holder["err"]
+    return holder.get("path")
 
 
 def ensure_model_staged(
@@ -596,7 +600,7 @@ def ensure_model_staged(
     target_dir.mkdir(parents=True, exist_ok=True)
     dl = downloader or _default_downloader
     try:
-        _run_downloader_with_timeout(
+        downloaded_path = _run_downloader_with_timeout(
             dl,
             repo_id=hf_id,
             local_dir=str(target_dir),
@@ -641,6 +645,36 @@ def ensure_model_staged(
         )
 
     # 5. Post-download sanity: did we actually get weights?
+    #
+    # PR#71: huggingface_hub >= 0.23 will sometimes leave ``local_dir``
+    # empty and only populate the HF cache (e.g. on filesystems where
+    # the copy-vs-symlink heuristic short-circuits, observed on the
+    # heyi dev box with hub 0.29.3 against an ext4 mount).  When that
+    # happens snapshot_download still returns the snapshot path inside
+    # the cache and the weights are real, just not at ``target_dir``.
+    # Re-point target_dir at the populated snapshot via a symlink so
+    # downstream stages (DEPLOY / READY_WAIT) keep their existing
+    # ``target_dir`` contract and the run is recoverable.
+    if (
+        not _has_weight_file(target_dir)
+        and downloaded_path
+        and downloaded_path != str(target_dir)
+    ):
+        populated = Path(downloaded_path)
+        if populated.exists() and _has_weight_file(populated):
+            try:
+                if target_dir.is_dir() and not any(target_dir.iterdir()):
+                    target_dir.rmdir()
+                if not target_dir.exists():
+                    target_dir.symlink_to(populated, target_is_directory=True)
+            except OSError as e:
+                import sys as _sys
+                print(
+                    f"[model_stager] could not symlink {target_dir} "
+                    f"-> {populated}: {e}",
+                    file=_sys.stderr,
+                )
+
     if not _has_weight_file(target_dir):
         # PR#32: same cleanup as the exception path. A "succeeded but
         # nothing usable on disk" outcome (e.g. allow_patterns matched
@@ -651,7 +685,8 @@ def ensure_model_staged(
             ok=False, skipped=False,
             error=(
                 f"snapshot_download returned ok but target_dir lacks "
-                f"recognised weights: {target_dir}"),
+                f"recognised weights: {target_dir} "
+                f"(downloader reported path: {downloaded_path!r})"),
             error_kind="incomplete_after_download",
             duration_s=now() - t0,
             target_dir=str(target_dir),

@@ -240,6 +240,44 @@ class TestCleanupOnFail(unittest.TestCase):
         self.assertEqual(r.bytes_freed, 0)
         self.assertTrue(self.target.exists())
 
+    def test_hub_0_23_returns_cache_path_when_local_dir_stays_empty(self) -> None:
+        """PR#71: huggingface_hub >= 0.23 will sometimes leave
+        ``local_dir`` empty and only populate the HF cache, returning
+        the snapshot path inside the cache instead.  Observed on the
+        heyi dev box with hub 0.29.3 against an ext4 mount: an empty
+        target_dir made STAGE_MODEL fail ``incomplete_after_download``
+        even though the weights were sitting one symlink away.  The
+        stager must follow the returned path and recover via a
+        symlink at target_dir so the DEPLOY contract still holds.
+        """
+        cache_root = self.target.parent / "_hf_cache"
+        snapshot_dir = cache_root / "models--x--y" / "snapshots" / "sha"
+
+        def hub_023_style(*, repo_id, local_dir, max_workers, allow_patterns):
+            Path(local_dir).mkdir(parents=True, exist_ok=True)
+            snapshot_dir.mkdir(parents=True, exist_ok=True)
+            (snapshot_dir / "config.json").write_bytes(b"{}")
+            (snapshot_dir / "model.safetensors"
+             ).write_bytes(b"\x00" * 64)
+            return str(snapshot_dir)
+
+        r = model_stager.ensure_model_staged(
+            hf_id="x/y", target_dir=self.target,
+            metadata={"param_count": "0.5B"},
+            downloader=hub_023_style,
+        )
+        self.assertTrue(
+            r.ok,
+            f"stager should follow hub-returned path when target_dir empty: {r.error}",
+        )
+        self.assertTrue(self.target.exists())
+        self.assertTrue(
+            self.target.is_symlink() or model_stager._has_weight_file(self.target),
+            "target_dir must resolve to the populated snapshot",
+        )
+        if self.target.is_symlink():
+            self.assertEqual(self.target.resolve(), snapshot_dir.resolve())
+
 
 # ── 4. size estimator with allow_patterns + siblings ───────────────────────
 
