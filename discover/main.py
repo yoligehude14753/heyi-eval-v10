@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -279,6 +280,30 @@ _REJECTED_LIBRARIES = {
 _TRUSTED_REASONS = {"whitelist", "both", "manual"}
 
 
+# PR#69: hf_id patterns we know exceed any reasonable eval pool size
+# even when the name doesn't carry an explicit B/T marker. Each entry
+# is a case-insensitive regex matched against the bare hf_id.
+#
+# Why this list at all: discover/Candidate doesn't carry param_count
+# (that's filled by CURATE later), so _vllm_args_hint(hf_id_only)
+# can't size models like nvidia/Kimi-K2.6-NVFP4 — the name has no
+# B/T suffix. Without this list those models would be enqueued, run
+# CURATE for ~24 s (and burn one LLM call), and only be stopped at
+# ENGINE_SELECT by INV-23. With the list they are filtered out at
+# enqueue and never enter the test loop — exactly the user-requested
+# "oversize 纯收集信息，直接不进入测试链路" behaviour. They remain in
+# candidates.jsonl and on the /candidates panel for information.
+#
+# Add to this list when CURATE+ENGINE_SELECT consistently shows a new
+# family is hard-oversized; do NOT add aspirational entries.
+_KNOWN_OVERSIZE_HF_PATTERNS = (
+    # Kimi-K2 / K2.5 / K2.6 / K3 — all ~1T total params.
+    re.compile(r"kimi-k[2-9](?:[-.\d]|$)", re.IGNORECASE),
+    # DeepSeek-V3/V4/V5+ — 671B+ total.
+    re.compile(r"deepseek-v[3-9](?![\d])", re.IGNORECASE),
+)
+
+
 def _enqueue_policy_passes(c, args) -> tuple[bool, str]:
     """Return (allow, reason_zh) for a candidate. reason_zh is the
     human-readable Chinese reason shown in the enqueue audit log.
@@ -289,6 +314,19 @@ def _enqueue_policy_passes(c, args) -> tuple[bool, str]:
     downloads are still in the dozens) — exactly the models we WANT
     to evaluate first. We already curated the vendor list explicitly,
     so trust their releases regardless of HF velocity counters.
+
+    PR#69: oversize pre-filter — models that would just oversize_skip
+    at ENGINE_SELECT are now rejected at enqueue so we don't waste
+    CURATE's LLM round-trip on them. Two signals:
+      1. _vllm_args_hint on the hf_id alone surfaces tp>pool size
+         for names with explicit B/T markers ("Llama-3.1-405B",
+         "EMO_1b14b_1T"). Reuses the same regex as INV-23 so
+         enqueue and ENGINE_SELECT can't drift.
+      2. _KNOWN_OVERSIZE_HF_PATTERNS covers families whose oversize
+         status isn't visible in the name (Kimi-K2*, DeepSeek-V3+).
+    Even oversize trusted-vendor candidates are filtered — there is
+    no point in keeping a model in queue that we cannot deploy on
+    the eval pool.
     """
     if c.private or c.gated:
         return False, "私有/受限仓库"
@@ -296,11 +334,39 @@ def _enqueue_policy_passes(c, args) -> tuple[bool, str]:
         return False, f"暂不支持的 pipeline_tag={c.pipeline_tag}"
     if c.library_name and c.library_name in _REJECTED_LIBRARIES:
         return False, f"不可运行的 library_name={c.library_name}"
+    oversize, oversize_reason = _is_oversize_for_enqueue(c)
+    if oversize:
+        return False, oversize_reason
     if c.reason in _TRUSTED_REASONS:
         return True, "ok（白名单/手动，跳过 dl/likes 阈值）"
     if (c.downloads or 0) < args.min_downloads and (c.likes or 0) < args.min_likes:
         return False, f"信号过低（dl={c.downloads} likes={c.likes}）"
     return True, "ok"
+
+
+def _is_oversize_for_enqueue(c) -> tuple[bool, str]:
+    """PR#69: pre-flight oversize check used by enqueue.
+
+    Mirrors the ENGINE_SELECT INV-23 gate but runs before any
+    orchestrator work. Returns ``(oversize, reason_zh)``; the second
+    element is the audit-log message shown when the candidate is
+    filtered out.
+    """
+    from orchestrator.config import OrchestratorConfig
+    from orchestrator.stages import _vllm_args_hint
+
+    cfg = OrchestratorConfig()
+    pool_size = max(1, len(cfg.eval_gpus))
+    hint = _vllm_args_hint({"hf_id": c.hf_id})
+    tp = int(hint.get("tensor_parallel_size", 1) or 1)
+    if tp > pool_size:
+        return True, (
+            f"超出测试范围（hf_id 估算 tp={tp} > 评测池={pool_size} 卡）"
+        )
+    for pat in _KNOWN_OVERSIZE_HF_PATTERNS:
+        if pat.search(c.hf_id):
+            return True, "超出测试范围（已知超大模型系列，仅收集信息）"
+    return False, ""
 
 
 def cmd_enqueue(args: argparse.Namespace) -> int:
