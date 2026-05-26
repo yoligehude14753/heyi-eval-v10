@@ -72,6 +72,33 @@ class HappyPathTests(unittest.TestCase):
         r = extract_report(agent_stdout, lane="project", target_id="simonw/llm")
         self.assertIsInstance(r, RunReport)
 
+    def test_markdown_json_codeblock_wrapper_accepted(self) -> None:
+        # Real agents (heyi 2026-05-26 drill, MiniMax-M2.7) wrap the
+        # fenced JSON in a ``` ```json ... ``` `` block even when the
+        # task prompt asks for raw JSON, because their system prompt
+        # biases toward markdown formatting.  Extractor must accept it.
+        payload = _good_payload()
+        wrapped = (
+            f"prelude...\n{FENCE_OPEN}\n"
+            f"```json\n{json.dumps(payload, ensure_ascii=False)}\n```\n"
+            f"{FENCE_CLOSE}\n"
+        )
+        r = extract_report(wrapped, lane="project", target_id="simonw/llm")
+        self.assertIsInstance(r, RunReport)
+        assert isinstance(r, RunReport)
+        self.assertEqual(r.outcome, Outcome.PASS)
+
+    def test_markdown_plain_codeblock_wrapper_accepted(self) -> None:
+        # Some models use plain ``` without a language tag.
+        payload = _good_payload()
+        wrapped = (
+            f"{FENCE_OPEN}\n"
+            f"```\n{json.dumps(payload, ensure_ascii=False)}\n```\n"
+            f"{FENCE_CLOSE}\n"
+        )
+        r = extract_report(wrapped, lane="project", target_id="simonw/llm")
+        self.assertIsInstance(r, RunReport)
+
 
 class MultipleFenceTests(unittest.TestCase):
     """Agent draft-then-revise: write a tentative report, then a final
@@ -135,6 +162,21 @@ class FailureModeTests(unittest.TestCase):
         self.assertIsInstance(r, ExtractError)
         assert isinstance(r, ExtractError)
         self.assertEqual(r.kind, "schema_invalid")
+
+    def test_step_missing_duration_s_accepted_with_default(self) -> None:
+        # Agents routinely omit ``duration_s`` on skip/no-op steps
+        # (heyi 2026-05-26 drill #10: MiniMax-M2.7 emitted 7 steps,
+        # 2 with no duration_s, which used to crash schema validation
+        # and lose the entire run).  Default to 0.0 instead.
+        payload = _good_payload()
+        payload["steps"] = [
+            {"name": "clone", "status": "ok", "duration_s": 5.2},
+            {"name": "smoke_run", "status": "skip"},  # no duration_s
+        ]
+        r = extract_report(_fence(payload), lane="project", target_id="simonw/llm")
+        self.assertIsInstance(r, RunReport)
+        assert isinstance(r, RunReport)
+        self.assertEqual(r.steps[1].duration_s, 0.0)
 
     def test_schema_violation_wrong_type(self) -> None:
         bad = _good_payload()

@@ -118,13 +118,21 @@ def extract_report(
             detail="markers present but body is whitespace-only",
         )
 
+    # Strip an optional ```json ... ``` markdown wrapper.  Real agents
+    # (heyi 2026-05-26 drill with MiniMax-M2.7) consistently wrap the
+    # report in a fenced code block even though our task prompt asks
+    # for raw JSON, because their system-prompt strongly biases toward
+    # markdown.  Rather than fight the model, we accept the wrapper as
+    # long as the fence content parses as JSON.
+    fenced_stripped = _unwrap_markdown_codeblock(fenced)
+
     try:
-        obj = json.loads(fenced)
+        obj = json.loads(fenced_stripped)
     except json.JSONDecodeError as e:
         return ExtractError(
             kind="json_invalid",
             detail=f"{type(e).__name__}: {e.msg} at line {e.lineno} col {e.colno}",
-            raw_excerpt=fenced[:500],
+            raw_excerpt=fenced_stripped[:500],
         )
 
     try:
@@ -157,6 +165,27 @@ def extract_report(
 # ── helpers ───────────────────────────────────────────────────────────────
 
 
+def _unwrap_markdown_codeblock(payload: str) -> str:
+    """If ``payload`` is a ``\u0060\u0060\u0060json ... \u0060\u0060\u0060`` (or plain
+    ``\u0060\u0060\u0060 ... \u0060\u0060\u0060``) markdown code block, return the
+    body; otherwise return ``payload`` unchanged.
+
+    Lenient by design — we want extraction to succeed whenever the JSON
+    is *recoverable*, not only when it's pristine.  Strictness costs
+    eval runs (each takes ~3 minutes of agent time + Yunwu tokens) so
+    being liberal here is the cheap fix.
+    """
+    s = payload.strip()
+    if not s.startswith("```"):
+        return payload
+    nl = s.find("\n")
+    if nl < 0:
+        return payload
+    if not s.endswith("```"):
+        return payload
+    return s[nl + 1 : -3].strip()
+
+
 def _last_fence_payload(raw_stdout: str) -> str | None:
     """Return the body of the LAST ``<<<...>>> ... <<<END>>>`` block.
 
@@ -185,11 +214,15 @@ def _to_report_dataclass(obj: dict[str, Any]) -> RunReport:
     enum coercions cannot fail.
     """
     verdict = Verdict(**obj["verdict"])
+    # ``duration_s`` is optional in the schema because agents routinely
+    # omit it for skip/no-op steps; default to 0.0 so the dataclass
+    # invariant (always a float) holds without forcing a parse error
+    # on otherwise-valid reports.
     steps = [
         Step(
             name=s["name"],
             status=StepStatus(s["status"]),
-            duration_s=float(s["duration_s"]),
+            duration_s=float(s.get("duration_s", 0.0)),
             note=s.get("note", ""),
             stdout_tail=s.get("stdout_tail", ""),
             artifacts=list(s.get("artifacts", [])),

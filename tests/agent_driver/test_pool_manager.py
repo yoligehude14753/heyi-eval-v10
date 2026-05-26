@@ -143,12 +143,17 @@ class PoolManagerLifecycleTests(unittest.TestCase):
         self.assertIsNone(h.run_id)
         self.assertFalse(ws.exists())
 
-    def test_acquire_creates_workspace_chmod_700(self) -> None:
+    def test_acquire_creates_workspace_chmod_755(self) -> None:
+        # 0o755 (not 0o700) so the in-container agent user (uid 1100)
+        # retains rwx via the "other" bits even when the host workspace
+        # is owned by a different uid (typically 1000).  Real-machine
+        # drill on heyi exposed the 0o700 variant as "permission denied
+        # on cd into workspace" — see commit message for details.
         pool = self._make()
         pool.acquire("run-x")
         ws = self.workspace_root / "run-x"
         mode = ws.stat().st_mode & 0o777
-        self.assertEqual(mode, 0o700)
+        self.assertEqual(mode, 0o755)
 
     def test_acquire_spreads_load(self) -> None:
         """First two acquires should pick m2b-1 and m2b-2, not stack
