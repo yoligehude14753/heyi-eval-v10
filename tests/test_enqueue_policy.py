@@ -109,6 +109,65 @@ class PolicyTests(unittest.TestCase):
         allow, _ = _enqueue_policy_passes(c, _args())
         self.assertTrue(allow)
 
+    # ── PR#69: oversize pre-filter at enqueue ─────────────────────────
+
+    def test_oversize_by_hf_id_b_marker_rejected(self):
+        """hf_id with an explicit B marker that implies tp > eval pool
+        (Mistral-Large-3 675B → tp=4 > pool=3) must NOT enter the queue."""
+        c = _cand("mistralai/Mistral-Large-3-675B-Instruct-2512-NVFP4")
+        allow, reason = _enqueue_policy_passes(c, _args())
+        self.assertFalse(allow)
+        self.assertIn("超出测试范围", reason)
+
+    def test_oversize_by_hf_id_t_marker_rejected(self):
+        """1T marker is now recognised (PR#16 _extract_b fix) — enqueue
+        must use the same hint and reject."""
+        c = _cand("allenai/EMO_1b14b_1T")
+        allow, reason = _enqueue_policy_passes(c, _args())
+        self.assertFalse(allow)
+        self.assertIn("超出测试范围", reason)
+
+    def test_oversize_kimi_k2_known_family_rejected(self):
+        """User-reported case: nvidia/Kimi-K2.6-NVFP4 — hf_id has no
+        B/T marker but the family is known to be ~1T. Falls through to
+        the _KNOWN_OVERSIZE_HF_PATTERNS list."""
+        c = _cand("nvidia/Kimi-K2.6-NVFP4")
+        allow, reason = _enqueue_policy_passes(c, _args())
+        self.assertFalse(allow)
+        self.assertIn("已知超大模型", reason)
+
+    def test_oversize_kimi_k2_base_rejected(self):
+        c = _cand("moonshotai/Kimi-K2-Instruct")
+        allow, _reason = _enqueue_policy_passes(c, _args())
+        self.assertFalse(allow)
+
+    def test_oversize_deepseek_v3_family_rejected(self):
+        """DeepSeek-V3 is 671B total → no B in the name but in the
+        known-oversize list. Future V4/V5 covered by the same pattern."""
+        c = _cand("deepseek-ai/DeepSeek-V3")
+        allow, reason = _enqueue_policy_passes(c, _args())
+        self.assertFalse(allow)
+        self.assertIn("已知超大模型", reason)
+
+    def test_small_model_not_oversized(self):
+        """Regression: typical 7B/30B candidates must still pass."""
+        for hf in ("Qwen/Qwen2.5-7B-Instruct",
+                   "microsoft/Dayhoff-3b-UR90-10000",
+                   "google/gemma-3-30B-it"):
+            c = _cand(hf)
+            allow, reason = _enqueue_policy_passes(c, _args())
+            self.assertTrue(allow, f"{hf} unexpectedly rejected: {reason}")
+
+    def test_oversize_overrides_whitelist_trust(self):
+        """Even a vendor-whitelisted candidate must be filtered when
+        oversize — running it would still oversize_skip at ENGINE_SELECT,
+        so we skip the curator round-trip."""
+        c = _cand("moonshotai/Kimi-K2-Instruct", reason="whitelist")
+        allow, reason = _enqueue_policy_passes(c, _args())
+        self.assertFalse(allow,
+                         "oversize must override the whitelist bypass")
+        self.assertIn("超出测试范围", reason)
+
 
 class DedupTests(unittest.TestCase):
 
