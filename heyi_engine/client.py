@@ -114,11 +114,19 @@ class HeyiEngineClient:
         timeout_s: float = 30.0,
         model_cache_ttl_s: float = 60.0,
         api_key: str | None = None,
+        model: str | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout_s = timeout_s
         self.model_cache_ttl_s = model_cache_ttl_s
         self.api_key = api_key
+        # PR#70: explicit model id, used when the upstream serves many
+        # models (e.g. yunwu.ai exposes 541) and ``discover_model()``'s
+        # "first entry wins" heuristic would pick the wrong one. When
+        # set, ``discover_model()`` short-circuits to this value and
+        # never calls /v1/models for routing purposes (health() still
+        # probes /v1/models as a liveness signal).
+        self._explicit_model = model
 
         self._lock = threading.Lock()
         self._cached_model: str | None = None
@@ -149,8 +157,16 @@ class HeyiEngineClient:
         return result
 
     def _probe_models(self) -> HealthResult:
-        """Try /v1/models first, fall back to /models if 404."""
-        urls = [f"{self.base_url}/v1/models", f"{self.base_url}/models"]
+        """Try /v1/models first, fall back to /models if 404.
+
+        PR#70: when ``base_url`` already ends in ``/v1`` (the canonical
+        yunwu form) skip the doubled-``/v1`` URL — we'd 404 on it
+        anyway and noise the operator log.
+        """
+        if self.base_url.endswith("/v1"):
+            urls = [f"{self.base_url}/models"]
+        else:
+            urls = [f"{self.base_url}/v1/models", f"{self.base_url}/models"]
         last_detail: str | None = None
         last_code: int | None = None
         for url in urls:
@@ -224,8 +240,14 @@ class HeyiEngineClient:
     def discover_model(self, *, force_refresh: bool = False) -> str:
         """Return the served model name, refreshing if TTL expired or forced.
 
-        Raises HeyiEngineError when the engine is unreachable.
+        Raises HeyiEngineError when the engine is unreachable. PR#70:
+        when an explicit ``model=`` was passed at construction time
+        (yunwu workflow), use that and skip the /v1/models round-trip
+        — both for performance and because the upstream catalog has
+        too many entries for "first one wins" to be meaningful.
         """
+        if self._explicit_model:
+            return self._explicit_model
         now = time.time()
         with self._lock:
             cached = self._cached_model
@@ -263,7 +285,14 @@ class HeyiEngineClient:
         swaps model on :10814 mid-flight).
         """
         model = self.discover_model()
-        url = f"{self.base_url}/v1/chat/completions"
+        # PR#70: base_url already including /v1 (yunwu form) must not
+        # be doubled. Same hazard llm_judge fixed; HeyiEngineClient
+        # had the identical bug because it shipped before yunwu was a
+        # supported provider.
+        if self.base_url.endswith("/v1"):
+            url = f"{self.base_url}/chat/completions"
+        else:
+            url = f"{self.base_url}/v1/chat/completions"
         payload: dict[str, Any] = {
             "model": model,
             "messages": messages,

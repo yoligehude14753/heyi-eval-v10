@@ -203,6 +203,59 @@ class TestYunwuJudgeProvider(unittest.TestCase):
         self.assertEqual(model, "MiniMax-M2.5")
 
 
+class TestOrchestratorConfigEngineResolver(unittest.TestCase):
+    """PR#70: OrchestratorConfig.engine_url + engine_api_key MUST
+    follow the same provider switch as llm_judge, otherwise curator
+    and showcase talk to a different endpoint than the judge."""
+
+    _ENV_KEYS = (
+        "HEYI_EVAL_JUDGE_PROVIDER",
+        "HEYI_EVAL_JUDGE_MODEL",
+        "HEYI_ENGINE_URL",
+        "HEYI_ENGINE_API_KEY",
+        "YUNWU_BASE_URL",
+        "YUNWU_GENERAL_KEY",
+        "YUNWU_KEY_2",
+    )
+
+    def setUp(self) -> None:
+        self._saved = {k: os.environ.pop(k, None) for k in self._ENV_KEYS}
+
+    def tearDown(self) -> None:
+        for k, v in self._saved.items():
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
+
+    def test_default_routes_to_local_engine(self) -> None:
+        from orchestrator.config import OrchestratorConfig
+        cfg = OrchestratorConfig()
+        self.assertEqual(cfg.engine_url, "http://127.0.0.1:10814")
+        self.assertIsNone(cfg.engine_api_key)
+
+    def test_yunwu_provider_routes_engine_url_too(self) -> None:
+        """Single env switch — must affect curator/showcase too."""
+        os.environ["HEYI_EVAL_JUDGE_PROVIDER"] = "yunwu"
+        os.environ["YUNWU_BASE_URL"] = "https://yunwu.ai/v1"
+        os.environ["YUNWU_GENERAL_KEY"] = "sk-test"
+        from orchestrator.config import OrchestratorConfig
+        cfg = OrchestratorConfig()
+        self.assertEqual(cfg.engine_url, "https://yunwu.ai/v1")
+        self.assertEqual(cfg.engine_api_key, "sk-test")
+
+    def test_curator_config_inherits_resolver(self) -> None:
+        """curator.CuratorConfig.from_env must use the same resolver
+        so a single switch flips the whole stack at once."""
+        os.environ["HEYI_EVAL_JUDGE_PROVIDER"] = "yunwu"
+        os.environ["YUNWU_BASE_URL"] = "https://yunwu.ai/v1"
+        os.environ["YUNWU_GENERAL_KEY"] = "sk-test"
+        from curator.enricher import CuratorConfig
+        cfg = CuratorConfig.from_env()
+        self.assertEqual(cfg.engine_url, "https://yunwu.ai/v1")
+        self.assertEqual(cfg.engine_api_key, "sk-test")
+        self.assertEqual(cfg.engine_model, "MiniMax-M2.7")
+
+
 # ── (3) ENGINE_SELECT oversize gate ─────────────────────────────────────
 
 

@@ -1086,6 +1086,7 @@ def _attempt_agent_repair(
 
     client = HeyiEngineClient(
         base_url=cfg.engine_url, api_key=cfg.engine_api_key,
+        model=getattr(cfg, "judge_model_name", "MiniMax-M2.7"),
     )
 
     proposals_log: list[dict[str, Any]] = []
