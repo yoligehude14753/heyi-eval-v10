@@ -347,17 +347,68 @@ def _stream_and_track(
 
     chunks: list[bytes] = []
     final = budget_guard.check()
-    for chunk in stream_exec(handle, cmd_in_container, workdir):
-        if not chunk:
-            continue
-        chunks.append(chunk)
-        # M1 heuristic: 1 token ≈ 3 chars of utf-8. Cheap, monotone.
-        # M2 replaces this with a ccr-log tailer reading the true usage.
-        approx_out_tokens = max(1, len(chunk) // 3)
-        budget_guard.note_tokens(input_tokens=0, output_tokens=approx_out_tokens)
-        final = budget_guard.check()
-        if final.decision is not BudgetDecision.OK:
-            break
+
+    # PR#73: when the upstream model 429-storms (yunwu Claude Code Router
+    # transparently retries on transient errors), claude's stdout can be
+    # silent for the full retry window — observed on heyi 2026-05-26 with
+    # claude-user/mcp-builder where the run sat at ``agent_run`` for 30+
+    # minutes despite ``wall_clock_s=900``.  The old loop only checked
+    # ``budget_guard.check()`` between chunks; with no chunks, no check.
+    #
+    # Fix: a watchdog thread polls ``budget_guard.check()`` every
+    # ``WATCHDOG_POLL_S`` and, on a breach, calls
+    # ``handle.kill_agent_process()`` to unblock the docker-exec stream.
+    # ``make_docker_stream_exec`` installs that callback on the handle;
+    # tests inject their own via ``ContainerHandle.kill_agent_process``.
+    import os
+    import threading
+    # PR#73: poll period for the wall-clock watchdog.  Default 15s is
+    # short enough that a 900s wall-clock cap is detected within 2% of
+    # budget; tests override via env to keep CI under 1s.
+    WATCHDOG_POLL_S = float(os.environ.get("HEYI_EVAL_WATCHDOG_POLL_S", "15.0"))
+    budget_breached_box: list[BudgetCheck | None] = [None]
+    stop_watchdog = threading.Event()
+
+    def _watchdog() -> None:
+        while not stop_watchdog.wait(WATCHDOG_POLL_S):
+            check = budget_guard.check()
+            if check.decision is not BudgetDecision.OK:
+                budget_breached_box[0] = check
+                killer = getattr(handle, "kill_agent_process", None)
+                if callable(killer):
+                    try:
+                        killer()
+                    except Exception:
+                        log.exception(
+                            "watchdog kill_agent_process failed run_id=%s",
+                            run_id,
+                        )
+                return
+
+    watchdog_thread = threading.Thread(
+        target=_watchdog, name=f"budget-watchdog-{run_id}", daemon=True,
+    )
+    watchdog_thread.start()
+
+    try:
+        for chunk in stream_exec(handle, cmd_in_container, workdir):
+            if budget_breached_box[0] is not None:
+                final = budget_breached_box[0]
+                break
+            if not chunk:
+                continue
+            chunks.append(chunk)
+            approx_out_tokens = max(1, len(chunk) // 3)
+            budget_guard.note_tokens(input_tokens=0, output_tokens=approx_out_tokens)
+            final = budget_guard.check()
+            if final.decision is not BudgetDecision.OK:
+                break
+    finally:
+        stop_watchdog.set()
+        watchdog_thread.join(timeout=2.0)
+
+    if budget_breached_box[0] is not None and final.decision is BudgetDecision.OK:
+        final = budget_breached_box[0]
 
     return b"".join(chunks).decode("utf-8", errors="replace"), final
 
@@ -402,6 +453,24 @@ def make_docker_stream_exec(
         handle: ContainerHandle, command: list[str], workdir: str,
     ) -> Iterable[bytes]:
         container = docker_client.containers.get(handle.name)
+
+        # PR#73: install a watchdog hook so the budget-guard thread can
+        # unblock the docker-exec stream on wall-clock breach. We pkill
+        # the claude process inside the container (not the python proc
+        # we're sitting inside); ccr can survive because pkill matches
+        # ``claude --print``, not ``ccr start``.
+        def _kill_agent_process() -> None:
+            try:
+                container.exec_run(
+                    cmd=["sh", "-c", "pkill -TERM -f 'claude --print' || true"],
+                    user="root",
+                    detach=True,
+                )
+            except Exception:
+                pass
+
+        handle.kill_agent_process = _kill_agent_process
+
         exec_result = container.exec_run(
             cmd=command,
             workdir=workdir,
