@@ -5,6 +5,8 @@
 > · 红线清单（INV-1..INV-23）见 [`INVARIANTS.md`](INVARIANTS.md)
 > · 操作手册见 [`USAGE.md`](USAGE.md) 与 [`RUNBOOK_NV8.md`](RUNBOOK_NV8.md)
 > · 早期 PR 测试计划与报告已归档至 [`_archive/`](_archive/)，仅作审计参考，不作为现状描述
+>
+> **三 lane 扩展（设计中，未落地）**：本文档描述的是现有 model_lane（11-stage HF 模型评测）。新增 project_lane（M2.7 部署 GitHub trending 项目）+ skill_lane（M2.7 加载 SKILL.md）的设计提案见 [`ARCHITECTURE_LANES.md`](ARCHITECTURE_LANES.md) / [`INVARIANTS_LANES.md`](INVARIANTS_LANES.md) / [`TEST_PLAN_LANES.md`](TEST_PLAN_LANES.md)。本文档保持 v10 现状不动，等三 lane 扩展 M1-M3 落地后再合并描述。
 
 ---
 
