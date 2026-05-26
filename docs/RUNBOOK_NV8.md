@@ -723,6 +723,31 @@ export HEYI_ENGINE_URL=http://<NV8_TAILNET_IP>:10814
 export HEYI_EVAL_JUDGE_MODEL=MiniMax-M2.7
 ```
 
+#### 15.1.1 切到云雾(yunwu)作为 judge provider — PR#68
+
+当本机 prod_engine 容器繁忙、暂离线、或操作员希望降低本地负载时,可以把
+LLM-judge 切到云雾的 OpenAI 兼容 endpoint(同样支持 `MiniMax-M2.7` 这个
+model id,经 `curl https://yunwu.ai/v1/models` 验证)。三个环境变量即可:
+
+```bash
+export HEYI_EVAL_JUDGE_PROVIDER=yunwu
+export YUNWU_BASE_URL=https://yunwu.ai/v1
+export YUNWU_GENERAL_KEY=sk-...           # 从 ~/.yoli.env 取
+# HEYI_EVAL_JUDGE_MODEL 不必设,默认 MiniMax-M2.7 与云雾 id 完全一致
+```
+
+在 nv8 上的常驻配置写到 `/etc/heyi-eval-v10/env`,改完执行
+`sudo systemctl restart heyi-eval-orchestrator.service` 让 systemd 重读。
+关键不变量:
+
+- INV-14 仍生效 — judge 只接收 EVAL 产物字节,不传测试 prompt。云雾换的
+  只是承载 M2.7 的物理 endpoint,不是 trust domain。
+- URL 拼接已做幂等处理:`/v1` 既可写也可不写,绝不会出现历史 bug 里那种
+  `/v1/v1/chat/completions` 的双拼。回归用例 `TestYunwuJudgeProvider` 守
+  着这条边界。
+- 兜底链:`YUNWU_GENERAL_KEY` → `YUNWU_KEY_2` → `YUNWU_GPT_KEY`。任一非空
+  即用,避免单 key 限流时操作员要改源码。
+
 ### 15.2 评估池切换(操作员视角)
 
 ```bash

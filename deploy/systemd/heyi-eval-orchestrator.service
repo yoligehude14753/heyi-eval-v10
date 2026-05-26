@@ -12,6 +12,10 @@ User=ai
 Group=ai
 WorkingDirectory=/home/ai/heyi-eval-v10
 EnvironmentFile=-/etc/heyi-eval-v10/env
+# PR#68: also load the operator's home-dir env (yunwu keys, HF tokens,
+# ai-hub cross-IDE secrets). Optional — `-` prefix so the unit still
+# starts on hosts without it.
+EnvironmentFile=-/home/ai/.yoli.env
 # heyi_engine readiness is gated INSIDE the loop (_engine_preflight_gate);
 # don't tie systemd start order to it — the engine is user-managed and may
 # bounce independently.

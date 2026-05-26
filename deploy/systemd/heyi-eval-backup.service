@@ -11,6 +11,7 @@ User=ai
 Group=ai
 WorkingDirectory=/home/ai/heyi-eval-v10
 EnvironmentFile=-/etc/heyi-eval-v10/env
+EnvironmentFile=-/home/ai/.yoli.env
 # Hard-cap one snapshot pass. take_snapshot uses 1h internally; this is the
 # systemd-side belt-and-suspenders so a hung rsync doesn't block the next timer.
 TimeoutStartSec=3600

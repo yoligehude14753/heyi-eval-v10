@@ -14,6 +14,7 @@ User=ai
 Group=ai
 WorkingDirectory=/home/ai/heyi-eval-v10
 EnvironmentFile=-/etc/heyi-eval-v10/env
+EnvironmentFile=-/home/ai/.yoli.env
 Environment=PYTHONUNBUFFERED=1
 Environment=HEYI_EVAL_DATA=/home/ai/heyi-eval-data
 Environment=HF_ENDPOINT=https://hf-mirror.com

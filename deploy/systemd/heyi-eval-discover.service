@@ -12,6 +12,7 @@ User=ai
 Group=ai
 WorkingDirectory=/home/ai/heyi-eval-v10
 EnvironmentFile=-/etc/heyi-eval-v10/env
+EnvironmentFile=-/home/ai/.yoli.env
 Environment=PYTHONUNBUFFERED=1
 Environment=HF_ENDPOINT=https://hf-mirror.com
 # `discover` is a package, must invoke the CLI module directly (PR#30 fix).

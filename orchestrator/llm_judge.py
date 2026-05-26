@@ -67,22 +67,64 @@ def _encode_image_data_url(path: Path) -> str:
 # ── default judge call: HeyiEngineClient with image in user message ────────
 
 
-def _default_judge_call(prompt: str, image_data_url: str) -> str:
-    """Send a vision chat completion to heyi_engine and return text.
+def _resolve_judge_endpoint() -> tuple[str, str | None, str]:
+    """Resolve (chat_completions_url, api_key, model_name) for the
+    judge call.
 
-    Uses ``urllib`` directly (instead of HeyiEngineClient.call which
-    is text-only) because the client doesn't yet expose a multi-content
-    message helper.
+    PR#68: the judge can now be served by an external OpenAI-compatible
+    provider (e.g. yunwu.ai), not just the local prod_engine container.
+    Two env-driven switches:
+
+      - ``HEYI_EVAL_JUDGE_PROVIDER=yunwu`` is a shorthand that maps to
+        ``YUNWU_BASE_URL`` + ``YUNWU_GENERAL_KEY`` from ``~/.yoli.env``
+        with MiniMax-M2.7 as the default model.
+      - Otherwise the historical ``HEYI_ENGINE_URL`` / ``HEYI_ENGINE_API_KEY``
+        path is preserved (default: local 127.0.0.1:10814 prod_engine).
+
+    Both branches share the same model-id default (``MiniMax-M2.7``) and
+    both correctly handle a base url that already ends in ``/v1`` (so
+    ``https://yunwu.ai/v1`` no longer gets doubled to
+    ``https://yunwu.ai/v1/v1/chat/completions``).
     """
     import os
 
-    base = os.environ.get("HEYI_ENGINE_URL", "http://127.0.0.1:10814")
-    api_key = os.environ.get("HEYI_ENGINE_API_KEY")
+    provider = (os.environ.get("HEYI_EVAL_JUDGE_PROVIDER") or "").strip().lower()
+    if provider == "yunwu":
+        base = os.environ.get("YUNWU_BASE_URL", "https://yunwu.ai/v1")
+        api_key = (
+            os.environ.get("YUNWU_GENERAL_KEY")
+            or os.environ.get("YUNWU_KEY_2")
+            or os.environ.get("YUNWU_GPT_KEY")
+        )
+    else:
+        base = os.environ.get("HEYI_ENGINE_URL", "http://127.0.0.1:10814")
+        api_key = os.environ.get("HEYI_ENGINE_API_KEY")
+    base = base.rstrip("/")
+    if base.endswith("/v1"):
+        url = f"{base}/chat/completions"
+    else:
+        url = f"{base}/v1/chat/completions"
     # PR#23: pin model name. M2.7 vLLM serves "MiniMax-M2.7"; the
     # previous "auto" hack only worked because vLLM happens to route
     # unknown names to the first served model. Per
     # rules/42-heyi-m27-api.md the contract is the literal string.
+    # Yunwu also exposes the model under the exact id "MiniMax-M2.7".
     judge_model = os.environ.get("HEYI_EVAL_JUDGE_MODEL", "MiniMax-M2.7")
+    return url, api_key, judge_model
+
+
+def _default_judge_call(prompt: str, image_data_url: str) -> str:
+    """Send a vision chat completion to the configured judge and
+    return text.
+
+    Uses ``urllib`` directly (instead of HeyiEngineClient.call which
+    is text-only) because the client doesn't yet expose a multi-content
+    message helper. The endpoint, key and model are resolved by
+    ``_resolve_judge_endpoint`` so the same code path serves both the
+    local prod_engine container and external OpenAI-compatible
+    providers (e.g. yunwu).
+    """
+    url, api_key, judge_model = _resolve_judge_endpoint()
     body = json.dumps({
         "model": judge_model,
         "messages": [{
@@ -99,8 +141,7 @@ def _default_judge_call(prompt: str, image_data_url: str) -> str:
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(
-        f"{base.rstrip('/')}/v1/chat/completions",
-        data=body, headers=headers, method="POST",
+        url, data=body, headers=headers, method="POST",
     )
     with urllib.request.urlopen(req, timeout=60.0) as r:
         raw = r.read().decode("utf-8", errors="replace")

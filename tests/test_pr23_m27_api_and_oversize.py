@@ -124,6 +124,85 @@ class TestJudgeModelName(unittest.TestCase):
         self.assertNotIn("'model': 'auto'", src)
 
 
+# ── (2b) PR#68: yunwu provider + base-url robustness ──────────────────────
+
+
+class TestYunwuJudgeProvider(unittest.TestCase):
+    """PR#68: ``HEYI_EVAL_JUDGE_PROVIDER=yunwu`` switches the judge to
+    yunwu.ai's OpenAI-compatible endpoint without touching the local
+    prod_engine container.
+    """
+
+    _ENV_KEYS = (
+        "HEYI_EVAL_JUDGE_PROVIDER",
+        "HEYI_ENGINE_URL",
+        "HEYI_ENGINE_API_KEY",
+        "HEYI_EVAL_JUDGE_MODEL",
+        "YUNWU_BASE_URL",
+        "YUNWU_GENERAL_KEY",
+        "YUNWU_KEY_2",
+        "YUNWU_GPT_KEY",
+    )
+
+    def setUp(self) -> None:
+        self._saved = {k: os.environ.pop(k, None) for k in self._ENV_KEYS}
+
+    def tearDown(self) -> None:
+        for k, v in self._saved.items():
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
+
+    def test_default_provider_uses_heyi_engine(self) -> None:
+        # No provider set → preserve historical behaviour.
+        url, key, model = llm_judge._resolve_judge_endpoint()
+        self.assertEqual(url, "http://127.0.0.1:10814/v1/chat/completions")
+        self.assertIsNone(key)
+        self.assertEqual(model, "MiniMax-M2.7")
+
+    def test_yunwu_provider_routes_to_yunwu(self) -> None:
+        os.environ["HEYI_EVAL_JUDGE_PROVIDER"] = "yunwu"
+        os.environ["YUNWU_BASE_URL"] = "https://yunwu.ai/v1"
+        os.environ["YUNWU_GENERAL_KEY"] = "sk-test-yunwu"
+        url, key, model = llm_judge._resolve_judge_endpoint()
+        # PR#68 bug fix: base already ends in /v1, must NOT double it.
+        self.assertEqual(url, "https://yunwu.ai/v1/chat/completions")
+        self.assertEqual(key, "sk-test-yunwu")
+        self.assertEqual(model, "MiniMax-M2.7")
+
+    def test_yunwu_falls_back_through_keys(self) -> None:
+        os.environ["HEYI_EVAL_JUDGE_PROVIDER"] = "yunwu"
+        os.environ["YUNWU_KEY_2"] = "sk-k2"
+        url, key, _model = llm_judge._resolve_judge_endpoint()
+        self.assertEqual(key, "sk-k2")
+        self.assertIn("yunwu.ai", url)
+
+    def test_base_url_without_v1_suffix_appends_v1(self) -> None:
+        # Local prod_engine container exposes the base without /v1.
+        # The historical default has always pinned /v1/chat/completions.
+        os.environ["HEYI_ENGINE_URL"] = "http://127.0.0.1:10814"
+        url, _key, _model = llm_judge._resolve_judge_endpoint()
+        self.assertEqual(url, "http://127.0.0.1:10814/v1/chat/completions")
+
+    def test_base_url_trailing_slash_normalised(self) -> None:
+        os.environ["HEYI_ENGINE_URL"] = "http://127.0.0.1:10814/"
+        url, _key, _model = llm_judge._resolve_judge_endpoint()
+        self.assertEqual(url, "http://127.0.0.1:10814/v1/chat/completions")
+
+    def test_explicit_v1_in_base_not_doubled(self) -> None:
+        # Real production hazard: someone copies the yunwu base URL
+        # ("https://yunwu.ai/v1") into HEYI_ENGINE_URL directly.
+        # Pre-PR#68 code would call /v1/v1/chat/completions and 404.
+        os.environ["HEYI_ENGINE_URL"] = "https://example.com/v1"
+        url, _key, _model = llm_judge._resolve_judge_endpoint()
+        self.assertEqual(url, "https://example.com/v1/chat/completions")
+
+    def test_judge_model_env_override(self) -> None:
+        os.environ["HEYI_EVAL_JUDGE_MODEL"] = "MiniMax-M2.5"
+        _url, _key, model = llm_judge._resolve_judge_endpoint()
+        self.assertEqual(model, "MiniMax-M2.5")
+
+
 # ── (3) ENGINE_SELECT oversize gate ─────────────────────────────────────
 
 
@@ -287,6 +366,81 @@ class TestVllmArgsHintTpHeuristic(unittest.TestCase):
         # old "no information" behaviour).
         h = self._hint()
         self.assertNotIn("tensor_parallel_size", h)
+
+    # ── PR#68: trillion-unit ("1T") + MoE max-match regression ──
+    # Real failure on nv8 (2026-05-25): moonshotai/Kimi-K2-Instruct
+    # had param_count="1T" (curator inferred from model card). The
+    # old regex only matched `\d+b\b` so 1T was silently dropped,
+    # tp defaulted to 1, INV-23 missed it, and the run wasted 28
+    # minutes of bandwidth before STAGE_MODEL crashed mid-download.
+
+    def test_param_count_1t_is_treated_as_1000b(self) -> None:
+        # 1T = 1 trillion = 1000B → tp=4 → oversize gate trips.
+        h = self._hint(param_count="1T")
+        self.assertEqual(h["tensor_parallel_size"], 4)
+
+    def test_param_count_1_5t_is_1500b(self) -> None:
+        h = self._hint(param_count="1.5T")
+        self.assertEqual(h["tensor_parallel_size"], 4)
+
+    def test_hf_id_emo_1b14b_1t_uses_max_match_for_total_params(self) -> None:
+        # The "1b14b_1T" naming reports active 1.14B / total 1T.
+        # First-match (the old behaviour) would pick "1b" and treat
+        # this as a 1B model. Max-match correctly picks the total
+        # (1T → 1000B) so the oversize gate trips.
+        h = self._hint(hf_id="allenai/EMO_1b14b_1T")
+        self.assertEqual(h["tensor_parallel_size"], 4)
+
+    def test_hf_id_stdmoe_1b14b_130b_uses_max_match(self) -> None:
+        h = self._hint(hf_id="allenai/StdMoE_1b14b_130B")
+        # max(1, 14, 130) = 130 → tp=4
+        self.assertEqual(h["tensor_parallel_size"], 4)
+
+    def test_kimi_k2_with_curator_1t_extracts_1000b(self) -> None:
+        # Real curator output we observed on nv8: param_count="1T",
+        # hf_id has no B/T marker. The trillion-unit fix is what
+        # turns this into tp=4.
+        h = self._hint(
+            param_count="1T",
+            hf_id="moonshotai/Kimi-K2-Instruct",
+        )
+        self.assertEqual(h["tensor_parallel_size"], 4)
+
+    def test_moe_first_token_smaller_still_wins_via_max(self) -> None:
+        # Regression guard for the docstring promise: when the model
+        # name embeds both active and total params, the larger number
+        # wins. The pre-PR#68 docstring said "first match wins" but
+        # the real intent is "biggest number wins" (which happens to
+        # be first for "MoE-236.5B-A21B" but last for "1b14b_1T").
+        h = self._hint(param_count="MoE-236.5B-A21B")
+        self.assertEqual(h["tensor_parallel_size"], 4)
+
+
+class TestOversizeGateTrillion(unittest.TestCase):
+    """End-to-end check: a curator output of param_count='1T' must
+    drive _execute_engine_select_stage to oversize_skip so we never
+    even attempt STAGE_MODEL.
+    """
+
+    def setUp(self) -> None:
+        self._td = TemporaryDirectory()
+        self.tmp = Path(self._td.name)
+        self._saved_eval = os.environ.pop("HEYI_EVAL_EVAL_GPUS", None)
+
+    def tearDown(self) -> None:
+        if self._saved_eval is not None:
+            os.environ["HEYI_EVAL_EVAL_GPUS"] = self._saved_eval
+        self._td.cleanup()
+
+    def test_kimi_k2_instruct_1t_aborts_at_engine_select(self) -> None:
+        run, cfg = _make_run_with_metadata(self.tmp, param_count="1T")
+        result = _execute_engine_select_stage(run, cfg)
+        self.assertFalse(result.ok, "1T must trigger oversize abort")
+        self.assertEqual(result.error_kind, "oversize_skip")
+        self.assertEqual(result.extra.get("tp_size"), 4)
+        plan = json.loads((cfg.run_dir("rs1") / "_meta" / "engine.json").read_text())
+        self.assertEqual(plan["engine"], "metadata_only")
+        self.assertTrue(plan["oversize"])
 
 
 class TestEngineSelectArtifactShape(unittest.TestCase):
