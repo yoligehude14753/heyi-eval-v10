@@ -26,6 +26,35 @@ def _env_path(name: str, default: str) -> Path:
     return Path(os.environ.get(name, default)).expanduser()
 
 
+def _resolve_engine_endpoint() -> tuple[str, str | None]:
+    """PR#70: single source of truth for *the LLM endpoint that curator,
+    showcase, deploy_repair and llm_judge all talk to*.
+
+    When ``HEYI_EVAL_JUDGE_PROVIDER=yunwu`` the four call sites all
+    switch together to yunwu.ai's OpenAI-compatible endpoint. That
+    means a single ``HEYI_EVAL_JUDGE_PROVIDER=yunwu`` line in the
+    operator's environment file is enough to take the local
+    prod_engine container (e.g. minimax on :10814) out of the loop —
+    nothing in orchestrator's hot path needs the local GPUs back.
+
+    Falls back to the historical ``HEYI_ENGINE_URL`` / ``HEYI_ENGINE_API_KEY``
+    pair (default: local 127.0.0.1:10814) so existing deployments
+    don't change behaviour until the provider switch is set.
+    """
+    provider = (os.environ.get("HEYI_EVAL_JUDGE_PROVIDER") or "").strip().lower()
+    if provider == "yunwu":
+        return (
+            os.environ.get("YUNWU_BASE_URL", "https://yunwu.ai/v1"),
+            os.environ.get("YUNWU_GENERAL_KEY")
+            or os.environ.get("YUNWU_KEY_2")
+            or os.environ.get("YUNWU_GPT_KEY"),
+        )
+    return (
+        os.environ.get("HEYI_ENGINE_URL", "http://127.0.0.1:10814"),
+        os.environ.get("HEYI_ENGINE_API_KEY"),
+    )
+
+
 def _parse_gpu_tuple(env_name: str, default: tuple[int, ...]) -> tuple[int, ...]:
     """Parse a comma-separated GPU index list from an env var.
 
@@ -80,8 +109,16 @@ class OrchestratorConfig:
     #   (B) Tailscale       http://<NV8_TAILNET_IP>:10814
     #   (C) trycloudflare   read /home/ai/cf-m27-url.txt (URL is dynamic)
     # When you're on the mac dev box, export HEYI_ENGINE_URL to (B) or (C).
-    engine_url: str = os.environ.get("HEYI_ENGINE_URL", "http://127.0.0.1:10814")
-    engine_api_key: str | None = os.environ.get("HEYI_ENGINE_API_KEY")
+    #
+    # PR#70: with ``HEYI_EVAL_JUDGE_PROVIDER=yunwu`` set, ``engine_url``
+    # and ``engine_api_key`` resolve to yunwu.ai automatically — curator,
+    # showcase, deploy_repair and llm_judge all switch together, so the
+    # local prod_engine container can be stopped to free GPUs for the
+    # eval pool. See ``_resolve_engine_endpoint``.
+    engine_url: str = field(default_factory=lambda: _resolve_engine_endpoint()[0])
+    engine_api_key: str | None = field(
+        default_factory=lambda: _resolve_engine_endpoint()[1]
+    )
     # PR#23: pin the model name. M2.7 vLLM serves model
     # "MiniMax-M2.7" and previously llm_judge.py hard-coded "auto"
     # (which vLLM accepts as "first registered model" but breaks the

@@ -275,6 +275,83 @@ class EdgeTests(unittest.TestCase):
             self.assertEqual(c.discover_model(), "primary")
 
 
+class Pr70YunwuClientTests(unittest.TestCase):
+    """PR#70: HeyiEngineClient must support yunwu-style base URLs
+    (``https://yunwu.ai/v1`` with the /v1 already in it) and an
+    explicit ``model=`` constructor arg so discover_model() doesn't
+    pick a random entry off a 541-model catalog.
+    """
+
+    def test_base_url_with_v1_suffix_does_not_double_in_chat(self) -> None:
+        """The historical bug: ``base + '/v1/chat/completions'`` →
+        ``/v1/v1/chat/completions`` and 404. PR#70 collapses the join."""
+        c = HeyiEngineClient(
+            base_url="https://yunwu.ai/v1", model="MiniMax-M2.7",
+        )
+        captured: dict = {}
+        with mock.patch("urllib.request.urlopen") as op:
+            def _capture(req, timeout=None):
+                captured["url"] = req.full_url
+                return _fake_response(_chat_payload("ok"))
+            op.side_effect = _capture
+            c.call(messages=[{"role": "user", "content": "hi"}], max_tokens=10)
+        self.assertEqual(captured["url"],
+                         "https://yunwu.ai/v1/chat/completions",
+                         "/v1 must NOT be doubled when base_url already ends in /v1")
+
+    def test_base_url_with_v1_suffix_does_not_double_in_health(self) -> None:
+        c = HeyiEngineClient(base_url="https://yunwu.ai/v1")
+        captured: list[str] = []
+        with mock.patch("urllib.request.urlopen") as op:
+            def _capture(req, timeout=None):
+                captured.append(req.full_url)
+                return _fake_response(_models_payload("MiniMax-M2.7"))
+            op.side_effect = _capture
+            h = c.health()
+        self.assertTrue(h.ok)
+        self.assertEqual(captured, ["https://yunwu.ai/v1/models"])
+
+    def test_explicit_model_short_circuits_discover(self) -> None:
+        """Constructor ``model=`` arg must skip /v1/models entirely
+        when used. Critical when upstream serves hundreds of models
+        (yunwu.ai returns 541)."""
+        c = HeyiEngineClient(
+            base_url="https://yunwu.ai/v1", model="MiniMax-M2.7",
+        )
+        # No mock on urlopen for models — if discover_model() touches
+        # the network we'd see a real request and crash.
+        self.assertEqual(c.discover_model(), "MiniMax-M2.7")
+
+    def test_explicit_model_used_in_chat_payload(self) -> None:
+        c = HeyiEngineClient(
+            base_url="https://yunwu.ai/v1", model="MiniMax-M2.7",
+        )
+        captured: dict = {}
+        with mock.patch("urllib.request.urlopen") as op:
+            def _capture(req, timeout=None):
+                captured["body"] = json.loads(req.data.decode("utf-8"))
+                return _fake_response(_chat_payload("ok"))
+            op.side_effect = _capture
+            c.call(messages=[{"role": "user", "content": "x"}], max_tokens=10)
+        self.assertEqual(captured["body"]["model"], "MiniMax-M2.7")
+
+    def test_local_base_url_unchanged(self) -> None:
+        """Regression: existing 127.0.0.1:10814 deployments must keep
+        the historical ``/v1/chat/completions`` join."""
+        c = HeyiEngineClient(
+            base_url="http://127.0.0.1:10814", model="MiniMax-M2.7",
+        )
+        captured: dict = {}
+        with mock.patch("urllib.request.urlopen") as op:
+            def _capture(req, timeout=None):
+                captured["url"] = req.full_url
+                return _fake_response(_chat_payload("ok"))
+            op.side_effect = _capture
+            c.call(messages=[{"role": "user", "content": "x"}], max_tokens=10)
+        self.assertEqual(captured["url"],
+                         "http://127.0.0.1:10814/v1/chat/completions")
+
+
 class HealthResultReprTests(unittest.TestCase):
     """Misc: HealthResult / CallResult are well-formed dataclasses."""
 

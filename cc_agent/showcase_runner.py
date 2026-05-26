@@ -574,8 +574,11 @@ def execute_showcase(
     if eval_http is None:
         eval_http = _cap._http_post_chat
     if plan_client is None:
+        # PR#70: pin model so showcase doesn't trip the 541-model
+        # discover-first heuristic when running against yunwu.
         plan_client = HeyiEngineClient(
             base_url=cfg.engine_url, api_key=cfg.engine_api_key,
+            model=cfg.judge_model_name,
         )
     if grade_client is None:
         grade_client = plan_client

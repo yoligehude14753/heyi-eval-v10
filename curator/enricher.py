@@ -285,10 +285,20 @@ def _sanitize_capability_tags(raw: Any) -> list[str]:
 
 @dataclass
 class CuratorConfig:
-    # heyi_engine endpoint. The client auto-discovers the model name from
-    # /v1/models so we never hardcode it here.
+    # heyi_engine endpoint. PR#70: ``engine_model`` is the pinned model
+    # id sent to chat completions. When the operator switches the
+    # provider (env ``HEYI_EVAL_JUDGE_PROVIDER=yunwu``) the engine_url
+    # / api_key / model triple all resolve together via
+    # ``OrchestratorConfig._resolve_engine_endpoint``, so we never need
+    # ``HeyiEngineClient.discover_model()``'s "first entry wins"
+    # heuristic against a 500-model catalog.
     engine_url: str = "http://127.0.0.1:10814"
     engine_api_key: str | None = None
+    # Default None preserves the historical auto-discover behaviour
+    # for ad-hoc test constructors. ``from_env()`` always pins a
+    # specific model id so production never sees a 541-entry
+    # discover surprise.
+    engine_model: str | None = None
     engine_client: HeyiEngineClient | None = field(default=None, repr=False)
     hf_endpoint: str = "https://hf-mirror.com"
     max_card_chars: int = DEFAULT_MAX_CARD_CHARS
@@ -298,9 +308,14 @@ class CuratorConfig:
 
     @classmethod
     def from_env(cls) -> CuratorConfig:
+        # PR#70: delegate to OrchestratorConfig so curator and the rest
+        # of the stack share one resolver and one provider switch.
+        from orchestrator.config import _resolve_engine_endpoint
+        engine_url, engine_api_key = _resolve_engine_endpoint()
         return cls(
-            engine_url=os.environ.get("HEYI_ENGINE_URL", "http://127.0.0.1:10814"),
-            engine_api_key=os.environ.get("HEYI_ENGINE_API_KEY"),
+            engine_url=engine_url,
+            engine_api_key=engine_api_key,
+            engine_model=os.environ.get("HEYI_EVAL_JUDGE_MODEL", "MiniMax-M2.7"),
             hf_endpoint=os.environ.get("HF_ENDPOINT", "https://hf-mirror.com"),
             max_card_chars=int(os.environ.get("HEYI_EVAL_CARD_MAX_CHARS",
                                               str(DEFAULT_MAX_CARD_CHARS))),
@@ -308,12 +323,18 @@ class CuratorConfig:
         )
 
     def get_or_create_client(self) -> HeyiEngineClient:
-        """Return the bound client, creating one on demand."""
+        """Return the bound client, creating one on demand.
+
+        PR#70: pass ``model=self.engine_model`` so the client doesn't
+        rely on ``discover_model()``'s ``data[0].id`` heuristic, which
+        is meaningless on multi-model providers (yunwu lists 541).
+        """
         if self.engine_client is None:
             self.engine_client = HeyiEngineClient(
                 base_url=self.engine_url,
                 timeout_s=self.engine_timeout_s,
                 api_key=self.engine_api_key,
+                model=self.engine_model,
             )
         return self.engine_client
 
