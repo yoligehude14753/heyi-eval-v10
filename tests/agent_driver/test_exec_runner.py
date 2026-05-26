@@ -306,6 +306,68 @@ class SadPathTests(unittest.TestCase):
             )
             self.assertEqual(result.report.outcome, Outcome.TIMEOUT)
 
+    def test_pr73_silent_stream_watchdog_kills_run(self) -> None:
+        """PR#73 regression: when the stream blocks indefinitely (e.g.
+        yunwu 429 storm makes claude print nothing for the entire wall
+        clock window), the budget-guard watchdog must call
+        ``handle.kill_agent_process`` so the run lands as TIMEOUT
+        instead of hanging forever.
+
+        Mechanism under test:
+          1. ``_stream_and_track`` starts a watchdog thread that polls
+             ``budget_guard.check()`` every ``HEYI_EVAL_WATCHDOG_POLL_S``
+             seconds (default 15s, overridable for tests via env).
+          2. On breach, it calls ``handle.kill_agent_process()`` (which
+             prod wires to ``pkill claude`` inside the container) AND
+             stores the breach so the streaming for-loop sees it.
+        """
+        import os as _os
+        import threading
+        import time as _t
+        from agent_driver.exec_runner import _stream_and_track
+        from agent_driver.pool_manager import ContainerHandle
+
+        prev_poll = _os.environ.get("HEYI_EVAL_WATCHDOG_POLL_S")
+        _os.environ["HEYI_EVAL_WATCHDOG_POLL_S"] = "0.1"
+        try:
+            release_stream = threading.Event()
+            killed_box = {"hit": False}
+
+            def fake_stream(handle, command, workdir):  # type: ignore[no-untyped-def]
+                def _killer() -> None:
+                    killed_box["hit"] = True
+                    release_stream.set()
+                handle.kill_agent_process = _killer
+                released = release_stream.wait(timeout=5.0)
+                if not released:
+                    raise RuntimeError("watchdog never killed the stream")
+                return
+                yield b""  # pragma: no cover
+
+            handle = ContainerHandle(
+                name="fake", workspace_root_in_container="/tmp",
+            )
+            # wall_clock_s = 0.2; watchdog polls every 0.1s; so within
+            # ~0.3s the watchdog fires.
+            guard = BudgetGuard(token_budget=999_999, wall_clock_s=0.2)
+            _t.sleep(0.01)
+
+            stdout, final = _stream_and_track(
+                handle, "run-pr73", fake_stream, guard,
+            )
+
+            self.assertTrue(
+                killed_box["hit"],
+                "watchdog should have called handle.kill_agent_process",
+            )
+            self.assertEqual(final.decision.value, "exceeded_wall_clock")
+            self.assertEqual(stdout, "")
+        finally:
+            if prev_poll is None:
+                _os.environ.pop("HEYI_EVAL_WATCHDOG_POLL_S", None)
+            else:
+                _os.environ["HEYI_EVAL_WATCHDOG_POLL_S"] = prev_poll
+
 
 # ── pool teardown invariants ──────────────────────────────────────────────
 

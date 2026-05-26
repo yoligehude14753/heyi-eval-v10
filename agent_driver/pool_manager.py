@@ -59,6 +59,11 @@ class ContainerHandle:
     run_count: int = 0
     booted_at_monotonic: float = field(default_factory=time.monotonic)
     run_id: str | None = None  # None = idle
+    # PR#73: callable installed by ``make_docker_stream_exec`` so the
+    # exec_runner watchdog can ``docker exec ... pkill claude`` on a
+    # wall-clock breach and unblock the streaming generator.  Optional
+    # because unit tests use fakes that don't need a real kill path.
+    kill_agent_process: Any = None
 
 
 class PoolBusy(RuntimeError):
