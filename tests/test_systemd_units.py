@@ -100,13 +100,30 @@ def test_u3_service_has_user_ai_and_wd(services):
 
 def test_u3_service_has_optional_environment_file(services):
     """EnvironmentFile= line is required, with `-` prefix so a missing
-    file at install time doesn't fail the service."""
-    for name, cp in services.items():
-        ef = cp.get("Service", "EnvironmentFile", fallback="")
-        assert ef.startswith("-"), \
-            f"{name}: EnvironmentFile must use '-' prefix (optional), got {ef!r}"
-        assert ef.endswith("/etc/heyi-eval-v10/env"), \
-            f"{name}: EnvironmentFile path must be /etc/heyi-eval-v10/env"
+    file at install time doesn't fail the service. PR#68 also permits
+    extra optional EnvironmentFile= lines (e.g. /home/ai/.yoli.env for
+    ai-hub cross-IDE secrets) — so we parse the raw unit file rather
+    than rely on configparser's last-wins semantics."""
+    for name, _cp in services.items():
+        unit_path = SYSTEMD_DIR / name
+        ef_lines = [
+            ln.strip() for ln in unit_path.read_text(encoding="utf-8").splitlines()
+            if ln.strip().startswith("EnvironmentFile=")
+        ]
+        assert ef_lines, f"{name}: no EnvironmentFile= directive"
+        # Every EnvironmentFile must be optional ('-' prefix).
+        for ln in ef_lines:
+            value = ln.split("=", 1)[1].strip()
+            assert value.startswith("-"), (
+                f"{name}: EnvironmentFile must use '-' prefix (optional), "
+                f"got {value!r}"
+            )
+        # The canonical /etc path must appear at least once.
+        canonical = "-/etc/heyi-eval-v10/env"
+        assert any(ln.split("=", 1)[1].strip() == canonical for ln in ef_lines), (
+            f"{name}: missing canonical EnvironmentFile=-/etc/heyi-eval-v10/env"
+            f" (lines: {ef_lines!r})"
+        )
 
 
 # ── U-4 ExecStart goes through venv python ─────────────────────────────────
