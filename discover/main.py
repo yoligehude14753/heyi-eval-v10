@@ -447,6 +447,59 @@ def cmd_enqueue(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_radar_once(args: argparse.Namespace) -> int:
+    """One agents-radar manifest ingest pass — pulls today's project
+    candidates and writes to ``$HEYI_EVAL_DATA/discover/project_candidates.jsonl``.
+
+    Output convention mirrors model_lane's ``candidates.jsonl`` so the
+    panel can iterate both jsonl files with one pattern. Lane-specific
+    diff is the file basename and ``ProjectCandidate``'s field set.
+    """
+    from .radar_ingest import default_project_candidates_path, ingest_today
+
+    out_path = default_project_candidates_path()
+    stats = ingest_today(out_path=out_path, max_per_kind=args.max_per_kind)
+    print(
+        f"[radar.ingest] manifest_date={stats.manifest_date} "
+        f"reports_seen={stats.reports_seen} skipped={stats.reports_skipped} "
+        f"parsed={stats.rows_parsed} new={stats.candidates_new} "
+        f"dedup={stats.candidates_dedup_skipped} net_err={stats.network_errors}"
+    )
+    if stats.candidates_new > 0:
+        # Tail of jsonl for quick eyeball; identical idiom to cmd_once.
+        from .radar_ingest import ProjectCandidate
+        lines = out_path.read_text().splitlines()[-stats.candidates_new:]
+        print(f"[radar.ingest] sample new candidates (last {min(5, len(lines))}):")
+        for ln in lines[:5]:
+            c = ProjectCandidate.from_jsonl(ln)
+            print(
+                f"  + {c.full_id}  reason={c.reason} "
+                f"delta=+{c.stars_delta or '?'} desc={c.short_desc[:60]!r}"
+            )
+    return 0
+
+
+def cmd_radar_loop(args: argparse.Namespace) -> int:
+    """Periodic agents-radar ingest daemon. Same loop shape as
+    ``cmd_loop`` (model_lane) so systemd unit treatment is symmetric."""
+    print(
+        f"[radar.loop] interval={args.interval}s, max_per_kind={args.max_per_kind}, "
+        "ctrl-c to stop",
+        file=sys.stderr,
+    )
+    while True:
+        try:
+            rc = cmd_radar_once(args)
+            if rc != 0:
+                print(f"[radar.loop] once returned rc={rc}", file=sys.stderr)
+        except KeyboardInterrupt:
+            return 130
+        except Exception as e:  # daemon must not die on transient errors
+            print(f"[radar.loop] iteration raised {type(e).__name__}: {e}",
+                  file=sys.stderr)
+        time.sleep(args.interval)
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="discover", description="HF model discovery tracker")
     p.add_argument("--hf-endpoint", default=os.environ.get("HF_ENDPOINT", "https://hf-mirror.com"))
@@ -520,6 +573,34 @@ def main(argv: list[str] | None = None) -> int:
     p_list = sp.add_parser("list", help="tail recent candidates")
     p_list.add_argument("--limit", type=int, default=20)
     p_list.set_defaults(func=cmd_list)
+
+    # ── radar (project_lane) ────────────────────────────────────────────
+    # M2a: agents-radar manifest.json ingest. Separate subcommand-pair
+    # from `once` / `loop` because the data flow + storage path is
+    # completely different (no HF API, no cursor.json, separate jsonl).
+    p_radar_once = sp.add_parser(
+        "radar-once",
+        help="single agents-radar ingest round (project_candidates.jsonl)",
+    )
+    p_radar_once.add_argument(
+        "--max-per-kind", type=int, default=10,
+        help="per-report-kind cap on candidates per day (default 10, "
+             "matches §13 budget of ~5 projects/day across 4 kinds)",
+    )
+    p_radar_once.set_defaults(func=cmd_radar_once)
+
+    p_radar_loop = sp.add_parser(
+        "radar-loop", help="periodic agents-radar ingest daemon",
+    )
+    p_radar_loop.add_argument(
+        "--interval", type=int, default=86400,
+        help="seconds between manifest fetches (default 24h)",
+    )
+    p_radar_loop.add_argument(
+        "--max-per-kind", type=int, default=10,
+        help="see `radar-once --max-per-kind`",
+    )
+    p_radar_loop.set_defaults(func=cmd_radar_loop)
 
     p_enq = sp.add_parser("enqueue",
                           help="auto-enqueue newest N candidates into orchestrator queue")
