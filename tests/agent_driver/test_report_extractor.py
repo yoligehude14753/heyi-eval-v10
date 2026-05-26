@@ -163,6 +163,21 @@ class FailureModeTests(unittest.TestCase):
         assert isinstance(r, ExtractError)
         self.assertEqual(r.kind, "schema_invalid")
 
+    def test_step_missing_duration_s_accepted_with_default(self) -> None:
+        # Agents routinely omit ``duration_s`` on skip/no-op steps
+        # (heyi 2026-05-26 drill #10: MiniMax-M2.7 emitted 7 steps,
+        # 2 with no duration_s, which used to crash schema validation
+        # and lose the entire run).  Default to 0.0 instead.
+        payload = _good_payload()
+        payload["steps"] = [
+            {"name": "clone", "status": "ok", "duration_s": 5.2},
+            {"name": "smoke_run", "status": "skip"},  # no duration_s
+        ]
+        r = extract_report(_fence(payload), lane="project", target_id="simonw/llm")
+        self.assertIsInstance(r, RunReport)
+        assert isinstance(r, RunReport)
+        self.assertEqual(r.steps[1].duration_s, 0.0)
+
     def test_schema_violation_wrong_type(self) -> None:
         bad = _good_payload()
         bad["verdict"]["deploys"] = "yes"  # type: ignore[index]

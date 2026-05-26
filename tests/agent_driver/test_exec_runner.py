@@ -104,6 +104,19 @@ class HappyPathTests(unittest.TestCase):
                 assert handle.name == "m2b-1"
                 assert "/TASK.md" in cmd[-1]
                 assert wd.startswith("/home/agent/workspace/")
+                # m2b is a strongly-isolated sandbox, so the runner must
+                # opt the agent into bypassPermissions — otherwise the
+                # default permission policy declines Bash(git *) and the
+                # agent can't even clone the target repo (confirmed on
+                # heyi 2026-05-26 drill).  Asserting in the happy-path
+                # fake_stream means a regression here is loud, not silent.
+                assert "--permission-mode" in cmd, (
+                    f"runner must pass --permission-mode in cmd, got {cmd}"
+                )
+                assert "bypassPermissions" in cmd, (
+                    f"runner must use bypassPermissions for m2b sandbox, "
+                    f"got {cmd}"
+                )
                 yield from chunks
 
             result = run_agent(

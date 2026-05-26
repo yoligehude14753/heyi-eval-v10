@@ -327,6 +327,18 @@ def _stream_and_track(
     """
     cmd_in_container = [
         "claude", "--print",
+        # In project_lane / skill_lane the agent runs inside m2b's
+        # strongly-isolated container (no host fs mounts beyond the
+        # per-run workspace, no docker socket, no privileged caps).
+        # That matches exactly Anthropic's own guidance for the
+        # ``bypassPermissions`` mode — "recommended for sandboxes" —
+        # and without it the default policy declines Bash(git *) /
+        # Bash(curl *) which makes the agent unable to clone or
+        # exercise the project we're evaluating.  Confirmed on heyi
+        # 2026-05-26: the container's network/git work fine, but the
+        # agent self-reported "sandbox blocked git clone" until we
+        # flipped the permission mode here.
+        "--permission-mode", "bypassPermissions",
         # Anthropic CLI reads the prompt from the file argument when
         # given as positional; --print suppresses interactive UI.
         f"/home/agent/workspace/{run_id}/TASK.md",

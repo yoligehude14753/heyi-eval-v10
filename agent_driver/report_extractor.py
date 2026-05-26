@@ -214,11 +214,15 @@ def _to_report_dataclass(obj: dict[str, Any]) -> RunReport:
     enum coercions cannot fail.
     """
     verdict = Verdict(**obj["verdict"])
+    # ``duration_s`` is optional in the schema because agents routinely
+    # omit it for skip/no-op steps; default to 0.0 so the dataclass
+    # invariant (always a float) holds without forcing a parse error
+    # on otherwise-valid reports.
     steps = [
         Step(
             name=s["name"],
             status=StepStatus(s["status"]),
-            duration_s=float(s["duration_s"]),
+            duration_s=float(s.get("duration_s", 0.0)),
             note=s.get("note", ""),
             stdout_tail=s.get("stdout_tail", ""),
             artifacts=list(s.get("artifacts", [])),

@@ -168,7 +168,7 @@ REPORT_JSON_SCHEMA: dict[str, Any] = {
             "items": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["name", "status", "duration_s"],
+                "required": ["name", "status"],
                 "properties": {
                     "name": {"type": "string", "minLength": 1, "maxLength": 64},
                     "status": {"enum": [s.value for s in StepStatus]},

@@ -136,7 +136,19 @@ def build_ccr_config(
                 "api_key": yunwu_key,
                 "models": [model_id],
                 "transformer": {
+                    # ``openai`` is ccr's built-in Anthropic→OpenAI
+                    # protocol shim: collapses content blocks into a
+                    # plain string, strips Anthropic-specific fields
+                    # like cache_control / reasoning, and reshapes
+                    # tool_calls.  Without it, Yunwu's M2.7 endpoint
+                    # rejects every request with a wall of
+                    # "Extra inputs are not permitted" validation
+                    # errors against messages[*].content (heyi
+                    # 2026-05-26 drill on chalk/chalk confirmed).
+                    # Order matters: ``openai`` first so downstream
+                    # transformers see the already-converted shape.
                     "use": [
+                        "openai",
                         ["maxtoken", {"max_tokens": 8192}],
                         "strip-thinking",
                     ],
@@ -279,34 +291,76 @@ def inject_into_container(
         )
 
     # ccr's node entrypoint doesn't trap SIGHUP, so SIGHUP terminates
-    # the process without reloading.  We instead do a clean stop-then-
-    # start: SIGTERM existing ccr (if any), wipe the stale pidfile that
-    # would otherwise make the new ccr exit with "server is running",
-    # then nohup a fresh ccr.  Both steps are best-effort — failures
-    # surface in the post-settle probe path inside run_agent.
-    container.exec_run(
-        cmd=[
-            "sh", "-c",
-            "pkill -TERM -f 'ccr start' 2>/dev/null; "
-            "sleep 1; "
-            "rm -f /home/agent/.claude-code-router/.claude-code-router.pid; "
-            "true",
-        ],
+    # the process without reloading.  Do a clean stop-then-start-then-
+    # wait sequence in one synchronous shell so we can detect any of
+    # the failure modes here (rather than blowing up later in run_agent
+    # with ConnectionRefused).  The combined script:
+    #   1. ``ccr stop`` (ccr's own subcommand — sends the right signal
+    #      via its pidfile, and is a no-op if ccr isn't running).  We
+    #      can't use ``pkill -f 'ccr start'`` here because sh -c's own
+    #      argv contains the literal string "ccr start" as part of the
+    #      script body, so pkill -f matches sh and we SIGTERM
+    #      ourselves (heyi 2026-05-26 drill #9: exit code 143).
+    #   2. nuke the pidfile defensively — without this, a freshly-
+    #      started ccr sees the stale pid and exits with the cryptic
+    #      "claude-code-router server is running" message
+    #   3. nohup a fresh ccr, redirecting stdio so it doesn't keep
+    #      the exec session alive
+    #   4. poll http://127.0.0.1:3456 every 0.5s for up to 15s, exit
+    #      0 once it responds, exit 1 otherwise so the caller raises
+    #
+    # Detach=True is intentionally NOT used: we WANT exec_run to block
+    # until step 4 succeeds.  detach=True turned out to be unreliable
+    # on heyi (docker-py 7.x + Docker 24) — even though `docker exec
+    # -u agent -d ... nohup ccr start &` works fine at the CLI, the
+    # SDK path occasionally lost the child process and the next
+    # agent run hit "API Error: Unable to connect to API
+    # (ConnectionRefused)".  Synchronous wait costs ~1-2s typically
+    # and a hard 15s ceiling on the unhappy path; cheap insurance.
+    pid_file = "/home/agent/.claude-code-router/.claude-code-router.pid"
+    log_path = "/home/agent/logs/ccr-injected.log"
+    script = (
+        "export HOME=/home/agent;"
+        "export PATH=/home/agent/.npm-global/bin:$PATH;"
+        "ccr stop >/dev/null 2>&1 || true;"
+        "sleep 1;"
+        f"rm -f {pid_file};"
+        f"nohup ccr start >{log_path} 2>&1 </dev/null &"
+        "disown $!;"
+        "for i in $(seq 1 30); do"
+        "  if curl -sS -m 1 -o /dev/null http://127.0.0.1:3456 2>/dev/null;"
+        "  then exit 0;"
+        "  fi;"
+        "  sleep 0.5;"
+        "done;"
+        "exit 1"
+    )
+    res = container.exec_run(
+        cmd=["sh", "-c", script],
         user="agent",
         detach=False,
         tty=False,
     )
-    container.exec_run(
-        cmd=[
-            "sh", "-c",
-            "export HOME=/home/agent PATH=/home/agent/.npm-global/bin:$PATH; "
-            "nohup ccr start "
-            ">/home/agent/logs/ccr-injected.log 2>&1 </dev/null &",
-        ],
-        user="agent",
-        detach=True,
-        tty=False,
+    # docker-py returns ExecResult(exit_code, output) on non-stream;
+    # also tolerate the legacy (exit_code, output) tuple form.
+    exit_code = (
+        getattr(res, "exit_code", None)
+        if not isinstance(res, tuple) else res[0]
     )
+    if exit_code not in (0, None):
+        out = (
+            getattr(res, "output", b"")
+            if not isinstance(res, tuple) else res[1]
+        )
+        try:
+            out_text = out.decode("utf-8", errors="replace") if out else ""
+        except Exception:
+            out_text = repr(out)
+        raise RuntimeError(
+            f"ccr restart inside {container_name} failed "
+            f"(exit={exit_code}); check {log_path} inside the container. "
+            f"Last stdout: {out_text[-400:]}"
+        )
 
     if settle_seconds > 0:
         _time.sleep(settle_seconds)
