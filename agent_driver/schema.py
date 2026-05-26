@@ -65,7 +65,21 @@ class Outcome(str, Enum):
 
 
 class StepStatus(str, Enum):
+    """Per-step status emitted by the agent.
+
+    ``PARTIAL`` was added 2026-05-26 after the heyi production loop
+    observed M2.7 routinely emit ``status="partial"`` for steps that
+    half-succeeded (e.g. CLI built but one demo command failed).
+    Forcing the agent to round-trip those through ``ok``/``fail``
+    erases real signal — a partial step matters for the panel
+    ("install OK, smoke partial") and for the verdict heuristic
+    (``outcome=partial`` was already a top-level Outcome literal, but
+    the step grain didn't mirror it).  Run-level outcome is still
+    decided by ``Verdict.core_features_demonstrated`` + ``blockers``,
+    so adding PARTIAL here doesn't widen the pass-bar.
+    """
     OK = "ok"
+    PARTIAL = "partial"
     FAIL = "fail"
     SKIP = "skip"
 

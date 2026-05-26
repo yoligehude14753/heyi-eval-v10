@@ -128,6 +128,17 @@ class SchemaRejectionTests(unittest.TestCase):
         with self.assertRaises(jsonschema.ValidationError):
             self._validate(d)
 
+    def test_accepts_steps_status_partial(self) -> None:
+        """PR#72: M2.7 routinely emits ``status="partial"`` for steps
+        that half-succeeded.  Schema must accept it (panel + judge
+        consume the partial signal); rejecting it on the way in
+        erased real information and forced the run into
+        ``report_parse_error`` even though the body was useful.
+        """
+        d = _full_report().to_dict()
+        d["steps"][0]["status"] = "partial"
+        self._validate(d)  # must NOT raise
+
     def test_rejects_oversized_self_assessment(self) -> None:
         d = _full_report().to_dict()
         d["self_assessment_zh"] = "x" * 2000
