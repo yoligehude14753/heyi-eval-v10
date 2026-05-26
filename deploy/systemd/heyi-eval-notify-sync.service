@@ -10,6 +10,7 @@ User=ai
 Group=ai
 WorkingDirectory=/home/ai/heyi-eval-v10
 EnvironmentFile=-/etc/heyi-eval-v10/env
+EnvironmentFile=-/home/ai/.yoli.env
 # TODO(notify-sync): implement `notify_sync` module that tails
 # data_root/store/notify_outbox.jsonl and forwards `channels: ["wechat"]`
 # events through the user's wechat bridge. For now this exits 0 immediately
