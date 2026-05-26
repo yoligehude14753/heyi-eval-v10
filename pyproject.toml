@@ -30,8 +30,9 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools]
 # Top-level Python packages. After PR#5, cc_agent is a regular importable
 # module (was a Docker entrypoint in v9). backup/ and deploy/ join in
-# later PRs.
-packages = ["discover", "curator", "heyi_engine", "orchestrator", "panel", "cc_agent", "backup"]
+# later PRs. agent_driver lands in PR#20 as the M2.7+Claude-Code bridge
+# for project_lane / skill_lane.
+packages = ["discover", "curator", "heyi_engine", "orchestrator", "panel", "cc_agent", "backup", "agent_driver"]
 include-package-data = true
 
 [tool.setuptools.package-data]
@@ -76,7 +77,7 @@ show_error_codes = true
 disallow_any_unimported = false      # huggingface_hub still ships partial stubs
 
 [[tool.mypy.overrides]]
-module = ["docker.*", "huggingface_hub.*"]
+module = ["docker.*", "huggingface_hub.*", "jsonschema.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
