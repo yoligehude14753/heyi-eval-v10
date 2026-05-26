@@ -126,7 +126,7 @@ def _default_http_get(url: str) -> bytes:  # pragma: no cover — production sea
         url, headers={"User-Agent": "heyi-eval-v10/radar-ingest"},
     )
     with urllib.request.urlopen(req, timeout=10) as resp:
-        return resp.read()
+        return bytes(resp.read())
 
 
 # ── constants ─────────────────────────────────────────────────────────────
@@ -305,7 +305,7 @@ def fetch_manifest(*, http_get: HttpGet | None = None) -> dict[str, Any]:
     """
     fn = http_get or _default_http_get
     raw = fn(_MANIFEST_URL)
-    obj = json.loads(raw.decode("utf-8"))
+    obj: dict[str, Any] = json.loads(raw.decode("utf-8"))
     if "dates" not in obj or not isinstance(obj["dates"], list):
         raise ValueError(
             "manifest.json has no 'dates' array — schema drift; "
@@ -325,7 +325,8 @@ def latest_date_entry(manifest: dict[str, Any]) -> dict[str, Any]:
     )
     if not dates:
         raise ValueError("manifest.json has zero date entries")
-    return dates[0]
+    entry: dict[str, Any] = dates[0]
+    return entry
 
 
 def manifest_staleness_days(manifest: dict[str, Any]) -> int:

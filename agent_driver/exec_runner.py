@@ -33,7 +33,7 @@ import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from agent_driver.budget_guard import BudgetCheck, BudgetDecision, BudgetGuard
 from agent_driver.pool_manager import (
@@ -350,18 +350,83 @@ def _stream_and_track(
     return b"".join(chunks).decode("utf-8", errors="replace"), final
 
 
-def _default_stream_exec(  # pragma: no cover — exercised in M2 drill
+def make_docker_stream_exec(
+    docker_client: Any,
+    *,
+    user: str = "agent",
+    environment: dict[str, str] | None = None,
+) -> StreamExec:
+    """Build a ``StreamExec`` callable bound to a docker-py SDK client.
+
+    Returns a function with the StreamExec signature that, when invoked
+    by run_agent, does ``container.exec_run(cmd, workdir=, stream=True,
+    user=, environment=)`` and yields raw stdout bytes chunks.
+
+    Why a factory rather than a constant function?
+
+    - The docker_client is owned by pool_manager (so it can use the same
+      object for health probes + restart). Passing it through here as
+      well would duplicate the dependency injection seam.
+    - ``user="agent"`` and ``environment={}`` are the m2b convention —
+      ``HOME=/home/agent``, ``ANTHROPIC_BASE_URL=http://127.0.0.1:3456``
+      etc. are baked into the container; we only override per-run extras
+      via ``environment`` (e.g. INV-P5 puts the agent's run_id into env
+      for audit logging).
+
+    Stream semantics:
+      - docker-py's ``exec_run(stream=True)`` returns an
+        ``ExecResult(exit_code=None, output=<generator>)``. We consume
+        the generator until it's exhausted (container side closes), then
+        check exit code via ``inspect_exec``.
+      - If the exec exits non-zero, we DO NOT raise — agent failure
+        modes (build error, wrong command) are valid outcomes that the
+        agent should describe in the report JSON. run_agent's caller
+        sees the agent's verdict, not a non-zero exit.
+      - If docker raises (container died), the exception bubbles up to
+        run_agent's catch-all which maps to SANDBOX_DEAD.
+    """
+
+    def stream_exec(
+        handle: ContainerHandle, command: list[str], workdir: str,
+    ) -> Iterable[bytes]:
+        container = docker_client.containers.get(handle.name)
+        exec_result = container.exec_run(
+            cmd=command,
+            workdir=workdir,
+            stream=True,
+            stdout=True,
+            stderr=False,  # ccr's stderr is noisy; we just want claude stdout
+            user=user,
+            environment=environment or {},
+            tty=False,
+            demux=False,
+        )
+        # docker-py returns either ExecResult or a (exit_code, generator)
+        # tuple depending on version. Normalise.
+        if hasattr(exec_result, "output"):
+            stream = exec_result.output
+        else:
+            _, stream = exec_result
+        yield from stream
+
+    return stream_exec
+
+
+def _default_stream_exec(  # pragma: no cover — needs real docker
     handle: ContainerHandle, command: list[str], workdir: str,
 ) -> Iterable[bytes]:
-    """Production stream: docker-py's exec_run with stream=True.
+    """Fallback for callers that didn't inject ``stream_exec``.
 
-    Intentionally kept thin so the integration risk lives in M2's drill
-    rather than M1's unit suite. M1 ships ``run_agent`` with mock
-    stream_exec; M2 wires this in + e2e on heyi.
+    In production, the orchestrator passes ``stream_exec=make_docker_stream_exec(d)``
+    explicitly so this function isn't reached. We keep it as a clear
+    error path: someone calling ``run_agent(...)`` without wiring docker
+    at all should hear about it via a clean RuntimeError, not a
+    halfway-mocked execution.
     """
-    raise NotImplementedError(
-        "agent_driver.exec_runner._default_stream_exec is M2 work — "
-        "M1 tests inject stream_exec explicitly."
+    raise RuntimeError(
+        "agent_driver.run_agent was called without a stream_exec; "
+        "wire it via stream_exec=make_docker_stream_exec(docker.from_env()) "
+        "or pass an explicit test double."
     )
 
 

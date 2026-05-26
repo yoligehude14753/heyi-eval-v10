@@ -192,12 +192,13 @@ def write_ccr_config_to_path(config: dict[str, Any], path: Path) -> None:
     tmp.replace(path)
 
 
-def inject_into_container(  # pragma: no cover — exercised in M2 drill
+def inject_into_container(
     container_name: str,
     *,
     docker_client: Any,
     config: dict[str, Any],
     target_path_in_container: str = "/home/agent/.claude-code-router/config.json",
+    settle_seconds: float = 2.0,
 ) -> None:
     """docker cp the config into a running m2b container + restart ccr.
 
@@ -207,16 +208,69 @@ def inject_into_container(  # pragma: no cover — exercised in M2 drill
     passes ``docker.from_env()``.
 
     Steps:
-      1. write config to a host-side tempfile
-      2. docker cp tempfile → container target_path
-      3. docker exec inside container: pkill -HUP ccr
-      4. wait up to 10s for ccr's health endpoint to come back
+      1. serialize config to JSON bytes + chmod 600 entry in a tar
+         stream (docker.put_archive accepts only tar)
+      2. ``container.put_archive(parent_dir, tar_bytes)`` — atomically
+         replaces the file inside the container
+      3. ``container.exec_run("pkill -HUP ccr")`` — ccr handles SIGHUP
+         by re-reading config. The kill is non-fatal (exit 1 if no ccr
+         process matched, exit 0 if matched) — we ignore exit and
+         settle-wait either way.
+      4. settle-wait ``settle_seconds`` for ccr to re-bind 3456
 
-    Failure modes are intentionally noisy: caller (pool_manager) treats
-    an injection failure as "this container is broken, recycle it".
+    The "settle wait" is a hardcoded sleep (not a probe) because the
+    only readiness signal would be exec'ing ``curl 127.0.0.1:3456`` into
+    the container, which costs another round-trip; for a 2s settle this
+    isn't worth it.
+
+    Failure modes:
+      - put_archive fails (container missing, fs full) → propagate the
+        docker-py exception; caller (pool_manager) treats as recycle.
+      - pkill exits non-zero → ignored (ccr might not be running yet
+        on a freshly-started container; SIGHUP only matters if it IS
+        running, in which case 0 is returned).
+      - settle wait completes regardless. If ccr never came back, the
+        next agent run will fail at the claude → ccr hop and produce
+        a SANDBOX_DEAD report.
     """
-    raise NotImplementedError(
-        "agent_driver.ccr_bridge.inject_into_container is M2 work — "
-        "land it together with pool_manager's heyi drill so the "
-        "happy path is end-to-end tested before being shipped."
+    import io
+    import tarfile
+    import time as _time
+
+    container = docker_client.containers.get(container_name)
+
+    target_path = target_path_in_container
+    parent_dir, filename = target_path.rsplit("/", 1)
+
+    body = (json.dumps(config, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+    # Build a single-file tar in memory. put_archive extracts the tar
+    # at parent_dir, so the entry name is just ``filename`` (no path).
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        info = tarfile.TarInfo(name=filename)
+        info.size = len(body)
+        info.mode = 0o600
+        info.mtime = int(_time.time())
+        tf.addfile(info, io.BytesIO(body))
+    buf.seek(0)
+
+    ok = container.put_archive(parent_dir, buf.read())
+    if ok is False:
+        # docker-py returns False on failure (rather than raising) for
+        # some legacy paths — defensive translation.
+        raise RuntimeError(
+            f"docker.put_archive returned False for {container_name}:{target_path}"
+        )
+
+    # SIGHUP triggers ccr's config-reload handler. If ccr isn't yet up
+    # (fresh container), pkill returns 1; that's not an error for us.
+    container.exec_run(
+        cmd=["sh", "-c", "pkill -HUP -f 'ccr start' || true"],
+        user="agent",
+        detach=False,
+        tty=False,
     )
+
+    if settle_seconds > 0:
+        _time.sleep(settle_seconds)

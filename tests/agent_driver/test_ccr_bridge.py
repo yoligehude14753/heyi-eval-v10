@@ -211,5 +211,187 @@ class ResolverIntegrationTests(_EnvIsolation):
         self.assertEqual(providers["yunwu-m27"]["api_key"], "sk-from-resolver")
 
 
+class InjectIntoContainerTests(_EnvIsolation):
+    """M2d: docker put_archive + pkill -HUP path.
+
+    We use a hand-built fake docker client because docker-py's behaviour
+    around put_archive + tar is the bit we want to validate (the tar
+    must be parseable + content must be ours)."""
+
+    def _fake_docker(self) -> tuple:
+        """Returns (docker_client, captured) — ``captured`` is a dict
+        with keys ``tar_bytes`` / ``exec_cmds`` / ``put_archive_calls``."""
+        captured: dict = {
+            "tar_bytes": b"",
+            "exec_cmds": [],
+            "put_archive_dest": None,
+            "put_archive_calls": 0,
+        }
+
+        class _C:
+            name = "m2b-1"
+
+            def put_archive(self, path: str, data: bytes) -> bool:
+                captured["put_archive_dest"] = path
+                captured["tar_bytes"] = data
+                captured["put_archive_calls"] += 1
+                return True
+
+            def exec_run(self, **kw):
+                captured["exec_cmds"].append(kw.get("cmd"))
+                class _R:
+                    exit_code = 0
+                    output = b""
+                return _R()
+
+        class _Containers:
+            def get(self, name: str) -> _C:
+                assert name == "m2b-1"
+                return _C()
+
+        class _Docker:
+            containers = _Containers()
+
+        return _Docker(), captured
+
+    def test_put_archive_called_with_parent_dir(self) -> None:
+        from agent_driver.ccr_bridge import inject_into_container
+        docker, cap = self._fake_docker()
+        cfg = build_ccr_config(yunwu_url="https://yunwu.ai/v1", yunwu_key="sk")
+        inject_into_container(
+            "m2b-1", docker_client=docker, config=cfg,
+            settle_seconds=0,  # no sleep in tests
+        )
+        self.assertEqual(
+            cap["put_archive_dest"],
+            "/home/agent/.claude-code-router",
+        )
+        self.assertEqual(cap["put_archive_calls"], 1)
+
+    def test_tar_contains_config_json_with_correct_body(self) -> None:
+        import io
+        import tarfile
+
+        from agent_driver.ccr_bridge import inject_into_container
+        docker, cap = self._fake_docker()
+        cfg = build_ccr_config(yunwu_url="https://yunwu.ai/v1", yunwu_key="sk-injection-test")
+        inject_into_container(
+            "m2b-1", docker_client=docker, config=cfg, settle_seconds=0,
+        )
+        # The captured bytes should be a tar with one entry: ``config.json``
+        with tarfile.open(fileobj=io.BytesIO(cap["tar_bytes"]), mode="r") as tar:
+            names = tar.getnames()
+            self.assertEqual(names, ["config.json"])
+            member = tar.extractfile("config.json")
+            assert member is not None
+            body = member.read().decode("utf-8")
+            loaded = json.loads(body)
+            self.assertEqual(loaded["Router"]["default"], cfg["Router"]["default"])
+            info = tar.getmember("config.json")
+            self.assertEqual(info.mode, 0o600)
+
+    def test_pkill_command_issued(self) -> None:
+        from agent_driver.ccr_bridge import inject_into_container
+        docker, cap = self._fake_docker()
+        cfg = build_ccr_config(yunwu_url="https://yunwu.ai/v1", yunwu_key="sk")
+        inject_into_container(
+            "m2b-1", docker_client=docker, config=cfg, settle_seconds=0,
+        )
+        self.assertEqual(len(cap["exec_cmds"]), 1)
+        cmd = cap["exec_cmds"][0]
+        # Should be a shell pkill SIGHUP targeting the ccr process
+        self.assertIn("pkill", " ".join(cmd))
+        self.assertIn("-HUP", " ".join(cmd))
+        self.assertIn("ccr start", " ".join(cmd))
+
+    def test_put_archive_false_return_raises(self) -> None:
+        """docker-py legacy paths return False on failure; we translate
+        to RuntimeError so caller (pool_manager) sees a clear error."""
+        from agent_driver.ccr_bridge import inject_into_container
+
+        class _C:
+            def put_archive(self, p, d):
+                return False
+
+            def exec_run(self, **kw):
+                class _R:
+                    exit_code = 0
+                return _R()
+
+        class _Containers:
+            def get(self, n):
+                return _C()
+
+        class _Docker:
+            containers = _Containers()
+
+        cfg = build_ccr_config(yunwu_url="https://yunwu.ai/v1", yunwu_key="sk")
+        with self.assertRaisesRegex(RuntimeError, "put_archive returned False"):
+            inject_into_container(
+                "m2b-1", docker_client=_Docker(), config=cfg, settle_seconds=0,
+            )
+
+
+class StreamExecFactoryTests(unittest.TestCase):
+    """make_docker_stream_exec wires docker-py's exec_run; ensure
+    the contract we pass into it matches what docker-py expects."""
+
+    def test_uses_container_exec_run_with_stream(self) -> None:
+        from agent_driver.exec_runner import make_docker_stream_exec
+        from agent_driver.pool_manager import ContainerHandle
+
+        captured = {}
+
+        class _C:
+            def exec_run(self, **kw):
+                captured.update(kw)
+
+                class _R:
+                    output = (b"chunk-1", b"chunk-2")
+                return _R()
+
+        class _Containers:
+            def get(self, name):
+                return _C()
+
+        class _Docker:
+            containers = _Containers()
+
+        stream = make_docker_stream_exec(_Docker())
+        handle = ContainerHandle(name="m2b-1",
+                                 workspace_root_in_container="/home/agent/workspace")
+        chunks = list(stream(handle, ["claude", "--print", "/x"], "/home/agent/workspace/run-1"))
+        self.assertEqual(chunks, [b"chunk-1", b"chunk-2"])
+        # The factory must pass through stream=True, stdout=True
+        self.assertTrue(captured["stream"])
+        self.assertTrue(captured["stdout"])
+        self.assertFalse(captured["stderr"])
+        self.assertEqual(captured["workdir"], "/home/agent/workspace/run-1")
+        self.assertEqual(captured["user"], "agent")
+
+    def test_tuple_result_unpacks(self) -> None:
+        """Some docker-py versions return ``(exit_code, generator)`` instead
+        of ExecResult; the factory must handle both."""
+        from agent_driver.exec_runner import make_docker_stream_exec
+        from agent_driver.pool_manager import ContainerHandle
+
+        class _C:
+            def exec_run(self, **kw):
+                return (0, iter([b"a", b"b"]))
+
+        class _Containers:
+            def get(self, name):
+                return _C()
+
+        class _Docker:
+            containers = _Containers()
+
+        stream = make_docker_stream_exec(_Docker())
+        handle = ContainerHandle(name="m2b-1",
+                                 workspace_root_in_container="/")
+        chunks = list(stream(handle, ["x"], "/"))
+        self.assertEqual(chunks, [b"a", b"b"])
+
+
 if __name__ == "__main__":
     unittest.main()
