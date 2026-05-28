@@ -21,4 +21,11 @@
 | `PR33_DEPLOY_REPAIR_EXPERIMENT.md` | 部署自愈真机实验日志 |
 | `PR36_HONESTY_EXPERIMENT.md` | 推理探针 / honesty gate 实验 |
 
-**当前生效文档**回到 [`docs/`](../) 顶层：`ARCHITECTURE.md` / `INVARIANTS.md` / `USAGE.md` / `RUNBOOK_NV8.md` / `PLAN.md`。
+**当前生效文档**回到 [`docs/`](../) 顶层：
+
+- Model lane：`ARCHITECTURE.md` / `INVARIANTS.md` / `USAGE.md` / `RUNBOOK_NV8.md` / `PLAN.md`
+- Project + Skill lane（v0.2.0 新增）：`ARCHITECTURE_LANES.md` / `INVARIANTS_LANES.md` / `TEST_PLAN_LANES.md`
+- 顶层变更记录：[`CHANGELOG.md`](../../CHANGELOG.md)
+
+历史 lane 真机批跑（2026-05-26 v0.2.0 release sweep）：39 skill + 19 project，**89.7% / 52.6%** 结构化产出率，明细见 `CHANGELOG.md` v0.2.0 节。
+
