@@ -1,0 +1,31 @@
+[Unit]
+Description=heyi-eval-v10 drain the project_lane queue (agent eval via GLM-5.1)
+Documentation=https://github.com/yoligehude14753/heyi-eval-v10/blob/main/docs/ARCHITECTURE_LANES.md
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/home/ai/heyi-eval-v10/.venv/bin/python
+
+[Service]
+Type=oneshot
+User=ai
+Group=ai
+WorkingDirectory=/home/ai/heyi-eval-v10
+EnvironmentFile=-/etc/heyi-eval-v10/env
+EnvironmentFile=-/home/ai/.yoli.env
+Environment=PYTHONUNBUFFERED=1
+Environment=HEYI_EVAL_DATA=/home/ai/heyi-eval-data
+# m2b-claude-code is the long-lived agent sandbox container; the agent
+# inside drives deploy+smoke via GLM-5.1 (zhipu). --limit caps work per
+# trigger so a backlog drains gradually instead of in one long burst.
+ExecStart=/home/ai/heyi-eval-v10/.venv/bin/python -m orchestrator project run \
+    --container m2b-claude-code \
+    --limit 5
+# project_lane is GPU-free (the agent only deploys/runs the repo, no
+# local LLM), so it's cheap to run on a cadence.
+Nice=10
+MemoryHigh=2G
+MemoryMax=4G
+TasksMax=512
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,15 @@
+[Unit]
+Description=heyi-eval-v10 project_lane queue-drain trigger
+Documentation=https://github.com/yoligehude14753/heyi-eval-v10/blob/main/docs/ARCHITECTURE_LANES.md
+
+[Timer]
+OnBootSec=15min
+# Every 30 min: drain up to 5 pending project runs. Combined with the
+# daily radar-local ingest this keeps fresh hotspots flowing through
+# evaluation without a long-lived daemon that could wedge.
+OnUnitActiveSec=30min
+RandomizedDelaySec=1min
+Unit=heyi-eval-project-loop.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,12 @@
+[Unit]
+Description=heyi-eval-v10 skill_lane queue-drain trigger
+Documentation=https://github.com/yoligehude14753/heyi-eval-v10/blob/main/docs/ARCHITECTURE_LANES.md
+
+[Timer]
+OnBootSec=20min
+OnUnitActiveSec=30min
+RandomizedDelaySec=1min
+Unit=heyi-eval-skill-loop.service
+
+[Install]
+WantedBy=timers.target
