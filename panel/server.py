@@ -35,10 +35,29 @@ from typing import Any
 
 DATA_ROOT = Path(os.environ.get("HEYI_EVAL_DATA", "/home/ai/heyi-eval-data"))
 BACKUPS_ROOT = Path(os.environ.get("HEYI_EVAL_BACKUPS", "/home/ai/heyi-eval-backups"))
-ENGINE_URL = os.environ.get("HEYI_ENGINE_URL", "http://127.0.0.1:10814")
-ENGINE_API_KEY = os.environ.get("HEYI_ENGINE_API_KEY")
+# Resolve the LLM endpoint via the same single source of truth the
+# orchestrator uses (default provider: zhipu GLM-5.1), so the panel's
+# engine probe follows the active provider instead of pinning to the
+# old local ``:10814``.
+try:
+    from orchestrator.config import _resolve_llm_endpoint as _resolve_llm
+    _ENGINE_URL_R, _ENGINE_KEY_R, _ENGINE_MODEL_R = _resolve_llm()
+except Exception:  # pragma: no cover - panel must boot even if config import fails
+    _ENGINE_URL_R, _ENGINE_KEY_R, _ENGINE_MODEL_R = (
+        os.environ.get("HEYI_ENGINE_URL", "http://127.0.0.1:10814"),
+        os.environ.get("HEYI_ENGINE_API_KEY"),
+        os.environ.get("HEYI_EVAL_JUDGE_MODEL", "glm-5.1"),
+    )
+ENGINE_URL = os.environ.get("HEYI_ENGINE_URL") or _ENGINE_URL_R
+ENGINE_API_KEY = os.environ.get("HEYI_ENGINE_API_KEY") or _ENGINE_KEY_R
+ENGINE_MODEL = os.environ.get("HEYI_EVAL_JUDGE_MODEL") or _ENGINE_MODEL_R
 LISTEN_HOST = os.environ.get("HEYI_PANEL_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("HEYI_PANEL_PORT", "8090"))
+# Optional bearer token guarding the panel's write surface (POST). When
+# set, mutating requests must carry ``Authorization: Bearer <token>``.
+# Left unset the panel stays open (the historical Tailnet-only posture);
+# set it whenever the panel is reachable beyond the trusted network.
+PANEL_TOKEN = (os.environ.get("HEYI_PANEL_TOKEN") or "").strip() or None
 
 
 # PR#55: strict validator for the POST /api/enqueue surface. HF model
@@ -3296,6 +3315,10 @@ class Handler(BaseHTTPRequestHandler):
         write surface.
         """
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
+        if not self._post_authorized():
+            self._json({"error": "unauthorized",
+                        "detail": "missing/invalid bearer token"}, status=401)
+            return
         try:
             if path == "/api/enqueue":
                 self._handle_enqueue()
@@ -3303,6 +3326,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": "not_found", "path": path}, status=404)
         except Exception as e:
             self._json({"error": str(e), "type": type(e).__name__}, status=500)
+
+    def _post_authorized(self) -> bool:
+        """True if the request may mutate state. When ``PANEL_TOKEN`` is
+        unset the panel is open (Tailnet-only posture); when set, require
+        ``Authorization: Bearer <token>``."""
+        if PANEL_TOKEN is None:
+            return True
+        auth = self.headers.get("Authorization", "")
+        prefix = "Bearer "
+        return auth.startswith(prefix) and auth[len(prefix):].strip() == PANEL_TOKEN
 
     def _handle_enqueue(self) -> None:
         length = int(self.headers.get("Content-Length") or 0)

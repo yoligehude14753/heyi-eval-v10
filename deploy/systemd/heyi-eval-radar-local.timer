@@ -1,0 +1,15 @@
+[Unit]
+Description=heyi-eval-v10 daily local-radar hotspot ingest trigger
+Documentation=https://github.com/yoligehude14753/heyi-eval-v10/blob/main/docs/ARCHITECTURE_LANES.md
+
+[Timer]
+OnBootSec=10min
+# Daily — radar's own APScheduler crawls + scores continuously; we just
+# need to harvest the freshest scored hotspots once a day into the
+# project queue. The project enqueue dedups, so re-ingest is cheap.
+OnUnitActiveSec=24h
+RandomizedDelaySec=2min
+Unit=heyi-eval-radar-local.service
+
+[Install]
+WantedBy=timers.target

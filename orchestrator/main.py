@@ -91,6 +91,21 @@ def _engine_preflight_gate(
     proceed to pop a job. `allow_intake=False` means we must back off
     this iteration. Emits incident events on state transitions.
     """
+    from .config import _DEFAULT_LLM_PROVIDER
+    provider = (
+        os.environ.get("HEYI_EVAL_JUDGE_PROVIDER") or _DEFAULT_LLM_PROVIDER
+    ).strip().lower()
+    if provider in ("zhipu", "yunwu") and probe is None:
+        # Cloud LLM is a managed service; the ``/v1/models`` liveness
+        # probe isn't a reliable readiness signal (Zhipu's v4 endpoint
+        # may not expose ``/models``), and each stage already degrades
+        # gracefully on a transient upstream error. Don't gate intake on
+        # it — otherwise a quirky ``/models`` response would silently
+        # freeze the whole queue.
+        if state.engine_unhealthy_since is not None:
+            state.engine_unhealthy_since = None
+            state.engine_last_notify = 0.0
+        return True, "cloud-provider"
     if probe is None:
         from curator.health import probe_engine as probe
     now = now or time.time()

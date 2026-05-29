@@ -105,12 +105,29 @@ def extract_report(
     """
     fenced = _last_fence_payload(raw_stdout)
     if fenced is None:
-        return ExtractError(
-            kind="fence_missing",
-            detail=f"neither '{FENCE_OPEN}' nor '{FENCE_CLOSE}' found "
-                   f"in {len(raw_stdout)} chars of stdout",
-            raw_excerpt=raw_stdout[-500:],
+        # Salvage ONLY when the agent used no fence at all. If a fence was
+        # opened but the final block is truncated (open w/o close), stay
+        # conservative and reject — the agent's last word was unfinished
+        # so we don't trust an earlier draft (see MultipleFenceTests).
+        #
+        # The no-fence case is the dominant report_parse_error cause on
+        # the heyi 2026-05 project_lane sweep: the model printed valid
+        # report JSON (often in a ```json block) but omitted the
+        # <<<HEYI_RUN_REPORT_JSON>>> fence. Recovering it turns a lost run
+        # (~3 min agent time + tokens) into a usable report.
+        salvaged = (
+            _salvage_report_payload(raw_stdout)
+            if FENCE_OPEN not in raw_stdout
+            else None
         )
+        if salvaged is None:
+            return ExtractError(
+                kind="fence_missing",
+                detail=f"neither '{FENCE_OPEN}' nor '{FENCE_CLOSE}' found "
+                       f"in {len(raw_stdout)} chars of stdout",
+                raw_excerpt=raw_stdout[-500:],
+            )
+        fenced = salvaged
 
     if not fenced.strip():
         return ExtractError(
@@ -184,6 +201,67 @@ def _unwrap_markdown_codeblock(payload: str) -> str:
     if not s.endswith("```"):
         return payload
     return s[nl + 1 : -3].strip()
+
+
+# Report objects carry these top-level keys; we use them to recognise a
+# report JSON when the agent forgot the fence markers.
+_REPORT_SIGNATURE_KEYS = ("schema_version", "lane", "outcome")
+
+
+def _iter_balanced_json_objects(text: str):
+    """Yield each top-level ``{...}`` balanced-brace substring in ``text``,
+    in document order, ignoring braces inside JSON string literals.
+
+    Intentionally simple (no full JSON tokenizer): we only need to slice
+    candidate objects out of mixed prose+JSON stdout; ``json.loads`` does
+    the real validation on each slice.
+    """
+    depth = 0
+    start = -1
+    in_str = False
+    esc = False
+    for i, ch in enumerate(text):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}" and depth > 0:
+            depth -= 1
+            if depth == 0 and start >= 0:
+                yield text[start : i + 1]
+
+
+def _salvage_report_payload(raw_stdout: str) -> str | None:
+    """Fence markers missing: recover the report by scanning for the LAST
+    balanced top-level JSON object that carries the report signature keys
+    (``schema_version`` + ``lane`` + ``outcome``) AND parses as JSON.
+
+    Returns the JSON string, or ``None`` when nothing report-shaped is
+    found. The signature-key requirement keeps us from mistaking some
+    intermediate JSON the agent printed (e.g. a tool result) for the
+    report — a non-report object won't carry all three keys.
+    """
+    candidate: str | None = None
+    for blob in _iter_balanced_json_objects(raw_stdout):
+        if not all(f'"{k}"' in blob for k in _REPORT_SIGNATURE_KEYS):
+            continue
+        try:
+            obj = json.loads(blob)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and all(k in obj for k in _REPORT_SIGNATURE_KEYS):
+            candidate = blob  # keep scanning; last report-shaped object wins
+    return candidate
 
 
 def _last_fence_payload(raw_stdout: str) -> str | None:

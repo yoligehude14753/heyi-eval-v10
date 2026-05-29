@@ -310,12 +310,12 @@ class CuratorConfig:
     def from_env(cls) -> CuratorConfig:
         # PR#70: delegate to OrchestratorConfig so curator and the rest
         # of the stack share one resolver and one provider switch.
-        from orchestrator.config import _resolve_engine_endpoint
-        engine_url, engine_api_key = _resolve_engine_endpoint()
+        from orchestrator.config import _resolve_llm_endpoint
+        engine_url, engine_api_key, default_model = _resolve_llm_endpoint()
         return cls(
             engine_url=engine_url,
             engine_api_key=engine_api_key,
-            engine_model=os.environ.get("HEYI_EVAL_JUDGE_MODEL", "MiniMax-M2.7"),
+            engine_model=os.environ.get("HEYI_EVAL_JUDGE_MODEL") or default_model,
             hf_endpoint=os.environ.get("HF_ENDPOINT", "https://hf-mirror.com"),
             max_card_chars=int(os.environ.get("HEYI_EVAL_CARD_MAX_CHARS",
                                               str(DEFAULT_MAX_CARD_CHARS))),

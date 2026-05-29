@@ -1,0 +1,32 @@
+[Unit]
+Description=heyi-eval-v10 ingest scored hotspots from the local radar /api/items
+Documentation=https://github.com/yoligehude14753/heyi-eval-v10/blob/main/docs/ARCHITECTURE_LANES.md
+After=network-online.target radar.service
+Wants=network-online.target
+ConditionPathExists=/home/ai/heyi-eval-v10/.venv/bin/python
+
+[Service]
+Type=oneshot
+User=ai
+Group=ai
+WorkingDirectory=/home/ai/heyi-eval-v10
+EnvironmentFile=-/etc/heyi-eval-v10/env
+EnvironmentFile=-/home/ai/.yoli.env
+# YUNWU_* keys (the active LLM provider) live here.
+EnvironmentFile=-/home/ai/.heyi-eval-env
+Environment=PYTHONUNBUFFERED=1
+Environment=HEYI_EVAL_DATA=/home/ai/heyi-eval-data
+Environment=RADAR_BASE_URL=http://127.0.0.1:7090
+# Pull the day's top QAG-scored GitHub hotspots (>=0.6) from the local
+# radar into project_candidates.jsonl. Replaces the third-party
+# agents-radar manifest as the primary discovery source.
+ExecStart=/home/ai/heyi-eval-v10/.venv/bin/python -m discover.main radar-local-once \
+    --min-score 0.6 \
+    --limit 50
+Nice=10
+MemoryHigh=512M
+MemoryMax=1G
+TasksMax=128
+
+[Install]
+WantedBy=multi-user.target

@@ -500,6 +500,63 @@ def cmd_radar_loop(args: argparse.Namespace) -> int:
         time.sleep(args.interval)
 
 
+def cmd_radar_local_once(args: argparse.Namespace) -> int:
+    """One ingest pass from the LOCAL radar service (GET /api/items).
+
+    Pulls QAG-scored GitHub hotspots from our own radar (default
+    ``http://127.0.0.1:7090``) into ``project_candidates.jsonl``, the
+    same file model_lane/radar_ingest share. Prefer this over
+    ``radar-once`` (third-party manifest) when the local radar is up.
+    """
+    from .radar_local_ingest import default_project_candidates_path, ingest_from_radar
+
+    out_path = default_project_candidates_path()
+    stats = ingest_from_radar(
+        out_path=out_path,
+        base_url=getattr(args, "base_url", None),
+        source=args.source,
+        min_score=args.min_score,
+        limit=args.limit,
+    )
+    print(
+        f"[radar_local.ingest] base={stats.base_url} seen={stats.items_seen} "
+        f"new={stats.candidates_new} dedup={stats.candidates_dedup_skipped} "
+        f"non_github={stats.non_github_skipped} "
+        f"unparseable={stats.unparseable_skipped} net_err={stats.network_errors}"
+    )
+    if stats.candidates_new > 0:
+        from .radar_ingest import ProjectCandidate
+        lines = out_path.read_text().splitlines()[-stats.candidates_new:]
+        print(f"[radar_local.ingest] sample new (last {min(5, len(lines))}):")
+        for ln in lines[:5]:
+            c = ProjectCandidate.from_jsonl(ln)
+            print(
+                f"  + {c.full_id}  qag={c.qag_score}  "
+                f"stars={c.stars_total or '?'}  desc={c.short_desc[:60]!r}"
+            )
+    return 0 if stats.network_errors == 0 else 1
+
+
+def cmd_radar_local_loop(args: argparse.Namespace) -> int:
+    """Periodic local-radar ingest daemon (mirror of cmd_radar_loop)."""
+    print(
+        f"[radar_local.loop] interval={args.interval}s min_score={args.min_score} "
+        f"limit={args.limit}, ctrl-c to stop",
+        file=sys.stderr,
+    )
+    while True:
+        try:
+            rc = cmd_radar_local_once(args)
+            if rc != 0:
+                print(f"[radar_local.loop] once returned rc={rc}", file=sys.stderr)
+        except KeyboardInterrupt:
+            return 130
+        except Exception as e:
+            print(f"[radar_local.loop] iteration raised {type(e).__name__}: {e}",
+                  file=sys.stderr)
+        time.sleep(args.interval)
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="discover", description="HF model discovery tracker")
     p.add_argument("--hf-endpoint", default=os.environ.get("HF_ENDPOINT", "https://hf-mirror.com"))
@@ -601,6 +658,46 @@ def main(argv: list[str] | None = None) -> int:
         help="see `radar-once --max-per-kind`",
     )
     p_radar_loop.set_defaults(func=cmd_radar_loop)
+
+    # ── radar-local (project_lane, our own radar service) ───────────────
+    # Pulls QAG-scored GitHub hotspots from the co-located radar's
+    # GET /api/items. Preferred over the third-party manifest when the
+    # local radar is running.
+    def _add_radar_local_args(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument(
+            "--base-url", default=os.environ.get("RADAR_BASE_URL"),
+            help="local radar base URL (default env RADAR_BASE_URL or "
+                 "http://127.0.0.1:7090)",
+        )
+        parser.add_argument(
+            "--source", default="github",
+            help="radar source filter; only 'github' yields runnable repos",
+        )
+        parser.add_argument(
+            "--min-score", type=float, default=0.6,
+            help="QAG composite-score floor (0-1, default 0.6)",
+        )
+        parser.add_argument(
+            "--limit", type=int, default=50,
+            help="max items to pull from radar this round",
+        )
+
+    p_radar_local_once = sp.add_parser(
+        "radar-local-once",
+        help="single ingest from the local radar /api/items",
+    )
+    _add_radar_local_args(p_radar_local_once)
+    p_radar_local_once.set_defaults(func=cmd_radar_local_once)
+
+    p_radar_local_loop = sp.add_parser(
+        "radar-local-loop", help="periodic local-radar ingest daemon",
+    )
+    _add_radar_local_args(p_radar_local_loop)
+    p_radar_local_loop.add_argument(
+        "--interval", type=int, default=86400,
+        help="seconds between local-radar fetches (default 24h)",
+    )
+    p_radar_local_loop.set_defaults(func=cmd_radar_local_loop)
 
     p_enq = sp.add_parser("enqueue",
                           help="auto-enqueue newest N candidates into orchestrator queue")

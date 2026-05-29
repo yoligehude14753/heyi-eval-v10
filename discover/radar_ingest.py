@@ -82,6 +82,11 @@ class ProjectCandidate:
     # this candidate. Capped to 500 chars so a malformed row can't blow
     # up disk usage when ingested.
     raw_excerpt: str = ""
+    # QAG composite score (0-1) when the candidate came from the local
+    # radar (``radar_local_ingest``); ``None`` for the third-party
+    # manifest path which has no score. enqueue sorts by this when
+    # present so the day's highest-signal hotspots run first.
+    qag_score: float | None = None
 
     def to_jsonl(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)

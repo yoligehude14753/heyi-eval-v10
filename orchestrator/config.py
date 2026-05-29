@@ -26,33 +26,65 @@ def _env_path(name: str, default: str) -> Path:
     return Path(os.environ.get(name, default)).expanduser()
 
 
-def _resolve_engine_endpoint() -> tuple[str, str | None]:
-    """PR#70: single source of truth for *the LLM endpoint that curator,
-    showcase, deploy_repair and llm_judge all talk to*.
+# Default LLM provider. The cloud brain is yunwu's MiniMax-M2.7 (the
+# provider that actually has a working key). ``zhipu`` (GLM-5.1) is fully
+# wired and one ``HEYI_EVAL_JUDGE_PROVIDER=zhipu`` away — flip to it once
+# a valid Zhipu key is available. The local ``:10814`` path is the third
+# option. No local LLM weights are hosted in any cloud path, so the GPU
+# box never runs an LLM brain.
+_DEFAULT_LLM_PROVIDER = "yunwu"
 
-    When ``HEYI_EVAL_JUDGE_PROVIDER=yunwu`` the four call sites all
-    switch together to yunwu.ai's OpenAI-compatible endpoint. That
-    means a single ``HEYI_EVAL_JUDGE_PROVIDER=yunwu`` line in the
-    operator's environment file is enough to take the local
-    prod_engine container (e.g. minimax on :10814) out of the loop —
-    nothing in orchestrator's hot path needs the local GPUs back.
 
-    Falls back to the historical ``HEYI_ENGINE_URL`` / ``HEYI_ENGINE_API_KEY``
-    pair (default: local 127.0.0.1:10814) so existing deployments
-    don't change behaviour until the provider switch is set.
+def _resolve_llm_endpoint() -> tuple[str, str | None, str]:
+    """Single source of truth for ``(base_url, api_key, default_model)``.
+
+    Provider is chosen by ``HEYI_EVAL_JUDGE_PROVIDER`` (default: zhipu):
+
+      - ``zhipu`` → ``https://open.bigmodel.cn/api/paas/v4`` +
+        ``ZHIPU_API_KEY`` (or ``GLM_API_KEY``), model ``glm-5.1``
+      - ``yunwu`` → yunwu.ai + ``YUNWU_*`` keys, model ``MiniMax-M2.7``
+      - anything else → local ``HEYI_ENGINE_URL`` (:10814), model
+        ``MiniMax-M2.7``
+
+    ``default_model`` is what callers use when ``HEYI_EVAL_JUDGE_MODEL``
+    is unset, so flipping the provider also flips the model id without a
+    second env var. The base url is returned WITHOUT a ``/chat/completions``
+    suffix; callers append it (and must tolerate a base that already ends
+    in a version segment like ``/v1`` or ``/v4``).
     """
-    provider = (os.environ.get("HEYI_EVAL_JUDGE_PROVIDER") or "").strip().lower()
+    provider = (
+        os.environ.get("HEYI_EVAL_JUDGE_PROVIDER") or _DEFAULT_LLM_PROVIDER
+    ).strip().lower()
+    if provider == "zhipu":
+        return (
+            os.environ.get("ZHIPU_BASE_URL", "https://open.bigmodel.cn/api/paas/v4"),
+            os.environ.get("ZHIPU_API_KEY") or os.environ.get("GLM_API_KEY"),
+            os.environ.get("ZHIPU_MODEL", "glm-5.1"),
+        )
     if provider == "yunwu":
         return (
             os.environ.get("YUNWU_BASE_URL", "https://yunwu.ai/v1"),
             os.environ.get("YUNWU_GENERAL_KEY")
             or os.environ.get("YUNWU_KEY_2")
             or os.environ.get("YUNWU_GPT_KEY"),
+            "MiniMax-M2.7",
         )
     return (
         os.environ.get("HEYI_ENGINE_URL", "http://127.0.0.1:10814"),
         os.environ.get("HEYI_ENGINE_API_KEY"),
+        "MiniMax-M2.7",
     )
+
+
+def _resolve_engine_endpoint() -> tuple[str, str | None]:
+    """Back-compat 2-tuple wrapper around :func:`_resolve_llm_endpoint`.
+
+    Existing call sites (``agent_driver.ccr_bridge``, the
+    ``OrchestratorConfig`` field factories) only want ``(url, key)``;
+    model resolution flows separately through ``judge_model_name``.
+    """
+    base, key, _model = _resolve_llm_endpoint()
+    return base, key
 
 
 def _parse_gpu_tuple(env_name: str, default: tuple[int, ...]) -> tuple[int, ...]:
@@ -124,7 +156,11 @@ class OrchestratorConfig:
     # (which vLLM accepts as "first registered model" but breaks the
     # day someone serves two models on the same endpoint). Pinned to
     # match the rules/42-heyi-m27-api.md contract.
-    judge_model_name: str = os.environ.get("HEYI_EVAL_JUDGE_MODEL", "MiniMax-M2.7")
+    judge_model_name: str = field(
+        default_factory=lambda: (
+            os.environ.get("HEYI_EVAL_JUDGE_MODEL") or _resolve_llm_endpoint()[2]
+        )
+    )
 
     # PR#33: DEPLOY auto-repair (rule-based + LLM-agent escalation).
     # When enabled, a DEPLOY failure with one of

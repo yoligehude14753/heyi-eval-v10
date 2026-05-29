@@ -35,14 +35,15 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 from pathlib import Path
 from typing import Any
 
-# A v10-wide single source of truth for "where does yunwu live and how
-# do we authenticate"; PR#18 added this helper for curator / showcase /
-# llm_judge. agent_driver reuses it so all four call sites flip together.
-from orchestrator.config import _resolve_engine_endpoint
+# A v10-wide single source of truth for "where does the LLM live and how
+# do we authenticate"; agent_driver reuses it so all call sites flip
+# together. Default provider after the 2026-05 migration is zhipu GLM-5.1.
+from orchestrator.config import _DEFAULT_LLM_PROVIDER, _resolve_engine_endpoint
 
 
 def build_ccr_config(
@@ -70,18 +71,18 @@ def build_ccr_config(
     ``_tmp/m2b-claude-code/ccr-config.json`` plus a yunwu provider.
     """
     if yunwu_url is None or yunwu_key is None:
-        # Force yunwu provider by setting env if not already set; this
-        # lets us call build_ccr_config() in tests without env setup
-        # because we accept overrides above. In production env is set
-        # by systemd unit, so this branch reads it.
-        provider = os.environ.get("HEYI_EVAL_JUDGE_PROVIDER", "").lower()
-        if provider != "yunwu":
-            # Honest error: agent_driver requires yunwu to be configured
-            # (M1 doesn't support the local minimax path because we
-            # explicitly took it out of curator/showcase per PR#18).
+        # Provider is resolved centrally (default: zhipu GLM-5.1). Only
+        # the local ``:10814`` path is unsupported on the agent route
+        # because there's no Anthropic-compatible bridge for it; cloud
+        # providers (zhipu / yunwu) go through ccr's ``openai`` shim.
+        provider = (
+            os.environ.get("HEYI_EVAL_JUDGE_PROVIDER") or _DEFAULT_LLM_PROVIDER
+        ).lower()
+        if provider not in ("zhipu", "yunwu"):
             raise RuntimeError(
-                "agent_driver requires HEYI_EVAL_JUDGE_PROVIDER=yunwu; "
-                "set it in /etc/heyi-eval-v10/env or pass explicit "
+                "agent_driver requires a cloud LLM provider "
+                "(HEYI_EVAL_JUDGE_PROVIDER=zhipu or yunwu); set it in "
+                "/etc/heyi-eval-v10/env or pass explicit "
                 "yunwu_url / yunwu_key to build_ccr_config()."
             )
         resolved_url, resolved_key = _resolve_engine_endpoint()
@@ -90,8 +91,9 @@ def build_ccr_config(
 
     if not yunwu_key:
         raise RuntimeError(
-            "yunwu api_key resolved to empty; check YUNWU_GENERAL_KEY / "
-            "YUNWU_KEY_2 / YUNWU_GPT_KEY in environment."
+            "LLM api_key resolved to empty; check ZHIPU_API_KEY "
+            "(or YUNWU_GENERAL_KEY / YUNWU_KEY_2 / YUNWU_GPT_KEY when "
+            "provider=yunwu) in environment."
         )
 
     spec = (
@@ -111,10 +113,11 @@ def build_ccr_config(
     # ccr expects api_base_url to be the chat/completions endpoint —
     # NOT just /v1/. The PR#18 _resolve_engine_endpoint returns
     # https://yunwu.ai/v1 (no /chat/completions suffix) so we append.
+    _base = yunwu_url.rstrip("/")
     chat_url = (
-        yunwu_url.rstrip("/") + "/chat/completions"
-        if yunwu_url.rstrip("/").endswith("/v1")
-        else yunwu_url.rstrip("/") + "/v1/chat/completions"
+        _base + "/chat/completions"
+        if re.search(r"/v\d+$", _base)  # /v1 (yunwu) or /v4 (zhipu)
+        else _base + "/v1/chat/completions"
     )
 
     return {
@@ -129,7 +132,10 @@ def build_ccr_config(
             {"path": "/home/agent/.claude-code-router/plugins/strip-thinking.js"},
         ],
         "Providers": [
-            # NEW: yunwu provider for project_lane / skill_lane agent runs
+            # Single cloud provider (default: zhipu GLM-5.1) for the
+            # project_lane / skill_lane agent runs. The local
+            # ``heyi-glm`` @ :10817 fallback was removed in the 2026-05
+            # Zhipu migration — no local LLM is hosted anymore.
             {
                 "name": provider_name,
                 "api_base_url": chat_url,
@@ -140,33 +146,19 @@ def build_ccr_config(
                     # protocol shim: collapses content blocks into a
                     # plain string, strips Anthropic-specific fields
                     # like cache_control / reasoning, and reshapes
-                    # tool_calls.  Without it, Yunwu's M2.7 endpoint
-                    # rejects every request with a wall of
+                    # tool_calls.  Without it the OpenAI-compatible
+                    # upstream rejects every request with a wall of
                     # "Extra inputs are not permitted" validation
                     # errors against messages[*].content (heyi
                     # 2026-05-26 drill on chalk/chalk confirmed).
                     # Order matters: ``openai`` first so downstream
                     # transformers see the already-converted shape.
+                    # Zhipu GLM-5.1 has thinking mode on by default;
+                    # ``strip-thinking`` drops the reasoning trace so
+                    # Claude Code only sees the final answer.
                     "use": [
                         "openai",
                         ["maxtoken", {"max_tokens": 8192}],
-                        "strip-thinking",
-                    ],
-                },
-            },
-            # KEEP: heyi-glm fallback. Routes are flipped by setting
-            # HEYI_EVAL_AGENT_MODEL=heyi-glm,GLM-5.1, not by deleting
-            # this entry. Allows operator to roll back to local model
-            # without re-deploying ccr config.
-            {
-                "name": "heyi-glm",
-                "api_base_url": "http://10.10.11.198:10817/v1/chat/completions",
-                "api_key": "dummy",
-                "models": ["GLM-5.1"],
-                "transformer": {
-                    "use": [
-                        ["maxtoken", {"max_tokens": 4096}],
-                        "reasoning",
                         "strip-thinking",
                     ],
                 },

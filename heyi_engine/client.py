@@ -40,6 +40,7 @@ Design choices:
 from __future__ import annotations
 
 import json
+import re
 import socket
 import threading
 import time
@@ -47,6 +48,12 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Any
+
+# A base_url that already ends in an OpenAI-style version segment
+# (``/v1`` for yunwu / vLLM, ``/v4`` for Zhipu's ``/api/paas/v4``) must
+# NOT be re-prefixed with ``/v1`` — otherwise we POST to the bogus
+# ``.../v4/v1/chat/completions``. Matches a trailing ``/v<digits>``.
+_VERSION_SUFFIX_RE = re.compile(r"/v\d+$")
 
 # ── public dataclasses ────────────────────────────────────────────────────
 
@@ -163,7 +170,7 @@ class HeyiEngineClient:
         yunwu form) skip the doubled-``/v1`` URL — we'd 404 on it
         anyway and noise the operator log.
         """
-        if self.base_url.endswith("/v1"):
+        if _VERSION_SUFFIX_RE.search(self.base_url):
             urls = [f"{self.base_url}/models"]
         else:
             urls = [f"{self.base_url}/v1/models", f"{self.base_url}/models"]
@@ -288,8 +295,9 @@ class HeyiEngineClient:
         # PR#70: base_url already including /v1 (yunwu form) must not
         # be doubled. Same hazard llm_judge fixed; HeyiEngineClient
         # had the identical bug because it shipped before yunwu was a
-        # supported provider.
-        if self.base_url.endswith("/v1"):
+        # supported provider. PR(zhipu): generalised to any ``/v<N>``
+        # so Zhipu's ``/api/paas/v4`` works too.
+        if _VERSION_SUFFIX_RE.search(self.base_url):
             url = f"{self.base_url}/chat/completions"
         else:
             url = f"{self.base_url}/v1/chat/completions"
