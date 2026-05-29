@@ -71,45 +71,26 @@ def _resolve_judge_endpoint() -> tuple[str, str | None, str]:
     """Resolve (chat_completions_url, api_key, model_name) for the
     judge call.
 
-    PR#68: the judge can now be served by an external OpenAI-compatible
-    provider (e.g. yunwu.ai), not just the local prod_engine container.
-    Two env-driven switches:
-
-      - ``HEYI_EVAL_JUDGE_PROVIDER=yunwu`` is a shorthand that maps to
-        ``YUNWU_BASE_URL`` + ``YUNWU_GENERAL_KEY`` from ``~/.yoli.env``
-        with MiniMax-M2.7 as the default model.
-      - Otherwise the historical ``HEYI_ENGINE_URL`` / ``HEYI_ENGINE_API_KEY``
-        path is preserved (default: local 127.0.0.1:10814 prod_engine).
-
-    Both branches share the same model-id default (``MiniMax-M2.7``) and
-    both correctly handle a base url that already ends in ``/v1`` (so
-    ``https://yunwu.ai/v1`` no longer gets doubled to
-    ``https://yunwu.ai/v1/v1/chat/completions``).
+    Provider/base/key/model selection is delegated to
+    :func:`orchestrator.config._resolve_llm_endpoint` (single source of
+    truth; default provider is Zhipu GLM-5.1 after the 2026-05
+    migration). This function only derives the chat-completions URL,
+    tolerating a base that already ends in a version segment (``/v1``
+    for yunwu, ``/v4`` for zhipu) so we never double it to
+    ``.../v4/v1/chat/completions``.
     """
     import os
+    import re
 
-    provider = (os.environ.get("HEYI_EVAL_JUDGE_PROVIDER") or "").strip().lower()
-    if provider == "yunwu":
-        base = os.environ.get("YUNWU_BASE_URL", "https://yunwu.ai/v1")
-        api_key = (
-            os.environ.get("YUNWU_GENERAL_KEY")
-            or os.environ.get("YUNWU_KEY_2")
-            or os.environ.get("YUNWU_GPT_KEY")
-        )
-    else:
-        base = os.environ.get("HEYI_ENGINE_URL", "http://127.0.0.1:10814")
-        api_key = os.environ.get("HEYI_ENGINE_API_KEY")
+    from orchestrator.config import _resolve_llm_endpoint
+
+    base, api_key, default_model = _resolve_llm_endpoint()
     base = base.rstrip("/")
-    if base.endswith("/v1"):
+    if re.search(r"/v\d+$", base):
         url = f"{base}/chat/completions"
     else:
         url = f"{base}/v1/chat/completions"
-    # PR#23: pin model name. M2.7 vLLM serves "MiniMax-M2.7"; the
-    # previous "auto" hack only worked because vLLM happens to route
-    # unknown names to the first served model. Per
-    # rules/42-heyi-m27-api.md the contract is the literal string.
-    # Yunwu also exposes the model under the exact id "MiniMax-M2.7".
-    judge_model = os.environ.get("HEYI_EVAL_JUDGE_MODEL", "MiniMax-M2.7")
+    judge_model = os.environ.get("HEYI_EVAL_JUDGE_MODEL") or default_model
     return url, api_key, judge_model
 
 

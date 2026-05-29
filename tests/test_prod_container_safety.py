@@ -46,6 +46,14 @@ PROD_CONTAINER_PATTERNS = (
     "heyi-engine",
 )
 
+# Cloud MODEL ids that happen to share a prefix with a local prod
+# CONTAINER name. These are passed to HTTP chat-completions APIs, never
+# to docker, so they don't carry the INV-1/12/13 "accidentally control a
+# prod container" risk this guard protects against. Matched by exact
+# literal value (the local containers are "glm-5" / "glm-51" WITHOUT the
+# dot; the Zhipu cloud model is "glm-5.1" WITH it).
+_ALLOWED_MODEL_ID_LITERALS = frozenset({"glm-5.1"})
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PRODUCTION_SOURCE_DIRS = (
     REPO_ROOT / "orchestrator",
@@ -395,6 +403,8 @@ def test_p8_no_module_hardcodes_prod_container_name(prod_name: str) -> None:
             except (OSError, UnicodeDecodeError, SyntaxError):
                 continue
             for line_no, val in literals:
+                if val in _ALLOWED_MODEL_ID_LITERALS:
+                    continue  # cloud model id, not a docker container name
                 if prod_name in val:
                     rel = path.relative_to(REPO_ROOT)
                     hits.append(f"  {rel}:{line_no}: {val!r}")

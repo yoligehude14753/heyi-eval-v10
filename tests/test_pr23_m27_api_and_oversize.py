@@ -60,12 +60,14 @@ class TestEvalGpusDefault(unittest.TestCase):
 
 class TestJudgeModelName(unittest.TestCase):
     def setUp(self) -> None:
+        self._saved_provider = os.environ.pop("HEYI_EVAL_JUDGE_PROVIDER", None)
         self._saved_url = os.environ.pop("HEYI_ENGINE_URL", None)
         self._saved_key = os.environ.pop("HEYI_ENGINE_API_KEY", None)
         self._saved_model = os.environ.pop("HEYI_EVAL_JUDGE_MODEL", None)
 
     def tearDown(self) -> None:
         for k, v in {
+            "HEYI_EVAL_JUDGE_PROVIDER": self._saved_provider,
             "HEYI_ENGINE_URL": self._saved_url,
             "HEYI_ENGINE_API_KEY": self._saved_key,
             "HEYI_EVAL_JUDGE_MODEL": self._saved_model,
@@ -102,11 +104,12 @@ class TestJudgeModelName(unittest.TestCase):
             llm_judge._default_judge_call("prompt-text", "data:image/png;base64,xxx")
         return captured
 
-    def test_default_pinned_to_minimax_m27(self) -> None:
+    def test_default_pinned_to_glm5(self) -> None:
         captured = self._call_with_captured_body()
         body = json.loads(captured["data"].decode("utf-8"))
-        self.assertEqual(body["model"], "MiniMax-M2.7",
-                         "default judge model must be the pinned M2.7 name (NOT 'auto')")
+        self.assertEqual(body["model"], "glm-5.1",
+                         "default judge model must be the pinned zhipu "
+                         "glm-5.1 name (NOT 'auto')")
 
     def test_env_override_takes_effect(self) -> None:
         captured = self._call_with_captured_body(model_env="MyStagingModel-9000")
@@ -138,6 +141,10 @@ class TestYunwuJudgeProvider(unittest.TestCase):
         "HEYI_ENGINE_URL",
         "HEYI_ENGINE_API_KEY",
         "HEYI_EVAL_JUDGE_MODEL",
+        "ZHIPU_API_KEY",
+        "ZHIPU_BASE_URL",
+        "ZHIPU_MODEL",
+        "GLM_API_KEY",
         "YUNWU_BASE_URL",
         "YUNWU_GENERAL_KEY",
         "YUNWU_KEY_2",
@@ -153,12 +160,15 @@ class TestYunwuJudgeProvider(unittest.TestCase):
             if v is not None:
                 os.environ[k] = v
 
-    def test_default_provider_uses_heyi_engine(self) -> None:
-        # No provider set → preserve historical behaviour.
+    def test_default_provider_uses_zhipu(self) -> None:
+        # No provider set → default is zhipu GLM-5.1 after the migration.
+        os.environ["ZHIPU_API_KEY"] = "sk-zhipu-default"
         url, key, model = llm_judge._resolve_judge_endpoint()
-        self.assertEqual(url, "http://127.0.0.1:10814/v1/chat/completions")
-        self.assertIsNone(key)
-        self.assertEqual(model, "MiniMax-M2.7")
+        # /v4 base must NOT be doubled to /v4/v1/chat/completions
+        self.assertEqual(
+            url, "https://open.bigmodel.cn/api/paas/v4/chat/completions")
+        self.assertEqual(key, "sk-zhipu-default")
+        self.assertEqual(model, "glm-5.1")
 
     def test_yunwu_provider_routes_to_yunwu(self) -> None:
         os.environ["HEYI_EVAL_JUDGE_PROVIDER"] = "yunwu"
@@ -179,23 +189,35 @@ class TestYunwuJudgeProvider(unittest.TestCase):
 
     def test_base_url_without_v1_suffix_appends_v1(self) -> None:
         # Local prod_engine container exposes the base without /v1.
-        # The historical default has always pinned /v1/chat/completions.
+        # The local path has always pinned /v1/chat/completions.
+        os.environ["HEYI_EVAL_JUDGE_PROVIDER"] = "local"
         os.environ["HEYI_ENGINE_URL"] = "http://127.0.0.1:10814"
         url, _key, _model = llm_judge._resolve_judge_endpoint()
         self.assertEqual(url, "http://127.0.0.1:10814/v1/chat/completions")
 
     def test_base_url_trailing_slash_normalised(self) -> None:
+        os.environ["HEYI_EVAL_JUDGE_PROVIDER"] = "local"
         os.environ["HEYI_ENGINE_URL"] = "http://127.0.0.1:10814/"
         url, _key, _model = llm_judge._resolve_judge_endpoint()
         self.assertEqual(url, "http://127.0.0.1:10814/v1/chat/completions")
 
     def test_explicit_v1_in_base_not_doubled(self) -> None:
-        # Real production hazard: someone copies the yunwu base URL
-        # ("https://yunwu.ai/v1") into HEYI_ENGINE_URL directly.
-        # Pre-PR#68 code would call /v1/v1/chat/completions and 404.
+        # Real production hazard: someone copies a /v1 base URL
+        # into HEYI_ENGINE_URL directly. Must not become /v1/v1/...
+        os.environ["HEYI_EVAL_JUDGE_PROVIDER"] = "local"
         os.environ["HEYI_ENGINE_URL"] = "https://example.com/v1"
         url, _key, _model = llm_judge._resolve_judge_endpoint()
         self.assertEqual(url, "https://example.com/v1/chat/completions")
+
+    def test_zhipu_v4_base_not_doubled(self) -> None:
+        # Zhipu's base ends in /v4; must become /v4/chat/completions,
+        # NOT /v4/v1/chat/completions.
+        os.environ["HEYI_EVAL_JUDGE_PROVIDER"] = "zhipu"
+        os.environ["ZHIPU_API_KEY"] = "sk-z"
+        url, _key, model = llm_judge._resolve_judge_endpoint()
+        self.assertEqual(
+            url, "https://open.bigmodel.cn/api/paas/v4/chat/completions")
+        self.assertEqual(model, "glm-5.1")
 
     def test_judge_model_env_override(self) -> None:
         os.environ["HEYI_EVAL_JUDGE_MODEL"] = "MiniMax-M2.5"
@@ -213,6 +235,10 @@ class TestOrchestratorConfigEngineResolver(unittest.TestCase):
         "HEYI_EVAL_JUDGE_MODEL",
         "HEYI_ENGINE_URL",
         "HEYI_ENGINE_API_KEY",
+        "ZHIPU_API_KEY",
+        "ZHIPU_BASE_URL",
+        "ZHIPU_MODEL",
+        "GLM_API_KEY",
         "YUNWU_BASE_URL",
         "YUNWU_GENERAL_KEY",
         "YUNWU_KEY_2",
@@ -227,11 +253,14 @@ class TestOrchestratorConfigEngineResolver(unittest.TestCase):
             if v is not None:
                 os.environ[k] = v
 
-    def test_default_routes_to_local_engine(self) -> None:
+    def test_default_routes_to_zhipu(self) -> None:
+        # Default provider after the 2026-05 migration is zhipu GLM-5.1.
+        os.environ["ZHIPU_API_KEY"] = "sk-zhipu"
         from orchestrator.config import OrchestratorConfig
         cfg = OrchestratorConfig()
-        self.assertEqual(cfg.engine_url, "http://127.0.0.1:10814")
-        self.assertIsNone(cfg.engine_api_key)
+        self.assertEqual(cfg.engine_url, "https://open.bigmodel.cn/api/paas/v4")
+        self.assertEqual(cfg.engine_api_key, "sk-zhipu")
+        self.assertEqual(cfg.judge_model_name, "glm-5.1")
 
     def test_yunwu_provider_routes_engine_url_too(self) -> None:
         """Single env switch — must affect curator/showcase too."""

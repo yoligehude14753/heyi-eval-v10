@@ -133,6 +133,11 @@ def _execute_curate_stage(
     cur_cfg = CuratorConfig(
         engine_url=cfg.engine_url,
         engine_api_key=cfg.engine_api_key,
+        # Pin the model id so curator's client never falls back to
+        # HeyiEngineClient.discover_model() hitting ``/models`` — Zhipu's
+        # v4 endpoint may not expose it and the catalog is irrelevant
+        # once the provider is pinned.
+        engine_model=cfg.judge_model_name,
         hf_endpoint=cfg.hf_endpoint,
         max_tokens=8192,
     )
@@ -154,37 +159,59 @@ def _execute_curate_stage(
         # If unhealthy, emit incident + skip the enrichment (don't waste 30s)
         # but DON'T fail the run — METADATA can still produce useful output
         # from HF Hub alone.
-        print("  [curate] heyi_engine pre-flight probe …")
-        health = probe_engine(cfg.engine_url, api_key=cfg.engine_api_key, timeout_s=10.0)
-        if not health.ok:
-            print(f"  [curate] PRE-FLIGHT FAIL: {health.detail}  "
-                  f"(http={health.http_code} t={health.elapsed_s:.1f}s)")
-            try:
-                store = _StoreLocal(cfg.data_root)
-                notify.incident(
-                    store.outbox_path,
-                    what="curator-engine-upstream",
-                    detail=(f"heyi_engine unhealthy: {health.detail}. "
-                            f"Curator stage will run DEGRADED (HF Hub only). "
-                            f"hf_id={run.hf_id}"),
-                    run_id=run.run_id,
-                )
-            except Exception as e:
-                print(f"  [curate] notify.incident failed: {e}")
-            curated = {
-                "hf_id": run.hf_id,
-                "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()),
-                **({k: v for k, v in _DEFAULT_CURATED_SCHEMA.items()}),
-                "_llm_meta": {
-                    "model": None,
-                    "input_tokens": 0, "output_tokens": 0, "elapsed_s": health.elapsed_s,
-                    "parse_error": f"engine-preflight-fail: {health.detail}",
-                    "card_fetch_error": None,
-                },
-            }
-        else:
-            print(f"  [curate] enriching {run.hf_id}  (preflight {health.elapsed_s:.1f}s)")
+        #
+        # Cloud providers (zhipu/yunwu) are managed services whose
+        # ``/models`` liveness probe is unreliable (Zhipu v4 may not
+        # expose it). For those we skip the probe and attempt enrichment
+        # directly — enrich_one has its own per-call error handling and
+        # records parse_error/_llm_meta on failure, so a transient cloud
+        # blip degrades a single run rather than every run.
+        from .config import _DEFAULT_LLM_PROVIDER
+        _provider = (
+            os.environ.get("HEYI_EVAL_JUDGE_PROVIDER") or _DEFAULT_LLM_PROVIDER
+        ).strip().lower()
+        if _provider in ("zhipu", "yunwu"):
+            # Cloud LLM: skip the /models liveness probe (unreliable on
+            # zhipu v4) and enrich directly. enrich_one records its own
+            # parse_error / _llm_meta on failure, so a transient cloud
+            # blip degrades a single run rather than freezing intake.
+            print(f"  [curate] cloud provider={_provider}; skipping /models "
+                  f"probe, enriching {run.hf_id} directly")
             curated = enrich_one(run.hf_id, cur_cfg)
+        else:
+            print("  [curate] heyi_engine pre-flight probe …")
+            health = probe_engine(cfg.engine_url, api_key=cfg.engine_api_key, timeout_s=10.0)
+            if not health.ok:
+                print(f"  [curate] PRE-FLIGHT FAIL: {health.detail}  "
+                      f"(http={health.http_code} t={health.elapsed_s:.1f}s)")
+                try:
+                    store = _StoreLocal(cfg.data_root)
+                    notify.incident(
+                        store.outbox_path,
+                        what="curator-engine-upstream",
+                        detail=(f"heyi_engine unhealthy: {health.detail}. "
+                                f"Curator stage will run DEGRADED (HF Hub only). "
+                                f"hf_id={run.hf_id}"),
+                        run_id=run.run_id,
+                    )
+                except Exception as e:
+                    print(f"  [curate] notify.incident failed: {e}")
+                curated = {
+                    "hf_id": run.hf_id,
+                    "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()),
+                    **({k: v for k, v in _DEFAULT_CURATED_SCHEMA.items()}),
+                    "_llm_meta": {
+                        "model": None,
+                        "input_tokens": 0, "output_tokens": 0,
+                        "elapsed_s": health.elapsed_s,
+                        "parse_error": f"engine-preflight-fail: {health.detail}",
+                        "card_fetch_error": None,
+                    },
+                }
+            else:
+                print(f"  [curate] enriching {run.hf_id}  "
+                      f"(preflight {health.elapsed_s:.1f}s)")
+                curated = enrich_one(run.hf_id, cur_cfg)
         try:
             write_curated(cfg.data_root / "curated", curated)
         except Exception as e:

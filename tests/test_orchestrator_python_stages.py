@@ -194,9 +194,13 @@ class CurateStageTests(unittest.TestCase):
                 detail="upstream unreachable (HTTP 500, fetch failed)",
             )
 
-            # enrich_one must NOT be called when pre-flight fails
+            # enrich_one must NOT be called when pre-flight fails.
+            # The /models pre-flight only runs on the LOCAL provider path
+            # (cloud providers skip it), so pin provider=local here.
             enrich_mock = mock.MagicMock()
-            with mock.patch("curator.health.probe_engine", return_value=unhealthy), \
+            with mock.patch.dict(
+                     "os.environ", {"HEYI_EVAL_JUDGE_PROVIDER": "local"}), \
+                 mock.patch("curator.health.probe_engine", return_value=unhealthy), \
                  mock.patch("curator.enricher.enrich_one", enrich_mock), \
                  mock.patch("curator.enricher.fetch_modelcard", return_value="# x"):
                 res = _execute_curate_stage(run, cfg)

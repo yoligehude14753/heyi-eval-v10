@@ -181,21 +181,31 @@ class CuratorConfigEnvTests(unittest.TestCase):
     """CuratorConfig env-var resolution. PR#7a removed all v9 fallbacks."""
 
     def test_engine_url_env_is_honored(self) -> None:
+        # HEYI_ENGINE_URL is only consulted on the local provider path;
+        # the default (zhipu) ignores it in favour of the cloud endpoint.
         with mock.patch.dict("os.environ", {
+            "HEYI_EVAL_JUDGE_PROVIDER": "local",
             "HEYI_ENGINE_URL": "http://primary:10814",
         }, clear=False):
             cfg = CuratorConfig.from_env()
         self.assertEqual(cfg.engine_url, "http://primary:10814")
 
-    def test_engine_url_defaults_to_local(self) -> None:
+    def test_engine_url_defaults_to_zhipu(self) -> None:
+        # Default provider after the 2026-05 migration is zhipu GLM-5.1.
         import os
-        prev = os.environ.pop("HEYI_ENGINE_URL", None)
+        saved = {k: os.environ.pop(k, None) for k in (
+            "HEYI_EVAL_JUDGE_PROVIDER", "HEYI_ENGINE_URL", "ZHIPU_BASE_URL",
+            "HEYI_EVAL_JUDGE_MODEL", "ZHIPU_MODEL",
+        )}
         try:
             cfg = CuratorConfig.from_env()
-            self.assertEqual(cfg.engine_url, "http://127.0.0.1:10814")
+            self.assertEqual(
+                cfg.engine_url, "https://open.bigmodel.cn/api/paas/v4")
+            self.assertEqual(cfg.engine_model, "glm-5.1")
         finally:
-            if prev is not None:
-                os.environ["HEYI_ENGINE_URL"] = prev
+            for k, v in saved.items():
+                if v is not None:
+                    os.environ[k] = v
 
     def test_get_or_create_client_idempotent(self) -> None:
         cfg = CuratorConfig(engine_url="http://x:10814")
