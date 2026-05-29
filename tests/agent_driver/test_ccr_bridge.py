@@ -62,31 +62,45 @@ class BuildCcrConfigTests(_EnvIsolation):
 
     def test_explicit_args_bypass_env(self) -> None:
         cfg = build_ccr_config(
-            yunwu_url="https://open.bigmodel.cn/api/paas/v4",
+            yunwu_url="https://yunwu.ai/v1",
             yunwu_key="sk-test",
         )
-        # default model spec is zhipu-glm / glm-5.1 after the migration
-        self.assertEqual(cfg["Router"]["default"], "zhipu-glm,glm-5.1")
+        # default model spec is yunwu-m27 / MiniMax-M2.7
+        self.assertEqual(cfg["Router"]["default"], "yunwu-m27,MiniMax-M2.7")
         providers = {p["name"]: p for p in cfg["Providers"]}
-        self.assertIn("zhipu-glm", providers)
-        self.assertEqual(providers["zhipu-glm"]["api_key"], "sk-test")
-        # /v4 must NOT be doubled to /v4/v1/chat/completions
+        self.assertIn("yunwu-m27", providers)
+        self.assertEqual(providers["yunwu-m27"]["api_key"], "sk-test")
         self.assertEqual(
-            providers["zhipu-glm"]["api_base_url"],
-            "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+            providers["yunwu-m27"]["api_base_url"],
+            "https://yunwu.ai/v1/chat/completions",
         )
 
     def test_env_path_rejects_local_provider(self) -> None:
         """When called WITHOUT explicit args, the provider must be a
-        cloud one (zhipu/yunwu) — the local :10814 path has no
+        cloud one (yunwu/zhipu) — the local :10814 path has no
         Anthropic-compatible bridge for the agent route."""
         os.environ["HEYI_EVAL_JUDGE_PROVIDER"] = "local"
         with self.assertRaisesRegex(RuntimeError, "cloud LLM provider"):
             build_ccr_config()
 
-    def test_env_path_default_zhipu(self) -> None:
-        """Default provider (env unset) is zhipu; only ZHIPU_API_KEY needed."""
+    def test_env_path_default_yunwu(self) -> None:
+        """Default provider (env unset) is yunwu; needs a YUNWU_* key."""
+        os.environ["YUNWU_GENERAL_KEY"] = "sk-yunwu"
+        cfg = build_ccr_config()
+        providers = {p["name"]: p for p in cfg["Providers"]}
+        self.assertIn("yunwu-m27", providers)
+        self.assertEqual(providers["yunwu-m27"]["api_key"], "sk-yunwu")
+        self.assertEqual(
+            providers["yunwu-m27"]["api_base_url"],
+            "https://yunwu.ai/v1/chat/completions",
+        )
+
+    def test_env_path_zhipu_opt_in(self) -> None:
+        """Opt into zhipu via env: provider/model flip to glm-5.1 and the
+        /v4 base is not doubled to /v4/v1/chat/completions."""
+        os.environ["HEYI_EVAL_JUDGE_PROVIDER"] = "zhipu"
         os.environ["ZHIPU_API_KEY"] = "sk-zhipu"
+        os.environ["HEYI_EVAL_AGENT_MODEL"] = "zhipu-glm,glm-5.1"
         cfg = build_ccr_config()
         providers = {p["name"]: p for p in cfg["Providers"]}
         self.assertIn("zhipu-glm", providers)
@@ -181,7 +195,7 @@ class BuildCcrConfigTests(_EnvIsolation):
         """
         cfg = build_ccr_config(yunwu_url="https://yunwu.ai/v1", yunwu_key="sk")
         providers = {p["name"]: p for p in cfg["Providers"]}
-        transformer_use = providers["zhipu-glm"]["transformer"]["use"]
+        transformer_use = providers["yunwu-m27"]["transformer"]["use"]
         flat = [t if isinstance(t, str) else t[0] for t in transformer_use]
         self.assertIn("openai", flat)
         self.assertIn("maxtoken", flat)
@@ -229,22 +243,22 @@ class ResolverIntegrationTests(_EnvIsolation):
     ``_resolve_engine_endpoint`` rather than its own env-reading code."""
 
     def test_uses_central_resolver(self) -> None:
-        os.environ["HEYI_EVAL_JUDGE_PROVIDER"] = "zhipu"
-        os.environ["ZHIPU_API_KEY"] = "sk-from-resolver"
+        os.environ["HEYI_EVAL_JUDGE_PROVIDER"] = "yunwu"
+        os.environ["YUNWU_GENERAL_KEY"] = "sk-from-resolver"
         # Patch the resolver to confirm ccr_bridge calls it, not its
         # own copy of env-reading code.
         with mock.patch(
             "agent_driver.ccr_bridge._resolve_engine_endpoint",
-            return_value=("https://example.com/api/paas/v4", "sk-from-resolver"),
+            return_value=("https://example.com/v1", "sk-from-resolver"),
         ) as m:
             cfg = build_ccr_config()
             m.assert_called_once_with()
-        providers = {p["name"]: p for p in cfg["Providers"]}
+        # Single provider; url/key come from the (mocked) resolver.
         self.assertEqual(
-            providers["zhipu-glm"]["api_base_url"],
-            "https://example.com/api/paas/v4/chat/completions",
+            cfg["Providers"][0]["api_base_url"],
+            "https://example.com/v1/chat/completions",
         )
-        self.assertEqual(providers["zhipu-glm"]["api_key"], "sk-from-resolver")
+        self.assertEqual(cfg["Providers"][0]["api_key"], "sk-from-resolver")
 
 
 class InjectIntoContainerTests(_EnvIsolation):

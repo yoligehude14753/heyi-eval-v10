@@ -104,12 +104,12 @@ class TestJudgeModelName(unittest.TestCase):
             llm_judge._default_judge_call("prompt-text", "data:image/png;base64,xxx")
         return captured
 
-    def test_default_pinned_to_glm5(self) -> None:
+    def test_default_pinned_to_minimax_m27(self) -> None:
         captured = self._call_with_captured_body()
         body = json.loads(captured["data"].decode("utf-8"))
-        self.assertEqual(body["model"], "glm-5.1",
-                         "default judge model must be the pinned zhipu "
-                         "glm-5.1 name (NOT 'auto')")
+        self.assertEqual(body["model"], "MiniMax-M2.7",
+                         "default judge model must be the pinned yunwu "
+                         "MiniMax-M2.7 name (NOT 'auto')")
 
     def test_env_override_takes_effect(self) -> None:
         captured = self._call_with_captured_body(model_env="MyStagingModel-9000")
@@ -160,15 +160,14 @@ class TestYunwuJudgeProvider(unittest.TestCase):
             if v is not None:
                 os.environ[k] = v
 
-    def test_default_provider_uses_zhipu(self) -> None:
-        # No provider set → default is zhipu GLM-5.1 after the migration.
-        os.environ["ZHIPU_API_KEY"] = "sk-zhipu-default"
+    def test_default_provider_uses_yunwu(self) -> None:
+        # No provider set → default is yunwu MiniMax-M2.7.
+        os.environ["YUNWU_GENERAL_KEY"] = "sk-yunwu-default"
         url, key, model = llm_judge._resolve_judge_endpoint()
-        # /v4 base must NOT be doubled to /v4/v1/chat/completions
-        self.assertEqual(
-            url, "https://open.bigmodel.cn/api/paas/v4/chat/completions")
-        self.assertEqual(key, "sk-zhipu-default")
-        self.assertEqual(model, "glm-5.1")
+        # base already ends in /v1 → must NOT double it
+        self.assertEqual(url, "https://yunwu.ai/v1/chat/completions")
+        self.assertEqual(key, "sk-yunwu-default")
+        self.assertEqual(model, "MiniMax-M2.7")
 
     def test_yunwu_provider_routes_to_yunwu(self) -> None:
         os.environ["HEYI_EVAL_JUDGE_PROVIDER"] = "yunwu"
@@ -253,14 +252,14 @@ class TestOrchestratorConfigEngineResolver(unittest.TestCase):
             if v is not None:
                 os.environ[k] = v
 
-    def test_default_routes_to_zhipu(self) -> None:
-        # Default provider after the 2026-05 migration is zhipu GLM-5.1.
-        os.environ["ZHIPU_API_KEY"] = "sk-zhipu"
+    def test_default_routes_to_yunwu(self) -> None:
+        # Default provider is yunwu MiniMax-M2.7.
+        os.environ["YUNWU_GENERAL_KEY"] = "sk-yunwu"
         from orchestrator.config import OrchestratorConfig
         cfg = OrchestratorConfig()
-        self.assertEqual(cfg.engine_url, "https://open.bigmodel.cn/api/paas/v4")
-        self.assertEqual(cfg.engine_api_key, "sk-zhipu")
-        self.assertEqual(cfg.judge_model_name, "glm-5.1")
+        self.assertEqual(cfg.engine_url, "https://yunwu.ai/v1")
+        self.assertEqual(cfg.engine_api_key, "sk-yunwu")
+        self.assertEqual(cfg.judge_model_name, "MiniMax-M2.7")
 
     def test_yunwu_provider_routes_engine_url_too(self) -> None:
         """Single env switch — must affect curator/showcase too."""

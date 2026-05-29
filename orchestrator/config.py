@@ -26,14 +26,13 @@ def _env_path(name: str, default: str) -> Path:
     return Path(os.environ.get(name, default)).expanduser()
 
 
-# Default LLM provider after the 2026-05 Zhipu migration. Curator,
-# showcase, deploy_repair, llm_judge AND the project/skill agent runs all
-# talk to Zhipu's OpenAI-compatible GLM-5.1 cloud endpoint by default.
-# ``yunwu`` and the local ``:10814`` path stay as opt-in fallbacks (set
-# ``HEYI_EVAL_JUDGE_PROVIDER`` explicitly) so we can roll back without a
-# code change if Zhipu has an outage. No local LLM weights are required
-# in the default path — frees the GPU box from hosting any LLM brain.
-_DEFAULT_LLM_PROVIDER = "zhipu"
+# Default LLM provider. The cloud brain is yunwu's MiniMax-M2.7 (the
+# provider that actually has a working key). ``zhipu`` (GLM-5.1) is fully
+# wired and one ``HEYI_EVAL_JUDGE_PROVIDER=zhipu`` away — flip to it once
+# a valid Zhipu key is available. The local ``:10814`` path is the third
+# option. No local LLM weights are hosted in any cloud path, so the GPU
+# box never runs an LLM brain.
+_DEFAULT_LLM_PROVIDER = "yunwu"
 
 
 def _resolve_llm_endpoint() -> tuple[str, str | None, str]:

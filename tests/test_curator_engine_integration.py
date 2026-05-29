@@ -190,18 +190,17 @@ class CuratorConfigEnvTests(unittest.TestCase):
             cfg = CuratorConfig.from_env()
         self.assertEqual(cfg.engine_url, "http://primary:10814")
 
-    def test_engine_url_defaults_to_zhipu(self) -> None:
-        # Default provider after the 2026-05 migration is zhipu GLM-5.1.
+    def test_engine_url_defaults_to_yunwu(self) -> None:
+        # Default provider is yunwu MiniMax-M2.7.
         import os
         saved = {k: os.environ.pop(k, None) for k in (
-            "HEYI_EVAL_JUDGE_PROVIDER", "HEYI_ENGINE_URL", "ZHIPU_BASE_URL",
-            "HEYI_EVAL_JUDGE_MODEL", "ZHIPU_MODEL",
+            "HEYI_EVAL_JUDGE_PROVIDER", "HEYI_ENGINE_URL", "YUNWU_BASE_URL",
+            "HEYI_EVAL_JUDGE_MODEL",
         )}
         try:
             cfg = CuratorConfig.from_env()
-            self.assertEqual(
-                cfg.engine_url, "https://open.bigmodel.cn/api/paas/v4")
-            self.assertEqual(cfg.engine_model, "glm-5.1")
+            self.assertEqual(cfg.engine_url, "https://yunwu.ai/v1")
+            self.assertEqual(cfg.engine_model, "MiniMax-M2.7")
         finally:
             for k, v in saved.items():
                 if v is not None:

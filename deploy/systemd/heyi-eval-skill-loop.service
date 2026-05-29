@@ -12,6 +12,8 @@ Group=ai
 WorkingDirectory=/home/ai/heyi-eval-v10
 EnvironmentFile=-/etc/heyi-eval-v10/env
 EnvironmentFile=-/home/ai/.yoli.env
+# YUNWU_* keys (the active LLM provider) live here.
+EnvironmentFile=-/home/ai/.heyi-eval-env
 Environment=PYTHONUNBUFFERED=1
 Environment=HEYI_EVAL_DATA=/home/ai/heyi-eval-data
 ExecStart=/home/ai/heyi-eval-v10/.venv/bin/python -m orchestrator skill run \

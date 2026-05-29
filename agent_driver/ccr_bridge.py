@@ -99,7 +99,7 @@ def build_ccr_config(
     spec = (
         agent_model_spec
         or os.environ.get("HEYI_EVAL_AGENT_MODEL")
-        or "zhipu-glm,glm-5.1"
+        or "yunwu-m27,MiniMax-M2.7"
     )
     try:
         provider_name, model_id = spec.split(",", 1)
