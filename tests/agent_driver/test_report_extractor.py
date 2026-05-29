@@ -125,6 +125,59 @@ class MultipleFenceTests(unittest.TestCase):
         self.assertEqual(r.kind, "fence_missing")
 
 
+class SalvageNoFenceTests(unittest.TestCase):
+    """Fence missing but a report-shaped JSON object is present in stdout.
+
+    The dominant project_lane report_parse_error cause on the heyi
+    2026-05 sweep: the model printed valid report JSON (often in a
+    ```json block) but omitted the <<<HEYI_RUN_REPORT_JSON>>> fence.
+    """
+
+    def test_raw_json_without_fence_is_salvaged(self) -> None:
+        stdout = "一些过程日志\n" + json.dumps(_good_payload(), ensure_ascii=False)
+        r = extract_report(stdout, lane="project", target_id="simonw/llm")
+        self.assertIsInstance(r, RunReport)
+        assert isinstance(r, RunReport)
+        self.assertEqual(r.outcome, Outcome.PASS)
+
+    def test_markdown_json_block_without_fence_is_salvaged(self) -> None:
+        stdout = (
+            "## 评测报告\n```json\n"
+            + json.dumps(_good_payload(), ensure_ascii=False)
+            + "\n```\n收工"
+        )
+        r = extract_report(stdout, lane="project", target_id="simonw/llm")
+        self.assertIsInstance(r, RunReport)
+
+    def test_last_report_shaped_object_wins(self) -> None:
+        first = json.dumps(_good_payload(self_assessment_zh="第一版"),
+                           ensure_ascii=False)
+        second = json.dumps(_good_payload(self_assessment_zh="终版"),
+                            ensure_ascii=False)
+        stdout = f"draft:\n{first}\n\nrevised:\n{second}\n"
+        r = extract_report(stdout, lane="project", target_id="simonw/llm")
+        assert isinstance(r, RunReport)
+        self.assertEqual(r.self_assessment_zh, "终版")
+
+    def test_non_report_json_is_not_salvaged(self) -> None:
+        # A tool-result JSON without the report signature keys must NOT be
+        # mistaken for the report.
+        stdout = '工具输出：{"files": 3, "ok": true}\n没有报告'
+        r = extract_report(stdout, lane="project", target_id="simonw/llm")
+        self.assertIsInstance(r, ExtractError)
+        assert isinstance(r, ExtractError)
+        self.assertEqual(r.kind, "fence_missing")
+
+    def test_salvaged_json_still_schema_validated(self) -> None:
+        bad = _good_payload()
+        del bad["self_assessment_zh"]  # report-shaped but invalid
+        stdout = "no fence here\n" + json.dumps(bad, ensure_ascii=False)
+        r = extract_report(stdout, lane="project", target_id="simonw/llm")
+        self.assertIsInstance(r, ExtractError)
+        assert isinstance(r, ExtractError)
+        self.assertEqual(r.kind, "schema_invalid")
+
+
 class FailureModeTests(unittest.TestCase):
     """S3 / S4 from TEST_PLAN_LANES.md."""
 

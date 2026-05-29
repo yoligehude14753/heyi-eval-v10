@@ -873,6 +873,7 @@ def execute_stage(
         from cc_agent import showcase_runner as sc_mod  # PR#5
 
         from . import capability as cap_mod
+        from . import llm_judge as judge_mod
         from . import perf_bench as pb_mod  # PR#14
         from . import stages_py
         if stage == StageName.DEPLOY:
@@ -880,7 +881,16 @@ def execute_stage(
         if stage == StageName.READY_WAIT:
             return _adapt_native(stages_py.execute_ready_wait(run, cfg))
         if stage == StageName.CAPABILITY:
-            return _adapt_native(cap_mod.execute_capability(run, cfg))
+            # Wire the multimodal judges so image_gen / video_gen
+            # capabilities are actually scored (INV-14). Without these
+            # the dispatcher returns "judge_image not wired" and every
+            # multimodal model silently scores 0. The judges resolve
+            # their endpoint via the shared provider switch (yunwu M2.7).
+            return _adapt_native(cap_mod.execute_capability(
+                run, cfg,
+                judge_image=judge_mod.judge_image,
+                judge_video_first_frame=judge_mod.judge_video_first_frame,
+            ))
         if stage == StageName.PERF_BENCH:
             return _adapt_native(pb_mod.execute_perf_bench(run, cfg))
         if stage == StageName.CLEANUP:

@@ -76,7 +76,14 @@ class DispatcherTests(unittest.TestCase):
             with patch.object(cap_mod, "execute_capability",
                               return_value=_ok_cap_result()) as native:
                 stages.execute_stage(run, StageName.CAPABILITY, cfg, store)
-            native.assert_called_once_with(run, cfg)
+            # CAPABILITY now passes the multimodal judges so image_gen /
+            # video_gen are actually scored (INV-14).
+            from orchestrator import llm_judge as _judge
+            native.assert_called_once_with(
+                run, cfg,
+                judge_image=_judge.judge_image,
+                judge_video_first_frame=_judge.judge_video_first_frame,
+            )
 
     def test_d4_cleanup_routes_to_stages_py(self):
         with TemporaryDirectory() as td:
