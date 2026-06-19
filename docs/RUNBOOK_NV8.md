@@ -766,7 +766,33 @@ export HEYI_EVAL_EVAL_GPUS=""    # PR#11 graceful-skip 全量
 
 ### 15.3 oversize 闸门(开发者视角)
 
-- 判定时机:`ENGINE_SELECT`(NOT DEPLOY) — 避免浪费 100 GB+ 模型下载。
+oversize 现在有 **两道闸门**——PR#23 在 ENGINE_SELECT,PR#68 在 discover。
+前者兜底(metadata 阶段才发现装不下),后者预防(根本不让它进 candidates)。
+
+#### 15.3.A discover 预防(PR#68,首选)
+
+- 判定时机:**discover 阶段**(`scan_round` / `scan_backfill` /
+  `scan_incremental` 三条路径都过),早于 candidates.jsonl 落盘。
+- 判定公式:`Candidate.param_billion <= TrackerConfig.max_param_billion`
+  ⇒ 通过;反之 `stats.excluded_oversize += 1` 并丢弃。
+- 参数量来源(`_parse_param_billion`):优先 HF `safetensors.total`,
+  其次 hf_id 正则(`Kimi-K2.6-1T` / `Llama-3.1-405B`...),都没有则
+  ⇒ `param_billion=None` **fail-open** 透传(避免 HF API 抖动空白
+  整批 panel)。
+- 配置入口:`discover/whitelist.yaml::tracker.max_param_billion`,
+  nv8 默认 70.0(eval_gpus=(5,6,7) 装 70B fp16 ≈ 140 GB/3×H100 80 GB);
+  操作员扩 pool 时把它一并上调或 `null` 关闸。
+- 看效果:`python -m discover.main once` 末尾的 stats 行多了
+  `excluded_oversize=N`,`list` 子命令也新增 `B` 列显示 param_billion。
+- 触发场景示例:moonshotai 发新版 Kimi-K2.6 → list_models 抓到 →
+  safetensors.total≈1e12 → param_billion=1000.0 → 70.0 闸门拦截 →
+  不入 candidates,**不浪费 stager 下载**,Panel 也不会出现"列表里
+  但永远 ABORTED"的孤儿行。
+
+#### 15.3.B ENGINE_SELECT 兜底(PR#23,保留)
+
+- 判定时机:`ENGINE_SELECT`(NOT DEPLOY) — 当 PR#68 没拦住时(参数
+  量信号缺失、whitelist.yaml 把闸门关了等)的最后一道防线。
 - 判定公式:`tp_size = vllm_args.tensor_parallel_size`(由
   `_vllm_args_hint(metadata)` 根据 `param_count` 粗估),与
   `len(cfg.eval_gpus)` 直接比较。
@@ -774,7 +800,8 @@ export HEYI_EVAL_EVAL_GPUS=""    # PR#11 graceful-skip 全量
   pipeline 走 `GracefulSkip` → run 标 `ABORTED`(不计 failure)。
 - Panel 仍能拉到 metadata.json + engine.json,该模型以"仅采集"展示。
 - 想强行测一把超大模型:操作员临时扩 `HEYI_EVAL_EVAL_GPUS` 到匹配
-  tp_size 的 GPU 数即可,**无需改代码**。
+  tp_size 的 GPU 数即可,**无需改代码**(同时记得检查 discover-side
+  `max_param_billion` 是不是把它先拦在外面了)。
 
 ### 15.4 §15 核对清单
 
@@ -783,3 +810,5 @@ export HEYI_EVAL_EVAL_GPUS=""    # PR#11 graceful-skip 全量
 - [x] `orchestrator/llm_judge.py` 不再含 `"model": "auto"`
 - [x] 405B 模型 ENGINE_SELECT 后 `engine.json::engine == "metadata_only"` 且 `oversize == true`
 - [x] 7B 模型 ENGINE_SELECT 后正常 `engine == "vllm"` 且 `oversize == false`
+- [x] PR#68:`Kimi-K2.6-1T` 在 discover 阶段被拦下 → 不进 candidates.jsonl
+  → `stats.excluded_oversize=1` 出现在 stats 行

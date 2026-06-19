@@ -86,3 +86,15 @@ tracker:
   # + 200 trending) plus the 557k 2026 backfill blew the panel up.
   per_org_limit: 30
   trending_sweep_limit: 40
+
+  # PR#68: hard parameter-count ceiling (in billions). Models above this
+  # are dropped at discover-time so the panel/queue never lists things
+  # the eval-side GPU pool can't actually host — previously Kimi-K2.6
+  # (≥1T), DeepSeek-V3 (671B), Llama-3.1-405B all made it into the
+  # candidates list, sat in the queue, then aborted with `oversize_skip`
+  # at ENGINE_SELECT after wasting one stager download attempt apiece.
+  # 70.0 matches the nv8 eval pool (eval_gpus=(5,6,7), TP=4 fits 70B
+  # fp16 ≈ 140 GB on 3×H100 80GB, breath-room for KV cache). Operators
+  # with bigger pools (e.g. all 8 H100s) should bump this to e.g. 250.0;
+  # set to ``null`` (or omit) to disable and restore legacy behaviour.
+  max_param_billion: 70.0
